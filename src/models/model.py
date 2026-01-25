@@ -29,6 +29,7 @@ config = {
         "sigma_noise": 2e-4,    #---Observation noise---#
         "n_global": 30,         #--Maximum global clusters---#
         "n_local": 3,           #--Number of distinct datasets--#
+        "learnable_dirichlet_params": True #--bool to set concentration params as fixed or learnable--#
     },
     
     #---Woodbury GP---#
@@ -44,14 +45,17 @@ config = {
     }
 }
 
+from src.models.model_config import TransformerConfig, DirichletConfig, GPConfig, RKHSConfig, RFFConfig, SpectralConfig, ModelConfig, RootConfig
+
 #--- Class Definition: Feature Extractor---#
 class VisionTransformerFeatureExtractor(nn.Module):
-    def __init__(self, **kwargs):
+    def __init__(self, config: TransformerConfig):
         super().__init__()
-        self.latent_dim = kwargs.get('latent_dim', 128)
-        pretrained = kwargs.get('pretrained', True)
-        freeze_vit = kwargs.get('freeze_vit', True)
-        weights = ViT_B_16_Weights.DEFAULT if pretrained else None
+        self.config = config
+        self.latent_dim = self.config.latent_dim
+        pretrained = self.config.pretrained
+        freeze_vit = self.config.freeze_vit
+        weights = models.ViT_B_16_Weights.DEFAULT if pretrained else None
         self.vit_model = vit_b_16(weights=weights)
         self.vit_model.head = nn.Identity()
         if freeze_vit:
@@ -78,10 +82,11 @@ class VisionTransformerFeatureExtractor(nn.Module):
 
 #---Class Definition: Random Fourier Features in Woodbury GP O(nlogn) ---#
 class StatelessWoodburyRandomFourierGaussianProcess(nn.Module):
-    def __init__(self, **kwargs):
+    def __init__(self, config: GPConfig):
         super().__init__()
-        self.num_inducing = kwargs.get('num_inducing', 128) #---n inducing points--#
-        self.latent_dim = kwargs.get('latent_dim') #--Latent Dim (model endogenous fixed param)---#
+        self.config = config
+        self.num_inducing = self.config.num_inducing #---n inducing points--#
+        self.latent_dim = self.config.latent_dim #--Latent Dim (model endogenous fixed param)---#
         self.Z = nn.Parameter(torch.randn(self.num_inducing, self.latent_dim)) #--Local Inducing Points---#
 
     def _get_phi(self, x, mu, log_sigma):
@@ -124,14 +129,15 @@ class StatelessWoodburyRandomFourierGaussianProcess(nn.Module):
         return mu_pred, var_pred
 
 class HierarchicalDirichletProcess(nn.Module):
-    def __init__(self, **kwargs):
+    def __init__(self, config: DirichletConfig):
         super().__init__()
-        self.k_atoms = kwargs.get('n_global', 30)
-        self.j_tables = kwargs.get('n_local', 3)
-        self.latent_dim = kwargs.get('latent_dim', 128)
+        self.config = config
+        self.k_atoms = self.config.n_global
+        self.j_tables = self.config.n_local
+        self.latent_dim = self.config.latent_dim
 
         #---Spectral Atoms---#
-        self.M = kwargs.get('fourier_dim', 512)
+        self.M = self.config.fourier_dim
         self.mu_atom = nn.Parameter(torch.randn(self.k_atoms, self.M, self.latent_dim) * 0.1)
         self.log_sigma_atom = nn.Parameter(torch.full((self.k_atoms, self.M, self.latent_dim), -2.0)) #---exp(-2.0) approx equal to 0.13
 
@@ -140,11 +146,11 @@ class HierarchicalDirichletProcess(nn.Module):
         self.v_k = nn.Parameter(torch.randn(self.k_atoms - 1)) #--Global--#
         self.v_j = nn.Parameter(torch.randn(self.j_tables, self.k_atoms - 1)) #--local--#
 
-        alpha0 = kwargs.get('alpha', 1.0)
-        gamma0 = kwargs.get('gamma', 2.0)
+        alpha0 = self.config.alpha
+        gamma0 = self.config.gamma
         
         #--Learnable Params with gradient flow to tune cluster sparsity---#
-        if kwargs.get('learnable_dirichlet_params', True):
+        if self.config.learnable_params:
             self.alpha = nn.Parameter(torch.tensor(alpha0))
             self.gamma = nn.Parameter(torch.tensor(gamma0)) 
         #---Fixed Priors (fixed with buffer state)---#
@@ -154,7 +160,7 @@ class HierarchicalDirichletProcess(nn.Module):
             self.register_buffer('gamma', torch.tensor([float(gamma0)]))
         
         #--Observation noise Prior--#
-        self.register_buffer('sigma_noise', torch.tensor(kwargs.get('sigma_noise', 1e-4)))
+        self.register_buffer('sigma_noise', torch.tensor(self.config.sigma_noise))
 
     def _break_stick(self, v_raw, concentration):
         """GEM Construction"""
@@ -180,11 +186,12 @@ class HierarchicalDirichletProcess(nn.Module):
 
 #---Class Definition: Reproducing Kernel Hilbert Space Decoder----#
 class ReproducingKernelHilbertSpaceDecoder(nn.Module):
-    def __init__(self, **kwargs):
+    def __init__(self, config: RKHSConfig):
         super().__init__()
-        self.latent_dim = kwargs.get('latent_dim', 128)
-        self.feature_dim = kwargs.get('transformer_out_dim', 768)
-        self.n_anchor_points = kwargs.get('n_anchors', 256)
+        self.config = config
+        self.latent_dim = self.config.latent_dim
+        self.feature_dim = self.config.transformer_out_dim
+        self.n_anchor_points = self.config.n_anchors
 
         #---Learnable Anchor Points on Latent Manifold Z---#
         self.anchor_points = nn.Parameter(torch.randn(self.n_anchor_points, self.latent_dim))
@@ -218,10 +225,12 @@ class ReproducingKernelHilbertSpaceDecoder(nn.Module):
     
 #Class definition: Final Model architecture & flow with Bayesian nonparametric clustering---#
 class InfiniteGaussianMixtureModel(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: ModelConfig):
         super().__init__()
 
-        const_params = config['latent_dim']
+        self.config = config
+
+        const_params = self.config.latent_dim
 
         #--Share fixed params--#
         for key in ['transformer', 'dirichlet', 'gp', 'rkhs']:
@@ -229,27 +238,19 @@ class InfiniteGaussianMixtureModel(nn.Module):
 
 
         #--Feature Extractor---#
-        self.transformer = VisionTransformerFeatureExtractor(
-            **config['transformer']
-        )
+        self.transformer = VisionTransformerFeatureExtractor(self.config.transformer)
 
         #---Hierarchical Dirichlet Process---#
-        self.dirichlet = HierarchicalDirichletProcess(
-            **config['dirichlet']
-        )
+        self.dirichlet = HierarchicalDirichletProcess(self.config.dirichlet)
 
         #---Stateless Woodbury GP Operator---#
-        self.gp = StatelessWoodburyRandomFourierGaussianProcess(
-            **config['gp']
-        )
+        self.gp = StatelessWoodburyRandomFourierGaussianProcess(self.config.gp)
 
         #---RKHS Decoder--#
-        self.decoder = ReproducingKernelHilbertSpaceDecoder(
-            **config['rkhs']
-        )
+        self.decoder = ReproducingKernelHilbertSpaceDecoder(self.config.rkhs)
 
-        self.K = config['dirichlet']['n_global']
-        self.sigma_noise = config['dirichlet']['sigma_noise']
+        self.K = self.config.dirichlet.n_global
+        self.sigma_noise = self.config.dirichlet.sigma_noise
     
     def forward(self, x, local_idx, y=None):
         #---Forward Pass for entire model--#
@@ -257,7 +258,7 @@ class InfiniteGaussianMixtureModel(nn.Module):
         pi_j = self.dirichlet.get_weights(local_idx) #--Weights for each known local cluster---#
         #--Inifinite GP---#
         mu_proj = 0.0
-        sig_proj = 0.0
+        var_pred = 0.0
         for k in range(self.K):
             mu_k, sig_k = self.gp(
                 z,
@@ -269,16 +270,16 @@ class InfiniteGaussianMixtureModel(nn.Module):
 
             #--Aggregate Variance---#
             mu_proj += pi_j[k] * mu_k
-            sig_proj += pi_j[k] * (sig_k + mu_k**2)
-        sig_proj = sig_proj - mu_proj**2
-        sig_proj = torch.clamp(sig_proj, min=1e-9)
+            var_pred += pi_j[k] * (sig_k + mu_k**2)
+        var_pred = var_pred - mu_proj**2
+        var_pred = torch.clamp(var_pred, min=1e-9)
 
         #---RKHS Manifold Projection--#
         h_recon = self.decoder(z)
 
         return{
             "mu": mu_proj,
-            "sig": sig_proj,
+            "var": var_pred,
             "hilbert_space_kernel_recon": h_recon,
             "z_latent": z,
             "weights": pi_j
