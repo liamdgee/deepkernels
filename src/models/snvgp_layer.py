@@ -81,6 +81,11 @@ class SpectralVariationalGaussianProcess(gpytorch.models.ApproximateGP):
         phi = torch.cat([phi_cos, phi_sin], dim=-1)
 
         return phi
+    
+    def expose_features(self, x, **kwargs):
+        phi_hi = self._spectral_map(x, **kwargs)
+        phi_latent_w = phi_hi @self.random_orthogonal_proj.t()
+        return phi_latent_w #-phi corresponding to bottleneck spectral weight space-#
 
     def forward(self, x, **kwargs):
         mu_atom_hdp = kwargs['mu_atom']
