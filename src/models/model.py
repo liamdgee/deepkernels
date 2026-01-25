@@ -12,38 +12,6 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
-#---Configuration Criteria--#
-
-config = {
-    #--Feature Extractor (ViT_b_16)---#
-    "transformer": {
-        "latent_dim": 128,
-        "freeze_vit": True,
-        "pretrained": True,
-    },
-    
-    #--Hierarchical Dirichlet Process---#
-    "dirichlet": {
-        "alpha": 0.75,          #--Local concentration--#
-        "gamma": 2.0,           #--Global concentration--#
-        "sigma_noise": 2e-4,    #---Observation noise---#
-        "n_global": 30,         #--Maximum global clusters---#
-        "n_local": 3,           #--Number of distinct datasets--#
-        "learnable_dirichlet_params": True #--bool to set concentration params as fixed or learnable--#
-    },
-    
-    #---Woodbury GP---#
-    "gp": {
-        "num_inducing": 256, #--Number of inducing points--#
-        "fourier_dim": 512 #----dim of random fourier features--#
-    },
-    
-    # 4. RKHS Decoder (Manifold Guardrail)
-    "rkhs": {
-        "n_anchors": 256, #---n manifold anchor points-#
-        "transformer_out_dim": 768,     #--feature dimensionality identical to ViT output---#
-    }
-}
 
 from src.models.model_config import TransformerConfig, DirichletConfig, GPConfig, RKHSConfig, RFFConfig, SpectralConfig, ModelConfig, RootConfig
 
