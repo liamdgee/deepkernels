@@ -5,24 +5,29 @@ from torch.distributions.transforms import StickBreakingTransform
 from gpytorch.mlls import AddedLossTerm
 import math
 from src.models.model_config import RootConfig
+import torch.nn as nn
 import torch.nn.functional as F
+from pydantic import BaseModel
+from typing import Tuple, Optional
 
 class KLDivergence(AddedLossTerm):
     """loss term for hierarchical dirichlet process -- KL(q(rho)|p(rho))"""
     def __init__(self, qdist, pdist):
-        self.Q = qdist
-        self.P = pdist
+        self.qdist = qdist
+        self.pdist = pdist
     def loss(self):
-        return torch.distributions.kl_divergence(self.Q, self.P).sum()
+        return kl_divergence(self.qdist, self.pdist).sum()
 
-from pydantic import BaseModel
+
 
 class HDPConfig(BaseModel):
     K: int = 30
     M: int = 512
     D: int = 128
-    eps: float = 1e-4
+    eps: float = 1e-3
     gamma_prior: float = 2.0
+    mu_init: float = 0.0
+    sigma_init: float = 1.0
 
 
 class VariationalDirichlet(gpytorch.Module):
@@ -32,82 +37,131 @@ class VariationalDirichlet(gpytorch.Module):
         self.K = self.config.K
         self.M = self.config.M #-rff samples per atom-#
         self.D = self.config.D #-input dim to vit-#
-        self.gamma_prior = self.config.gamma_prior
+        self.eps = self.config.eps
 
-        self.gamma = nn.Parameter(torch.tensor(float(self.gamma_prior)))
+        #--init constraints--#
+        self.mu_init = self.config.mu_init
+        self.sigma_init = self.config.sigma_init
+        self.log_sigma_init = math.log(self.sigma_init)
 
-        #--variational params-#
-        #--q(logits) ~ N(mu, sig)
+        # ---------------------------------------------------------
+        # Structure: GEM Global Mixing Weights (Beta)
+        # ---------------------------------------------------------
+        #-- variational params - q(v) ~ N(q_mu, q_log_sigma)
+        self.q_mu = nn.Parameter(torch.randn(self.K - 1)) #--break symmetry-#
+        self.q_log_sigma = nn.Parameter(torch.full((self.K - 1,), -2.0)) #-cluster stability-#
 
-        self.register_parameter(
-            "q_mu", 
-            nn.Parameter(torch.randn(self.K - 1))
-        )
-        self.register_parameter(
-            "q_log_sigma", 
-            nn.Parameter(torch.full((self.K - 1,), -2.0))
-        )
-
-        #--prior params--#
+        #-- fixed prior params -- regularisation anchors-#
         #---uniform on simplex ~ N(0, 1)--#
-        self.register_buffer("prior_mu", torch.zeros(self.K - 1))
-        self.register_buffer("prior_log_sigma", torch.zeros(self.K - 1))
+        self.register_buffer("prior_mu", torch.full((self.K - 1,), self.mu_init))
+        self.register_buffer("prior_log_sigma", torch.full((self.K - 1,), self.log_sigma_init)) #-anchor strength-#
 
-        #--Spectral Frequencies-#
-        self.log_lengthscale_atom = nn.Parameter(torch.randn(self.K, 1, self.D) * 0.5 - 2.0)
+        # ---------------------------------------------------------
+        # Content: Spectral Frequencies (Omega)
+        # ---------------------------------------------------------
+        #--spectral mixture kernel: defined by weight (pi), center (atom_mu), width (atom_log_scale)
 
-        #--fixed RFF phases and noise buffers-#
+        #--Global Base Distribution (H) defines kernel smoothness & freq
+        self.h_mu = nn.Parameter(torch.zeros(1, 1, self.D)) #-center of kernels -- mu prior on gram matrix-#
+        self.h_log_sigma = nn.Parameter(torch.tensor(-2.0)) #-global bandwidth-#
+
+        #-local atom deviation (additive)-#
+        self.atom_log_sigma = nn.Parameter(torch.randn(self.K, 1, self.D) * 0.1)
+        self.atom_mu = nn.Parameter(torch.randn(self.K, 1, self.D))
+
+        #--RFF Constants - fixed noise params--#
         #-draw standard normal once and freeze (fundamental random fourier projection assumption)--#
-        #-Shape: [K, M, D]
-        self.register_buffer("noise_weights", torch.randn(self.K, self.M, self.D))
+        self.register_buffer("noise_weights", torch.randn(self.K, self.M, self.D)) #-Shape: [K, M, D]-#
         self.register_buffer("noise_bias", torch.rand(self.K, self.M) * 2 * math.pi)
 
-        self.stick_break_transform = StickBreakingTransform()
+
+        # ---------------------------------------------------------
+        # C) Amortized Inference (pi_encoder)
+        # ---------------------------------------------------------
+        #--Data Encoder for local mixing weights-#
+        self.pi_encoder = nn.Sequential(
+            nn.Linear(self.D, 2*self.D),
+            nn.LayerNorm(2*self.D),
+            nn.GELU(),
+            nn.Linear(2 * self.D, self.K),
+            nn.Softplus()
+        )
+
+        # ---------------------------------------------------------
+        # D) Concentration (Gamma)
+        # ---------------------------------------------------------
+        #-- Learnable scalar for dirichlet process concentration (gamma)-#
+        self.gamma_init = getattr(self.config, 'gamma_prior', 2.0)
+        self.gamma = nn.Parameter(torch.tensor(float(self.gamma_init)))
+
+        #--Define torch stickbreak module-#
+        self.stick_break_transform = torch.distributions.transforms.StickBreakingTransform()
     
-    def forward(self, batch_shape=torch.Size([])) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        #--variational posterior - q(v)-#
+    def forward(self, z: Optional[torch.Tensor]=None, batch_shape=torch.Size([])) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        #--A) define variational posterior - q(v)-#
         q_sig = F.softplus(self.q_log_sigma)
         q_dist = Normal(self.q_mu, q_sig)
-
         #-prior p(v)-#
         p_sig = F.softplus(self.prior_log_sigma)
         p_dist = Normal(self.prior_mu, p_sig)
 
-        #register loss-#
+        #--B) register loss--#
         self.update_added_loss_term("hdp_kl", KLDivergence(q_dist, p_dist))
 
-        #--Sample global weights-#
-        #-q(beta) = StickBreaking( q(v) )
+        #--C) Global weights (beta)-#
+        #-q(beta) = GEM(q(v))
+        simplex_dist = TransformedDistribution(q_dist, [self.stick_break_transform])
+        beta = simplex_dist.rsample() #-shape:[K]
 
-        dist = TransformedDistribution(q_dist, [self.stick_break_transform])
-        beta = dist.rsample() #-[K]-
-
-        #-sample local weights-#
-        #- pi | beta ~ Dir(gamma * beta)
-
-        #--Define Concentration -- gamma strictly positive-#
+        #--D) Dynamic local weights (pi)--#
         gamma = F.softplus(self.gamma)
-        concentration = (gamma * beta) + self.eps
-        concentration = torch.clamp(concentration, self.eps, 500)
 
-        #-if batch_shape is (), conc: [K]. if batch shape is 128, conc: [128, K]
-        if len(batch_shape) > 0:
-            concentration = concentration.unsqueeze(0).expand(*batch_shape, -1)
+        prior_conc = (gamma * beta) + self.eps
+        prior_conc = torch.clamp(prior_conc, min=self.eps, max=150.0)
+
+        if z is None:
+            if len(batch_shape) > 0:
+                post_conc = prior_conc.unsqueeze(0).expand(*batch_shape, -1)
+            else:
+                post_conc = prior_conc
+        else:
+            #--amortised inference in training-#
+            #-Data evidence from neural net (pi_encoder)-#
+            #- z: [B, D] -> data_conc: [B, K]-#
+            local_conc = self.pi_encoder(z) + self.eps #-[B, K]-#
+            #-Posterior Concentration (global belief + local evidence)-
+            post_conc = prior_conc.unsqueeze(0) + local_conc
+            post_conc = torch.clamp(post_conc, min=self.eps, max=150.0)
+            #--kl loss for only when data is present-#
+            #-Create Distribution objects for kl loss updates-#
+            pr_dist_pi = Dirichlet(prior_conc) #-KL(Post|Pr) --- Batch: [], Event: [K]--#
+            post_dist_pi = Dirichlet(post_conc) #--Batch: [], Event: [K]--#
+            #-Register KL loss for weights-#
+            self.update_added_loss_term("pi_kl", KLDivergence(post_dist_pi, pr_dist_pi))
         
-        local_dist = torch.distributions.Dirichlet(concentration)
-        pi = local_dist.rsample() #-[B, K]-#
+        #--Sample from pi (dynamic)-#
+        pi = Dirichlet(post_conc).rsample() #--[B, K]-#
 
+        #--E) Construct Spectal frequencies with H regularisation-#
+        #-shift by h_mu, scale by h_log_sigma
+        global_log_scale = self.h_log_sigma #-base global freq-#
+        local_log_scale = self.atom_log_sigma #-deviation locally--shape:[K, 1, D] #
+        log_scale = global_log_scale + local_log_scale
+        log_scale = torch.clamp(log_scale, max=10.0)
+        bandwidth = log_scale.exp() #-inv lengthscale-
 
-        #--Construct spectal frequencies-#
-        atomic_scale = self.log_lengthscale_atom.exp() #-[K, 1, D]
-        omega = self.noise_weights * atomic_scale #[K, M, D]
+        #--centres: global center + local frequency/position-#
+        spectral_means = self.h_mu + self.atom_mu
 
+        #--reparameterisation trick-#
+        #-omega ~ N(spectral_means, bandwidth)
+        #- omega shape: - [K, M, D]-#
+        omega = spectral_means + (self.noise_weights * bandwidth)
+        omega = torch.clamp(omega, -150.0, 150.0)
 
-        print(f"Type of beta: {type(beta)}")
-        print(f"Type of omega: {type(omega)}")
         #--Returns:
         #pi: [B, K] -> local mixing weights
         #beta: [K] -> global prevalence
         #omega: [K, M, D] -> spectral frequencies
-        #bias: [K, M] -> spectral phases
+        #bias: [K, M] -> spectral phases (fixed)
         return pi, beta, omega, self.noise_bias
