@@ -2,21 +2,13 @@ import torch
 import gpytorch
 from torch.distributions import Normal, TransformedDistribution, kl_divergence, Dirichlet
 from torch.distributions.transforms import StickBreakingTransform
-from gpytorch.mlls import AddedLossTerm
 import math
 from src.models.model_config import RootConfig
 import torch.nn as nn
 import torch.nn.functional as F
 from pydantic import BaseModel
 from typing import Tuple, Optional
-
-class KLDivergence(AddedLossTerm):
-    """loss term for hierarchical dirichlet process -- KL(q(rho)|p(rho))"""
-    def __init__(self, qdist, pdist):
-        self.qdist = qdist
-        self.pdist = pdist
-    def loss(self):
-        return kl_divergence(self.qdist, self.pdist).sum()
+from src.losses.kl_divergence import KLDivergence
 
 
 
@@ -28,6 +20,8 @@ class HDPConfig(BaseModel):
     gamma_prior: float = 2.0
     mu_init: float = 0.0
     sigma_init: float = 1.0
+    n_tasks: int = 128
+    num_inducing: int = 1024
 
 
 class VariationalDirichlet(gpytorch.Module):

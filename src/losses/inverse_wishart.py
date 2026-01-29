@@ -4,11 +4,11 @@ import gpytorch
 from gpytorch.mlls import AddedLossTerm
 
 class InverseWishartPenalty(AddedLossTerm):
-    def __init__(self, X, cov_mat, scale_mat, device):
+    def __init__(self, X, cov_mat, scale_mat, **kwargs):
         self.X = X
         self.cov_mat = cov_mat
         self.scale_mat = scale_mat
-        self.device = device
+        self.device = kwargs.get('device')
         self.eps = 1e-4
     
     def loss(self):
