@@ -6,7 +6,7 @@ import logging
 import os
 import numpy as np
 from typing import Tuple, Dict, Optional
-from src import integrate
+from src.infer import integrate
 
 #---Init logger---#
 logger = logging.getLogger(__name__)

@@ -76,7 +76,7 @@ class VariationalDirichlet(gpytorch.Module):
         self.pi_encoder = nn.Sequential(
             nn.Linear(self.D, 2*self.D),
             nn.LayerNorm(2*self.D),
-            nn.GELU(),
+            nn.Tanh(),
             nn.Linear(2 * self.D, self.K),
             nn.Softplus()
         )

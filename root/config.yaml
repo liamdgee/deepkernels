@@ -1,0 +1,206 @@
+project:
+  name: "deep_kernels_for_lender_bias_inference"
+  version: "1.0.0"
+
+data:
+  db_path: 'data/private_storage.db' #-placeholder-#
+  table_name: 'lendio_dataset_raw' #-placeholder--#
+
+  id_cols:
+    - lender_clean
+    - random_race_sg
+    - unique_borrower
+  
+  cols_to_drop:
+    - final_race
+    - black_final_race
+    - shr_app_black_final_race
+    - shr_app_white_final_race
+    - shr_appr_black_final_race
+    - shr_appr_white_final_race
+    - shr_rej_black_final_race
+    - shr_rej_white_final_race
+    - shr_loan_black_final_race
+    - shr_loan_white_final_race
+    - delta_shr_appr_bc
+    - delta_shr_appr_wc
+    - delta_shr_loan_bc
+    - delta_shr_loan_wc
+    - delta_shr_rej_bc
+    - delta_shr_rej_wc
+    - delta_shr_rej_wc_w
+    - true_pos_black_bisg
+    - true_neg_black_bisg
+    - false_pos_black_bisg
+    - false_neg_black_bisg
+    - approved_all
+    - lmean_approved_all
+    - rejected
+    - lmean_rejected
+    - amountfunded
+    - lmean_amountfunded
+    - shr_appr_black_sg_cont
+    - shr_appr_white_sg_cont
+    - shr_rej_black_sg_cont
+    - shr_rej_white_sg_cont
+    - shr_loan_black_sg_cont
+    - shr_loan_white_sg_cont
+    - lenders_sent_to
+    - fintech_lenders_sent_to
+    - non_fintech_lenders_sent_to
+
+  seg_cols:
+    - dissim_scaled
+    - isolation_scaled
+    - animus_scaled
+    - iat_score_f_scaled
+    - mdi
+
+  bisg_cols:
+    - black_s_pct
+    - black_g_pct
+    - black_fs_pct
+    - black_bifsg_pct
+    - black_sg_pct
+
+  density_cols:
+    - share_pop_black
+    - share_black_pop_geba
+  
+  borrower_race_shr_cols:
+    - shr_loan_black_final_race
+    - shr_loan_black_sg_cont
+    - shr_loan_white_final_race
+    - shr_loan_white_sg_cont
+    - shr_app_black_sg_cont
+    - shr_app_white_sg_cont
+
+  cols_to_binary_flag:
+    - black_final_race
+    - false_neg_black_bisg
+    - false_pos_black_bisg
+    - true_neg_black_bisg
+    - true_pos_black_bisg
+    - 'lender_clean'
+    - 'unique_borrower'
+    
+  cols_to_log_transform:
+    - total_percap_inc
+    - amountsought
+
+  lender_types:
+    - fintech
+    - cdfi
+    - creditunion
+    - bank
+
+features:
+  #--logic: {col_source_name: ['interaction_base', 'alias_for_pipeline']}
+  transforms:
+    black_g_pct: ["log1p", "l1_g"]
+    black_fs_pct: ["log", "lfs"]
+    black_sg_pct: ["log", "lsg"]
+    black_bifsg_pct: ["log1p", "l1_bifsg"]
+    black_s_pct: ["1", "s"]
+
+  #---logic: [new_feature, [i_term_1, i_term_2, ..., i_term_n]]
+  interactions:
+    - ["lg_bifsg", ["l1_g", "black_bifsg_pct"]]
+    - ["sg_lsg", ["black_sg_pct", "lsg"]]
+    - ["lg_lsg", ["l1_g", "lsg"]]
+    - ["s_lsg", ["s", "lsg"]]
+    - ["bifsg_lsg", ["black_bifsg_pct", "lsg"]]
+    - ["s_bifsg", ["s", "black_bifsg_pct"]]
+    - ["sg_s", ["black_sg_pct", "s"]]
+    - ["lg_s", ["l1_g", "s"]]
+    
+    # Complex / Higher-order interactions using identities
+    - ["lg_s_bifsg", ["l1_g", "s", "black_bifsg_pct"]]
+    - ["sg_s_bifsg", ["black_sg_pct", "s", "black_bifsg_pct"]]
+    - ["sg_lg_bifsg", ["black_sg_pct", "l1_g", "black_bifsg_pct"]]
+    - ["sg_lg_s", ["black_sg_pct", "l1_g", "s"]]
+    
+    # Complex Log-Interaction Terms
+    - ["lg_bifsg_lsg", ["l1_g", "black_bifsg_pct", "lsg"]]
+    - ["s_bifsg_lsg", ["s", "black_bifsg_pct", "lsg"]]
+    - ["sg_bifsg_lsg", ["black_sg_pct", "black_bifsg_pct", "lsg"]]
+    
+    # Composite Multi-order Interactions
+    - ["comp_int_1", ["black_sg_pct", "l1_g", "s", "black_bifsg_pct", "lsg"]]
+    - ["comp_int_2", ["l1_g", "s", "black_bifsg_pct", "lsg"]]
+    - ["comp_int_3", ["black_sg_pct", "l1_g", "black_bifsg_pct", "lsg"]]
+
+  scaling:
+    method: "power"
+    eps: 1e-8
+    with_centering: true
+
+clean:
+  missingness_threshold: 0.8
+  impute_strategy: "mean"
+  categorical_threshold: 0.025 #--1 in 40 values is unqiue--#
+  to_numeric: random_race_sg #--or bool: true? placeholder--#
+
+
+#-feature selection using classical statistical methods-#
+lasso:
+  #--Spearman filter--#
+  corr_threshold: 0.9
+  
+  #-Lasso sparsisty filter--#
+  lasso_cv: 5
+  lasso_max_samples: 24000 #-rows of input data--#
+  
+  #--VIF config for multicollinearity--#
+  vif_threshold: 8.5
+  
+  #--settings-#
+  interaction_only: true
+  random_state: 42
+  scaler: "robust"
+
+#-core model architecture-#
+model:
+  #--Vit-16 Vision Transformer Backbone--#
+  transformer:
+    latent_dim: 128
+    freeze_vit: true
+    pretrained: true
+
+# --- Hierarchical Dirichlet Process (HDP) ---
+  dirichlet:
+    alpha: 0.75              # Local concentration (lender-specific)
+    gamma: 2.0               # Global concentration (market-wide)
+    sigma_noise: 0.0002      # Observation noise floor
+    n_global: 30             # Upper bound for market-wide clusters
+    n_local: 3               # Number of distinct lender datasets/sources
+    learnable_params: true   # Optimize concentration via backprop
+
+# --- Woodbury Gaussian Process (Sparse GP)---
+  gp:
+    num_inducing: 256        # Inducing points for Woodbury inversion
+    fourier_dim: 512         # Random Fourier Feature (RFF) dimensionality
+
+# --- RKHS Decoder (Manifold Guardrail) ---
+#--Projects latent space back onto a Reproducing Kernel Hilbert Space matching transformer output dim--
+  rkhs:
+    n_anchors: 256           # Manifold anchor points
+    transformer_out_dim: 768 # Matches ViT-B/16 base output
+
+#-Core training architecture for optimisation with Langevin Dynamics-#
+training:
+  device: "mps"                # Optimized for M4 Apple Silicon
+  total_epochs: 200
+  
+  # Differential Learning Rates
+  lr_atoms: 0.00215           # Learning rate for HDP cluster locations (eta_a)
+  lr_weights: 0.0125          # Learning rate for GP/RKHS weights (eta_w)
+  stable_rkhs_lr: 0.0002      # Learning rate for the Manifold Guardrail decoder
+  
+  # Stochastic Gradient Langevin Dynamics (SGLD)
+  langevin_temp: 0.0000075    # Thermal noise for weight space exploration
+  
+  # Loss Function Weighting
+  kl_div_beta: 0.2            # Weight for KL-Divergence (Variational Inference)
+  rkhs_penalty_weight: 10.0   # Weight for the RKHS manifold constraint
+  

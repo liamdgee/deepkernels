@@ -14,15 +14,15 @@ class SGHMC(Optimizer):
         loss = None
         if closure is not None:
             loss = closure()
-        for group in self.param_groups:
-            for p in group['params']:
+        for g in self.param_groups:
+            for p in g['params']:
                 if p.grad is None: continue
                 state = self.state[p]
                 if len(state) == 0:
                     state['momentum'] = torch.randn_like(p) #-random init-#
                 #-hamiltonian hyperparams-#
-                lr = group['lr']
-                alpha = group['alpha']
+                lr = g['lr']
+                alpha = g['alpha']
                 dp = p.grad.data #-add nll grad term-#
                 #-- Hamiltonian dynamics: momentum_t+1 = momentum_t - lr * grad - momentum_decay * momentum_t + noise
                 momentum = state['momentum']

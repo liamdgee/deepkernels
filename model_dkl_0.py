@@ -7,6 +7,13 @@ import torch.nn.utils.parametrizations as P
 import gpytorch as gp
 from gpytorch.models import ApproximateGP as agp
 from gpytorch.variational import CholeskyVariationalDistribution, VariationalStrategy
+import logging
+
+#---Init logger---#
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 #---Deep Feature Network---#
 #---A deep, spectral-normalized MLP for feature extraction---#

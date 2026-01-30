@@ -7,10 +7,10 @@ import logging
 import os
 from typing import Tuple, Dict, Optional
 
-#---Init Logger---#
+#---Init logger---#
 logger = logging.getLogger(__name__)
 if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 #---Class Definition: Inference Module for DKL Models---#
 class DeepKernelInference:

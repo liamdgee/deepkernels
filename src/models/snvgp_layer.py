@@ -30,7 +30,7 @@ class SpectralVariationalGaussianProcess(gpytorch.models.ApproximateGP):
         )
 
         super().__init__(variational_strategy)
-        self.mean_module = gpytorch.means.ConstantMean()
+        self.mean_module = gpytorch.means.ZeroMean()
         self.covar_module = gpytorch.means.LinearKernel()
         self.register_buffer('scaling_constant', torch.tensor(math.sqrt(2.0 / self.M)))
         self.eps = getattr(config.model, 'eps', 1e-6)

@@ -1,0 +1,51 @@
+# pyproject.toml
+
+[project]
+name = "deepkernels"
+version = "0.1.0"
+description = "An end-to-end modular framework for probabilstic inference of demographic data using hybrid transformer_dirichlet-process_rff_gaussian-process_rkhs-decoder architecture
+
+#---Cleaner & Harmoniser--#
+core = [
+    "pandas>=2.3.3",
+    "numpy>=2.2.6",
+    "pydantic>=2.12.5",
+    "scipy>=1.15.3",
+    "statsmodels>=0.14.5",
+    "fastapi>=0.128.0",
+    "prometheus-fastapi-instrumentator>=7.0.0",
+    "uvicorn>=0.40.0"
+]
+
+model = [
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+    "scikit-learn>=1.7.2",
+    "matplotlib>=3.10.7"
+]
+
+[project.optional-dependencies]
+# 1. Training Tier (Install only on training clusters)
+
+train = [
+    "scikit-learn>=1.7.2",
+    "xgboost",
+    "mlflow"  # For experiment tracking
+]
+
+# 2. Inference Tier (Install only on serving API containers)
+inference = [
+    "fastapi",
+    "uvicorn",
+    "onnxruntime"  # If you export models to ONNX
+]
+
+# 3. Dev Tier (For your laptop)
+dev = [
+    "pytest",
+    "jupyterlab",
+    "mlops_toolkit[train,inference]"  # Installs everything
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]  # Tells Python to look inside the 'src' folder

@@ -220,7 +220,7 @@ class LangevinTrainer:
         for epoch in range(1, self.epochs+1):
             stats_per_epoch = {"total_loss": 0, "nll": 0, "kl": 0, "rkhs": 0}
             n_batches = len(train_loader)
-            for batch_idx, (x, y, ind) in enumerate(train_loader):
+            for batch_idx, (x, y, ind) in enumerate(train_loader): #---idx currently unused--#
                 x, y = x.to(self.device), y.to(self.device)
                 loss_dict = self.step(x, y, ind)
                 for k in stats_per_epoch:

@@ -10,8 +10,8 @@ class CrossCovarRFFKernel(Kernel):
     Computes a matrix valued kernel that maps to a vector-valued reproducing kernel hilbert space
     output shape: [batch, N, N, D, D] or block diagonal: [batch, N*D, N*D]
     """
-    def __init__(self, dp_module):
-        super().__init__()
+    def __init__(self, dp_module, **kwargs):
+        super().__init__(**kwargs)
         self.dp = dp_module
         self.D = dp_module.D
     
