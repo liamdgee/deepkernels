@@ -34,8 +34,6 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
     
     def fit(self, dfs_in: List[pd.DataFrame], y=None):
         """Learns master schema across multiple input datasets"""
-        logger.info(f"Fitting Harmoniser on {len(dfs_in)} source datasets.")
-        
         dfs = [self._canonicalise_headers(df.copy()) for df in dfs_in]
 
         #-- Lock target schema--#
