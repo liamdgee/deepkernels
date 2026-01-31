@@ -19,7 +19,7 @@ class CleanerConfig(BaseModel):
     missingness_threshold: float = Field(default=0.8, ge=0, le=1)
     impute_strategy: Literal['mean', 'median', 'mode', 'zero'] = 'mean'
     categorical_threshold: float = 0.025 #--1 in 40 values is unqiue--#
-    to_numeric: List[str] = Field(default_factory=list) #--List of cols we want to force to numeric--#
+    to_numeric: Optional[List[str]] = None #--List of cols we want to force to numeric--#
 
 
 #---Data Cleaning Pipeline Class---#

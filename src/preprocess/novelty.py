@@ -4,6 +4,28 @@ import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import StandardScaler, RobustScaler, PowerTransformer
 
+from pydantic import BaseModel, Field
+from typing import Dict, List, Tuple, Union
+
+class SklearnScalingConfig(BaseModel):
+    method: str
+    eps: float
+    with_centering: bool
+
+class FeatureConfig(BaseModel):
+    # Maps column name -> [transform_method, alias_name]
+    transforms: Dict[str, List[str]]
+    
+    # List of interaction definitions. 
+    # Each item is a Tuple: (New Feature Name, List of Source Terms)
+    # Matches YAML format: - ["name", ["term1", "term2"]]
+    interactions: List[Tuple[str, List[str]]]
+    
+    scaling: SklearnScalingConfig
+
+class FeatureRootConfig(BaseModel):
+    features: FeatureConfig
+
 #--Class: Feature Engineering Pipeline--#
 class FeatureTransformer(BaseEstimator, TransformerMixin):
     def __init__(self, config):
