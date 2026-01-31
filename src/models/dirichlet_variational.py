@@ -29,8 +29,8 @@ class VariationalDirichlet(gpytorch.Module):
         super().__init__()
         self.config = config
         self.K = self.config.K
-        self.M = self.config.M #-rff samples per atom-#
-        self.D = self.config.D #-input dim to vit-#
+        self.M = self.config.M #-rff samples per mixture-#
+        self.D = self.config.D #-input dim from vit-#
         self.eps = self.config.eps
 
         #--init constraints--#
@@ -91,7 +91,37 @@ class VariationalDirichlet(gpytorch.Module):
         #--Define torch stickbreak module-#
         self.stick_break_transform = torch.distributions.transforms.StickBreakingTransform()
     
-    def forward(self, z: Optional[torch.Tensor]=None, batch_shape=torch.Size([])) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _random_fourier_features(self, z, omega, pi):
+        B, D = z.shape
+        K, M, _ = omega.shape
+
+        W = omega.view(-1, D)
+
+        #-project to frequencies (dot product)-#
+        proj = F.linear(z, W)
+
+        #-harmonics + reshape for weights-#
+        cos_proj = (torch.cos(proj)).view(B, K, M)
+        sin_proj = (torch.sin(proj)).view(B, K, M)
+
+        #-Mixing weights (amortised)-#
+        #-unsqueeze [B, K] -> [B, K, 1] to broadcast over inducing points-#
+        pi_scl = torch.sqrt(pi).unsqueeze(-1)
+        cos_proj = cos_proj * pi_scl
+        sin_proj = sin_proj * pi_scl
+
+        #-normalisation-#
+        scale = 1.0 / math.sqrt(self.M)
+        cos_proj = cos_proj.flatten(1) * scale
+        sin_proj = sin_proj.flatten(1) * scale
+
+        #-concat/flatten-#
+        #-[B, K, M, 2] -> [B, K*M*2]
+        feats = torch.cat([cos_proj, sin_proj], dim=-1)
+
+        return feats
+
+    def forward(self, z: Optional[torch.Tensor]=None, batch_shape=torch.Size([]), rff_only=True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         #--A) define variational posterior - q(v)-#
         q_sig = F.softplus(self.q_log_sigma)
         q_dist = Normal(self.q_mu, q_sig)
@@ -153,9 +183,14 @@ class VariationalDirichlet(gpytorch.Module):
         omega = spectral_means + (self.noise_weights * bandwidth)
         omega = torch.clamp(omega, -150.0, 150.0)
 
-        #--Returns:
-        #pi: [B, K] -> local mixing weights
-        #beta: [K] -> global prevalence
-        #omega: [K, M, D] -> spectral frequencies
-        #bias: [K, M] -> spectral phases (fixed)
-        return pi, beta, omega, self.noise_bias
+        if rff_only:
+            #-returns amortised output in rff-#
+            return self._random_fourier_features(z, omega, pi)
+        
+        else:
+            #--Returns:
+            #pi: [B, K] -> local mixing weights
+            #beta: [K] -> global prevalence
+            #omega: [K, M, D] -> spectral frequencies
+            #bias: [K, M] -> spectral phases (fixed)
+            return pi, beta, omega, self.noise_bias
