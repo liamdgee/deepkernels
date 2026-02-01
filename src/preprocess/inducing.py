@@ -1,12 +1,19 @@
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted, check_array
+from pydantic import BaseModel, Field
+
+class InducingConfig(BaseModel):
+    n_inducing: int = 500
+    tolerance_threshold: float = 2e-6
+    kernel_lengthscale: float = 1.0
 
 class InducingPointSelect(BaseEstimator, TransformerMixin):
-    def __init__(self, n_inducing=700, tolerance_threshold=1e-6, kernel_lengthscale=1.0):
-        self.n_inducing = n_inducing
-        self.tol = tolerance_threshold
-        self.lengthscale = kernel_lengthscale
+    def __init__(self, config: InducingConfig):
+        self.config = config
+        self.n_inducing = self.config.n_inducing
+        self.tol = self.config.tolerance_threshold
+        self.lengthscale = self.config.kernel_lengthscale
         self.inducing_points_ = None
         self.chol_factor_ = None
         self.eps = 1e-10
