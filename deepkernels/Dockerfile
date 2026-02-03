@@ -45,4 +45,4 @@ LABEL maintainer="Liam Douglas Giles"
 LABEL version="0.1.0"
 LABEL description="deepkernels: Gaussian Process Regression Framework in O(N)"
 
-ENTRYPOINT ["python", "-m", "deepkernels.orchestrate.predict"]
+ENTRYPOINT ["python", "-m", "deepkernels"]

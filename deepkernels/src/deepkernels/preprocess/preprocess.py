@@ -10,6 +10,7 @@ from typing import List, Tuple, Literal, Optional
 from pydantic import BaseModel, Field
 
 #-Scikit-Learn Dependencies-#
+import sklearn
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import StandardScaler, RobustScaler, OneHotEncoder, LabelEncoder

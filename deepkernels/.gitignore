@@ -30,3 +30,9 @@ __pycache__/
 *.xlsx
 
 *.ipynb
+
+logs/
+notebooks/
+data/
+
+deepkernels/unused/
