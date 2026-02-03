@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pydantic import BaseModel
 from typing import Tuple, Optional
+from gpytorch.priors import NormalPrior, GammaPrior
 
 from src.deepkernels.losses.kl_divergence import KLDivergence
 from src.deepkernels.models.beta_vae import SpectralVAE
@@ -20,7 +21,7 @@ class HDPConfig(BaseModel):
     M: int = 512
     D: int = 128
     eps: float = 1e-3
-    gamma_prior: float = 1.75
+    gamma_init: float = 1.75
     mu_init: float = 0.0
     sigma_init: float = 1.0
     n_tasks: int = 128
@@ -62,6 +63,17 @@ class AmortisedDirichlet(gpytorch.Module):
         self.register_buffer("prior_mu", torch.full((self.K - 1,), self.mu_init))
         self.register_buffer("prior_log_sigma", torch.full((self.K - 1,), self.log_sigma_init)) #-anchor strength-#
 
+        #-priors-#
+        self.register_prior("global_lengthscale_prior", GammaPrior(concentration=2.5, rate=3.5), lambda m: m.h_log_sigma.exp(), lambda m, v: None)
+
+        self.register_prior("local_lengthscale_prior", GammaPrior(concentration=3.0, rate=5.0), lambda m: m.atom_log_sigma.exp(), lambda m,v: None)
+        
+        self.register_prior("gamma_prior", GammaPrior(2.25, 1.25), lambda m: F.softplus(m.gamma), lambda m, v: None)
+
+        self.register_prior("vae_weight_prior", NormalPrior(0.0, 1.0), lambda m: [p for p in m.pi_encoder.parameters()], lambda m, v: None)
+
+        
+
         # ---------------------------------------------------------
         # Content: Spectral Frequencies (Omega)
         # ---------------------------------------------------------
@@ -91,7 +103,7 @@ class AmortisedDirichlet(gpytorch.Module):
         # D) Concentration (Gamma)
         # ---------------------------------------------------------
         #-- Learnable scalar for dirichlet process concentration (gamma)-#
-        self.gamma_init = getattr(self.config, 'gamma_prior', 2.0)
+        self.gamma_init = getattr(self.config, 'gamma_init', 2.0)
         self.gamma = nn.Parameter(torch.tensor(float(self.gamma_init)))
 
         #--Define torch stickbreak module-#

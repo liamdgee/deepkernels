@@ -5,12 +5,14 @@ import torch.nn as nn
 import gpytorch
 from gpytorch.kernels import Kernel
 
+from src.deepkernels.models.beta_vae import SpectralVAE
+
 #-kernel class-#
 class DynamicEigenKernel(Kernel):
     """
     Non-Stationary Spectral Mixture Kernel (positive definite gibbs sampler) built for HMC.
     """
-    def __init__(self, input_dim, n_mixtures=4, hidden_dim=32, hypernet=hnet, **kwargs):
+    def __init__(self, input_dim, n_mixtures=4, hidden_dim=32, hypernet=SpectralVAE, **kwargs):
         super().__init__(**kwargs)
         self.input_dim = input_dim
         self.n_mixtures = n_mixtures
@@ -18,7 +20,7 @@ class DynamicEigenKernel(Kernel):
         self.jitter = 1e-6
 
         #--init hypernetwork-#
-        self.hypernet = hypernet(self.input_dim, self.n_mixtures, self.hidden_dim)
+        self.hypernet = hypernet(input_dim=self.input_dim, k_atoms=self.n_mixtures, hidden_dim=self.hidden_dim)
 
         #-Static global frequencies (we are performing bayesian optimisation in parameter space)-#
         self.register_parameter(
