@@ -32,7 +32,7 @@ class HDPConfig(BaseModel):
 
 
 class AmortisedDirichlet(gpytorch.Module):
-    def __init__(self, config:HDPConfig, hypernetwork=SpectralVAE):
+    def __init__(self, config:HDPConfig, vae=SpectralVAE):
         super().__init__()
         self.config = config
         self.K = self.config.K
@@ -72,7 +72,6 @@ class AmortisedDirichlet(gpytorch.Module):
 
         self.register_prior("vae_weight_prior", NormalPrior(0.0, 1.0), lambda m: [p for p in m.pi_encoder.parameters()], lambda m, v: None)
 
-        
 
         # ---------------------------------------------------------
         # Content: Spectral Frequencies (Omega)
@@ -97,7 +96,7 @@ class AmortisedDirichlet(gpytorch.Module):
         # C) Amortized Inference (pi_encoder)
         # ---------------------------------------------------------
         #--Data Encoder for local mixing weights-#
-        self.pi_encoder = hypernetwork(input_dim=self.D, k_atoms=self.K, M=self.M, latent_dim=16, hidden_dim=128)
+        self.pi_encoder = vae(input_dim=self.D, k_atoms=self.K, M=self.M, latent_dim=16, hidden_dim=128)
 
         # ---------------------------------------------------------
         # D) Concentration (Gamma)
@@ -150,7 +149,7 @@ class AmortisedDirichlet(gpytorch.Module):
 
         return feats #-[B, (K * M * 2)]
 
-    def forward(self, z: Optional[torch.Tensor]=None, batch_shape=torch.Size([])) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, z: Optional[torch.Tensor]=None, batch_shape=torch.Size([]), rff_kernel=False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         #--A) define variational posterior - q(v)-#
         q_sig = F.softplus(self.q_log_sigma)
         q_dist = Normal(self.q_mu, q_sig)
@@ -170,7 +169,7 @@ class AmortisedDirichlet(gpytorch.Module):
         gamma = F.softplus(self.gamma)
 
         prior_conc = (gamma * beta) + self.eps
-        prior_conc = torch.clamp(prior_conc, min=self.eps, max=100.0)
+        prior_conc = torch.clamp(prior_conc, min=1e-2, max=100.0)
 
         #--E) amortised inference--#
         ls_pred = None
@@ -188,7 +187,7 @@ class AmortisedDirichlet(gpytorch.Module):
             vae_out = self.pi_encoder(z)
             local_conc = vae_out['alpha'] #-[B, K]-#
             amortised_ls = vae_out['ls']
-            ls_pred = amortised_ls
+            ls_pred = torch.clamp(amortised_ls, min=self.eps, max=5.0)
             
             #-Posterior Concentration (global belief + local evidence)-
             local_conc = torch.clamp(local_conc, min=self.eps, max=100.0)
@@ -215,8 +214,9 @@ class AmortisedDirichlet(gpytorch.Module):
             bw_dyn = 1.0 / (ls_pred + jitter) #-inv ls-#
             bw = bw_base * bw_dyn.unsqueeze(2)
         else:
-            bw = bw_base
-        
+            bw = bw_base 
+       
+
         #-omega ~ N(spectral_means, bandwidth)
         #- omega shape: - [K, M, D]-#
         omega = spectral_means + (self.noise_weights * bw)
@@ -231,4 +231,10 @@ class AmortisedDirichlet(gpytorch.Module):
         #beta: [K] -> global prevalence
         #omega: [K, M, D] -> spectral frequencies
         #bias: [K, M] -> spectral phases (fixed)
-        return pi, beta, omega, self.noise_bias
+        if rff_kernel:
+            print("Outputs are tailored for RFF kernel")
+            return pi, beta, omega, self.noise_bias
+        
+        else:
+            print("Outputs are tailored for an exact kernel")
+            return pi, beta, spectral_means, bw
