@@ -52,7 +52,7 @@ class DeepGaussianProcess(gpytorch.models.ApproximateGP):
 
         self.auxiliary_loss = torch.tensor(0.0)
     
-    def _get_target_rff(self, z, spectral_means, bw, pi):
+    def _comp_target_rff(self, z, spectral_means, bw, pi):
             omega = spectral_means * bw 
 
             proj = (z.unsqueeze(1).unsqueeze(1) * omega.unsqueeze(0)).sum(dim=-1)
@@ -78,13 +78,13 @@ class DeepGaussianProcess(gpytorch.models.ApproximateGP):
         #-if raw data-#
         else:
             z = self.vit(x)
+            pi, beta, spectral_means, bw = self.dirichlet(z)
             if self.training:
+                target_rff_tensor = self._comp_target_rff(z, spectral_means, bw, pi)
                 vae_out = self.vae(z)
-                vae_loss = self.vae.loss(vae_out, target_rff = self.target_rff)
+                vae_loss = self.vae.loss(vae_out, target_rff = target_rff_tensor)
                 self.auxiliary_loss = vae_loss
             
-            #-amortisation-#
-            pi, beta, spectral_means, bw = self.dirichlet(z)
             #-concat and feed back to kernel-#
             x_aug = torch.cat([z, pi], dim=-1)
         
@@ -99,7 +99,7 @@ class DeepGaussianProcess(gpytorch.models.ApproximateGP):
             bw=bw
         )
         
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)\
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
         
     
 class DeepSpectralObjective(gpytorch.mlls.MarginalLogLikelihood):

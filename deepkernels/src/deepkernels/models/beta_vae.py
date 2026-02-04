@@ -173,7 +173,7 @@ class SpectralVAE(nn.Module):
 
         return vae_outputs
 
-    def loss(self, vae_outputs, beta_divergence_factor_override=None):
+    def loss(self, vae_outputs, target_rff, beta_divergence_factor_override=None):
         """
         Calculates the spectral reconstruction loss
         Args:
@@ -183,7 +183,6 @@ class SpectralVAE(nn.Module):
         recon_rff = vae_outputs['recon_rff']
         mu = vae_outputs['mu']
         logvar = vae_outputs['logvar']
-        target_rff = None #-placeholder-#
         
         #-MSE Recon Loss-#
         #-VAE kernel dream (recon_rff) against GP kernel fourier features-#
@@ -196,3 +195,18 @@ class SpectralVAE(nn.Module):
         beta = beta_divergence_factor_override if beta_divergence_factor_override is not None else self.beta
         
         return recon_loss + beta * kl_loss
+    
+    def get_target_rff(self, z, omega, pi):
+        """
+        z: [B, D]
+        omega: [K, M, D]
+        pi: [B, K]
+        """
+        proj = (z.unsqueeze(1).unsqueeze(1) * omega.unsqueeze(0)).sum(dim=-1)
+        feat_cos = torch.cos(2 * math.pi * proj)
+        feat_sin = torch.sin(2 * math.pi * proj)
+        features_k = torch.cat([feat_cos, feat_sin], dim=-1)
+        target_rff = (features_k * pi.unsqueeze(-1)).sum(dim=1) #-[B, 2M]
+        target_rff = target_rff / math.sqrt(self.config.M)
+        
+        return target_rff
