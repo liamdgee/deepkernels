@@ -2,9 +2,79 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.parametrizations as P
+from pydantic import Field, BaseModel, PositiveInt, PositiveFloat, validator
+import math
+
+class VAEConfig(BaseModel):
+    """
+    Configuration for the Dirichlet VAE Base Model.
+    """
+    # --- Input Dimensions ---
+    input_dim: PositiveInt = Field(
+        default=128, 
+        description="Dimension of input features (D)"
+    )
+    
+    # --- VAE Architecture ---
+    latent_dim: PositiveInt = Field(
+        default=16, 
+        description="Size of the VAE bottleneck (z)"
+    )
+    hidden_dim: PositiveInt = Field(
+        default=128, 
+        description="Width of hidden layers in encoder/decoder"
+    )
+    depth: PositiveInt = Field(
+        default=4, 
+        description="Number of layers in the deep spectral networks"
+    )
+    
+    # --- Mixture & Spectral Params ---
+    k_atoms: PositiveInt = Field(
+        default=30, 
+        description="Number of Dirichlet components / Experts (K)"
+    )
+    M: PositiveInt = Field(
+        default=256, 
+        description="Number of RFF spectral samples (Frequency modes)"
+    )
+    
+    target_rff: PositiveInt = Field(
+        default=512, 
+        description="Number of RFF targets (2M)"
+    )
+
+    # --- Regularization & Stability ---
+    beta: PositiveFloat = Field(
+        default=3.0, 
+        description="Beta-VAE disentanglement factor"
+    )
+    jitter: float = Field(
+        default=1e-6, 
+        description="Numerical stability term for matrix operations"
+    )
+
+    class Config:
+        extra = "forbid" 
+        json_schema_extra = {
+            "example": {
+                "input_dim": 128,
+                "k_atoms": 50,
+                "M": 512,
+                "latent_dim": 32,
+                "beta": 4.0
+            }
+        }
+
+    @validator("M")
+    def check_M_is_even(cls, v):
+        """Optional: Enforce M is even if using Sin/Cos RFF pairs."""
+        if v % 2 != 0:
+            raise ValueError(f"M (spectral samples) must be even, got {v}")
+        return v
 
 class SpectralVAE(nn.Module):
-    def __init__(self, input_dim=128, k_atoms=30, M=256, latent_dim=16, beta=3.0, hidden_dim=128, depth=4):
+    def __init__(self, config: VAEConfig):
         """
         Args:
             input_dim: Dimension of input features
@@ -15,14 +85,16 @@ class SpectralVAE(nn.Module):
             hidden_dim: Width of hidden layers.
         """
         super().__init__()
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.K = k_atoms
-        self.beta = beta
-        self.H = hidden_dim
-        self.jitter = 1e-6
-        self.D = depth
-        self.M = M
+        self.config = config
+        self.input_dim = self.config.input_dim
+        self.latent_dim = self.config.latent_dim
+        self.K = self.config.k_atoms
+        self.beta = self.config.beta
+        self.H = self.config.hidden_dim
+        self.jitter = self.config.jitter
+        self.D = self.config.depth
+        self.M = self.config.M
+        self.target_rff = 2 * self.M
 
         #-output dim-#
         self.rff_out = self.K * self.M * 2
@@ -88,6 +160,8 @@ class SpectralVAE(nn.Module):
         decoder_hidden = self.decoder(z)
         recon_rff = self.rkhs_head(decoder_hidden)
 
+        self.z = z
+
         vae_outputs = {
             "alpha": alpha,          #-Dirichlet-#
             "ls": ls,                #-Kernel-#
@@ -99,7 +173,7 @@ class SpectralVAE(nn.Module):
 
         return vae_outputs
 
-    def loss(self, vae_outputs, target_rff, beta_divergence_factor_override=None):
+    def loss(self, vae_outputs, beta_divergence_factor_override=None):
         """
         Calculates the spectral reconstruction loss
         Args:
@@ -109,6 +183,7 @@ class SpectralVAE(nn.Module):
         recon_rff = vae_outputs['recon_rff']
         mu = vae_outputs['mu']
         logvar = vae_outputs['logvar']
+        target_rff = None #-placeholder-#
         
         #-MSE Recon Loss-#
         #-VAE kernel dream (recon_rff) against GP kernel fourier features-#
