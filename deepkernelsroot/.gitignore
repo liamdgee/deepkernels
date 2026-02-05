@@ -36,3 +36,5 @@ notebooks/
 data/
 
 deepkernels/unused/
+.DS_Store
+Thumbs.db
