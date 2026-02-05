@@ -1,0 +1,17 @@
+# --- DEEPKERNELS CORE DEPENDENCIES --- #
+pandas>=2.2.0
+numpy>=1.26.0
+pydantic>=2.0.0
+scipy>=1.11.0
+scikit-learn>=1.7.0
+
+# --- PROBABILISTIC MODELS & DL --- #
+torch>=2.2.0
+torchvision
+gpytorch>=1.11
+linear_operator>=0.5.0
+mlflow>=2.10.0
+
+# --- DEPLOYMENT & UTILS --- #
+opencv-python-headless 
+tqdm

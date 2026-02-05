@@ -1,0 +1,36 @@
+# pyproject.toml
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepkernels"
+version = "0.1.0"
+description = "An end-to-end modular framework for probabilstic inference (deep kernel learning) and uncertainty quantification (Gaussian Processes) in Stricly Linear computational efficiency [O(N)]"
+requires-python = ">=3.10"
+
+dependencies = [
+    "pandas==2.3.3",
+    "numpy==2.2.6",
+    "pydantic>=2.12.5",
+    "scipy>=1.15.3",
+    "torch==2.5.1",
+    "torchvision",
+    "scikit-learn==1.7.2",
+    "gpytorch>=1.11",
+    "mlflow",
+    "linear-operator"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "jupyterlab",
+    "black",
+    "isort"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include= ["deepkernels*"]
