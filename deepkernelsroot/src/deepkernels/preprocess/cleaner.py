@@ -1,4 +1,7 @@
 #---Dependencies---#
+import sklearn
+sklearn.set_config(transform_output="pandas")
+
 import os
 import logging
 import numpy as np
@@ -9,7 +12,7 @@ from typing import List, Dict, Optional, Union, Literal, Annotated
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 from sklearn.compose import ColumnTransformer
-from sklearn.compose import StandardScaler
+from sklearn.preprocessing import StandardScaler
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
@@ -31,9 +34,10 @@ class CleanerConfig(BaseModel):
     "dissim_scaled", "isolation_scaled", "animus_scaled", 
     "iat_score_f_scaled", "mdi"
     ]
+    override_to_numeric_cols: Optional[List[str]] = None
+
     default_id_cols: List[str] = ['unique_borrower', 'lender_clean']
     override_id_cols: Optional[List[str]] = None
-    override_to_numeric_cols: Optional[List[str]] = None
 
     @property
     def active_id_cols(self) -> List[str]:
@@ -48,7 +52,9 @@ class CleanerConfig(BaseModel):
 #---Data Cleaning Pipeline Class---#
 class DataCleaner(BaseEstimator, TransformerMixin):
     def __init__(
-            self, config: CleanerConfig, id_cols: Optional[List[str]] = None,
+            self, 
+            config: CleanerConfig, 
+            id_cols: Optional[List[str]] = None,
             to_numeric: Optional[List[str]] = None, 
             missingness_threshold: Annotated[float, Field(ge=0, le=1)] = 0.85, 
             impute_strategy: Literal['mean', 'median', 'mode', 'zero'] = 'mean', 
@@ -78,7 +84,7 @@ class DataCleaner(BaseEstimator, TransformerMixin):
         self.keep_cols_ = None
 
         self.default_id_cols = ['unique_borrower', 'lender_clean']
-        self.id_cols = id_cols if id_cols is not None else self.default_id_cols
+        self.id_cols = id_cols if id_cols is not None else self.config.active_id_cols
 
         self.processor = ColumnTransformer(
             transformers=[
