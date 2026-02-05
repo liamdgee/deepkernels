@@ -5,9 +5,11 @@ import numpy as np
 import pandas as pd
 import warnings
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Union, Literal
+from typing import List, Dict, Optional, Union, Literal, Annotated
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
+from sklearn.compose import ColumnTransformer
+from sklearn.compose import StandardScaler
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
@@ -16,10 +18,10 @@ if not logger.handlers:
 
 #--Config--#
 class CleanerConfig(BaseModel):
-    missingness_threshold: float = Field(default=0.8, ge=0, le=1)
+    missingness_threshold: Annotated[float, Field(ge=0, le=1)] = 0.85
     impute_strategy: Literal['mean', 'median', 'mode', 'zero'] = 'mean'
-    categorical_threshold: float = 0.025 #--1 in 40 values is unqiue--#
-    to_numeric: Optional[List[str]] = [
+    categorical_threshold: Annotated[float, Field(ge=0, le=1)] = 0.025
+    default_to_numeric: Optional[List[str]] = [
     "black_s_pct", "black_g_pct", "black_fs_pct", "black_bifsg_pct", "black_sg_pct",
     "share_pop_black", "share_black_pop_geba",
     "shr_loan_black_final_race", "shr_loan_black_sg_cont", 
@@ -28,17 +30,37 @@ class CleanerConfig(BaseModel):
     "total_percap_inc", "amountsought",
     "dissim_scaled", "isolation_scaled", "animus_scaled", 
     "iat_score_f_scaled", "mdi"
-    ] #-manually input-#
+    ]
+    default_id_cols: List[str] = ['unique_borrower', 'lender_clean']
+    override_id_cols: Optional[List[str]] = None
+    override_to_numeric_cols: Optional[List[str]] = None
+
+    @property
+    def active_id_cols(self) -> List[str]:
+        return self.override_id_cols if self.override_id_cols is not None else self.default_id_cols
+    
+    @property
+    def active_numeric_cols(self) -> List[str]:
+        return self.override_to_numeric_cols if self.override_to_numeric_cols is not None else self.default_to_numeric
+
 
 
 #---Data Cleaning Pipeline Class---#
 class DataCleaner(BaseEstimator, TransformerMixin):
-    def __init__(self, config: CleanerConfig, missingness_threshold: float = Field(default=0.8, ge=0.01, le=0.995), impute_strategy: Literal['mean', 'median', 'mode', 'zero'] = 'mean', categorical_threshold: float = Field(default=0.025, ge=0.001, le=0.9)):
+    def __init__(
+            self, config: CleanerConfig, id_cols: Optional[List[str]] = None,
+            to_numeric: Optional[List[str]] = None, 
+            missingness_threshold: Annotated[float, Field(ge=0, le=1)] = 0.85, 
+            impute_strategy: Literal['mean', 'median', 'mode', 'zero'] = 'mean', 
+            categorical_threshold: Annotated[float, Field(ge=0, le=1)] = 0.025, 
+            **kwargs
+        ):
+
         self.config = config or CleanerConfig()
         self.missingness_threshold = missingness_threshold or self.config.missingness_threshold
         self.impute_strategy = impute_strategy or self.config.impute_strategy
         self.categorical_threshold = categorical_threshold or self.config.categorical_threshold
-        self.to_numeric = [
+        self.default_to_numeric = [
             "black_s_pct", "black_g_pct", "black_fs_pct", "black_bifsg_pct", "black_sg_pct",
             "share_pop_black", "share_black_pop_geba",
             "shr_loan_black_final_race", "shr_loan_black_sg_cont", 
@@ -48,9 +70,25 @@ class DataCleaner(BaseEstimator, TransformerMixin):
             "dissim_scaled", "isolation_scaled", "animus_scaled", 
             "iat_score_f_scaled", "mdi"
         ]
+        
+        self.to_numeric = to_numeric if to_numeric is not None else self.default_to_numeric
+
         self.feature_names_out_ = None
         self.dtype_map_ = None
         self.keep_cols_ = None
+
+        self.default_id_cols = ['unique_borrower', 'lender_clean']
+        self.id_cols = id_cols if id_cols is not None else self.default_id_cols
+
+        self.processor = ColumnTransformer(
+            transformers=[
+                ('scaler', StandardScaler(), self.to_numeric),
+                ('keep_ids', 'passthrough', self.id_cols)
+            ]
+        )
+    
+    def clean(self, df):
+        return self.processor.fit_transform(df)
     
     def fit(self, X: pd.DataFrame, y=None):
         X_norm = self._canonicalise_headers(X.copy())
