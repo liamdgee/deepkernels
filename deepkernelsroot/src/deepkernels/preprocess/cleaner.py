@@ -28,18 +28,26 @@ class CleanerConfig(BaseModel):
     "total_percap_inc", "amountsought",
     "dissim_scaled", "isolation_scaled", "animus_scaled", 
     "iat_score_f_scaled", "mdi"
-    ]
+    ] #-manually input-#
 
 
 #---Data Cleaning Pipeline Class---#
 class DataCleaner(BaseEstimator, TransformerMixin):
     def __init__(self, config: CleanerConfig, missingness_threshold: float = Field(default=0.8, ge=0.01, le=0.995), impute_strategy: Literal['mean', 'median', 'mode', 'zero'] = 'mean', categorical_threshold: float = Field(default=0.025, ge=0.001, le=0.9)):
-        self.config = config if config is not None else CleanerConfig
+        self.config = config or CleanerConfig()
         self.missingness_threshold = missingness_threshold or self.config.missingness_threshold
         self.impute_strategy = impute_strategy or self.config.impute_strategy
         self.categorical_threshold = categorical_threshold or self.config.categorical_threshold
-        self.to_numeric = config.to_numeric or []
-        self.impute_vals_ = {}
+        self.to_numeric = [
+            "black_s_pct", "black_g_pct", "black_fs_pct", "black_bifsg_pct", "black_sg_pct",
+            "share_pop_black", "share_black_pop_geba",
+            "shr_loan_black_final_race", "shr_loan_black_sg_cont", 
+            "shr_loan_white_final_race", "shr_loan_white_sg_cont",
+            "shr_app_black_sg_cont", "shr_app_white_sg_cont",
+            "total_percap_inc", "amountsought",
+            "dissim_scaled", "isolation_scaled", "animus_scaled", 
+            "iat_score_f_scaled", "mdi"
+        ]
         self.feature_names_out_ = None
         self.dtype_map_ = None
         self.keep_cols_ = None
