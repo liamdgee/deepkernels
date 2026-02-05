@@ -52,7 +52,7 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         self.config = config if config else HarmoniserConfig()
         self.numeric_strategy = numeric_strategy
         self.threshold_for_missingness = threshold_for_missingness or self.config.threshold_for_missingness
-        self.mode = mode or self.config.mode
+        self.mode = mode if mode else self.config.mode
 
         self.feature_names_out_ = None
         self.target_schema_ = None
@@ -66,6 +66,10 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         """Learns master schema across multiple input datasets"""
         dfs = [self._canonicalise_headers(df.copy()) for df in dfs_in]
         all_cols = [set(df.columns) for df in dfs]
+
+        if not hasattr(self, 'mode') or self.mode is None:
+            self.mode = self.config.mode if self.config else 'union'
+
         if self.mode == 'intersection':
             schema = sorted(list(set.intersection(*all_cols)))
         else:
