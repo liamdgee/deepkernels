@@ -38,7 +38,7 @@ class DataCleaner(BaseEstimator, TransformerMixin):
         self.missingness_threshold = missingness_threshold or self.config.missingness_threshold
         self.impute_strategy = impute_strategy or self.config.impute_strategy
         self.categorical_threshold = categorical_threshold or self.config.categorical_threshold
-        self.to_numeric = self.config.to_numeric if self.config.to_numeric is not None else []
+        self.to_numeric = config.to_numeric or []
         self.impute_vals_ = {}
         self.feature_names_out_ = None
         self.dtype_map_ = None
