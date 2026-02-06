@@ -18,7 +18,7 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 #-custom type hints for interaction terms-#
-TransformMap: TypeAlias = dict[str, tuple[str]]
+TransformMap: TypeAlias = dict[str, tuple[str, str]]
 CustomInteractionMap: TypeAlias = dict[str, list[str]]
 
 
@@ -61,8 +61,6 @@ class ConfigLoader:
 
 
 class NoveltyConfig(BaseModel):
-    TransformMap: TypeAlias = dict[str, tuple[str, str]]
-    CustomInteractionMap: TypeAlias = dict[str, list[str]]
      #--logic: {col_source_name: ['interaction_base', 'alias_for_pipeline']}-#
     default_transforms: TransformMap = {
         'black_g_pct': ('log1p', 'l1_g'),
