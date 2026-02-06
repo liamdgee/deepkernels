@@ -38,10 +38,6 @@ class CleanerConfig(BaseModel):
 
     default_id_cols: List[str] = ['unique_borrower', 'lender_clean', 'time']
     override_id_cols: Optional[List[str]] = None
-
-    @property
-    def active_id_cols(self) -> List[str]:
-        return self.override_id_cols if self.override_id_cols is not None else self.default_id_cols
     
     @property
     def active_numeric_cols(self) -> List[str]:
@@ -63,9 +59,9 @@ class DataCleaner(BaseEstimator, TransformerMixin):
         ):
 
         self.config = config or CleanerConfig()
-        self.missingness_threshold = missingness_threshold or self.config.missingness_threshold
+        self.missingness_threshold = missingness_threshold or self.config.missingness_threshold or 0.9
         self.impute_strategy = impute_strategy or self.config.impute_strategy
-        self.categorical_threshold = categorical_threshold or self.config.categorical_threshold
+        self.categorical_threshold = categorical_threshold or self.config.categorical_threshold or 0.025
         self.default_to_numeric = [
             "black_s_pct", "black_g_pct", "black_fs_pct", "black_bifsg_pct", "black_sg_pct",
             "share_pop_black", "share_black_pop_geba",
@@ -83,7 +79,7 @@ class DataCleaner(BaseEstimator, TransformerMixin):
         self.dtype_map_ = None
         self.keep_cols_ = None
 
-        self.id_cols = id_cols if id_cols is not None else self.config.active_id_cols
+        self.id_cols = id_cols if id_cols is not None else ['lender_clean', 'time', 'unique_borrower']
 
         self.processor = ColumnTransformer(
             transformers=[
@@ -144,8 +140,8 @@ class DataCleaner(BaseEstimator, TransformerMixin):
             self.impute_vals_ = {col: 0 for col in num_cols}
         else:
             raise ValueError(f"impute strategy must be set to 'mean', 'median', 'mode' or 'zero'. No valid strategy was received-- Current strategy: {self.config.impute_strategy}")
-        
-        obj_cols = X_norm[self.keep_cols_].select_dtypes(include=['object']).columns
+        current_cols = X_norm.columns.intersectiuon(self.keep_cols_)
+        obj_cols = X_norm[current_cols].select_dtypes(include=['object']).columns
         candidate_drop_cols = [col for col in obj_cols if col not in self.id_cols]
         for col in candidate_drop_cols:
             unique_ratio = X_norm[col].nunique() / len(X_norm)
