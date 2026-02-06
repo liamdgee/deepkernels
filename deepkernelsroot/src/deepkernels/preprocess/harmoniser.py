@@ -2,6 +2,7 @@
 import sklearn
 sklearn.set_config(transform_output="pandas")
 
+import warnings
 import pandas as pd
 import numpy as np
 import logging
@@ -131,6 +132,37 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         self.feature_names_out_ = self.target_schema_
         
         return self
+    
+    def _assign_time_index(self, df: pd.DataFrame):
+        """
+        Unique helper function to assign a time index to specific bisg datasets being used.
+        """
+        if 'time' in df.columns:
+            return df
+        if 'lender_clean' in df.columns:
+            target_idx = 'lender_clean'
+        elif 'unique_borrower' in df.columns:
+            target_idx = 'unique_borrower'
+        if target_idx not in df.columns:
+            warnings.warn(
+                f"Column '{target_idx}' not found for sorting. "
+                "Defaulting 'time' index to original row order.",
+                UserWarning
+            )
+            df['time'] = range(len(df))
+        else:
+            warnings.warn(
+                "Neither 'lender_clean' nor 'unique_borrower' found. "
+                "Defaulting 'time' index to original row order.",
+                UserWarning
+            )
+            df['time'] = range(len(df))
+            return df
+        
+        sort_key = df[target_idx].astype(str).str.lower().str.strip()
+        df['time'] = sort_key.rank(method='first').astype(int)
+
+        return df
     
     def transform(self, dfs_in: Union[List[pd.DataFrame], pd.DataFrame], y=None) -> pd.DataFrame:
         """Aligns, tags and merges input datasets into a master data frame"""
