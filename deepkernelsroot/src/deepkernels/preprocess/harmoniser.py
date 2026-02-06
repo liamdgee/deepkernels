@@ -32,7 +32,7 @@ class HarmoniserConfig(BaseModel):
     threshold_for_missingness: Annotated[float, Field(ge=0.0, le=1.0)] = 0.92
     numeric_strategy: Literal['mean', 'median', 'zero', 'mode'] = 'median'
     mode: Literal['union', 'intersection'] = 'union'
-    default_id_cols: List[str] = ['unique_borrower', 'lender_clean']
+    default_id_cols: List[str] = ['unique_borrower', 'lender_clean', 'time']
     override_id_cols: Optional[List[str]] = None
 
     @property
@@ -58,8 +58,6 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         self.target_schema_ = None
         self.impute_values_ = {}
         self.processor_ = None
-
-        self.default_id_cols = ['unique_borrower', 'lender_clean']
         self.id_cols = id_cols if id_cols is not None else self.config.active_id_cols
     
     def fit(self, dfs_in: List[pd.DataFrame], y=None):

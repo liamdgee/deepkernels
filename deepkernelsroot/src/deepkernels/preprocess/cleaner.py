@@ -83,8 +83,7 @@ class DataCleaner(BaseEstimator, TransformerMixin):
         self.dtype_map_ = None
         self.keep_cols_ = None
 
-        base_ids = id_cols if id_cols is not None else self.config.active_id_cols
-        self.id_cols = list(base_ids) if base_ids else ['lender_clean']
+        self.id_cols = id_cols if id_cols is not None else self.config.active_id_cols
         
         if 'time' not in self.id_cols:
             self.id_cols.append('time')

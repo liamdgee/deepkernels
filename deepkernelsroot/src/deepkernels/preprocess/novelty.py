@@ -18,7 +18,7 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 #-custom type hints for interaction terms-#
-TransformMap: TypeAlias = dict[str, list[str]]
+TransformMap: TypeAlias = dict[str, tuple[str]]
 CustomInteractionMap: TypeAlias = dict[str, list[str]]
 
 
@@ -61,38 +61,39 @@ class ConfigLoader:
 
 
 class NoveltyConfig(BaseModel):
-    
+    TransformMap: TypeAlias = dict[str, tuple[str, str]]
+    CustomInteractionMap: TypeAlias = dict[str, list[str]]
      #--logic: {col_source_name: ['interaction_base', 'alias_for_pipeline']}-#
     default_transforms: TransformMap = {
-        'black_g_pct': ['log1p', 'l1_g'],
-        'black_fs_pct': ['log', 'lfs'],
-        'black_sg_pct': ['log', 'lsg'],
-        'black_bifsg_pct': ['log1p', 'l1_bifsg'], 
-        'black_s_pct': ['1', 's']
+        'black_g_pct': ('log1p', 'l1_g'),
+        'black_fs_pct': ('log', 'lfs'),
+        'black_sg_pct': ('log', 'lsg'),
+        'black_bifsg_pct': ('log1p', 'l1_bifsg'), 
+        'black_s_pct': ('1', 's')
     }
 
     override_transforms: Optional[TransformMap] = None
     
     #---logic: [new_feature, [i_term_1, i_term_2, ..., i_term_n]]
     default_interactions: CustomInteractionMap = {
-        'lg_bifsg', ['l1_g', 'black_bifsg_pct'], 
-        'sg_lsg', ['black_sg_pct', 'lsg'], 
-        'lg_lsg', ['l1_g', 'lsg'], 
-        's_lsg', ['s', 'lsg'], 
-        'bifsg_lsg', ['black_bifsg_pct', 'lsg'], 
-        's_bifsg', ['s', 'black_bifsg_pct'], 
-        'sg_s', ['black_sg_pct', 's'], 
-        'lg_s', ['l1_g', 's'], 
-        'lg_s_bifsg', ['l1_g', 's', 'black_bifsg_pct'], 
-        'sg_s_bifsg', ['black_sg_pct', 's', 'black_bifsg_pct'], 
-        'sg_lg_bifsg', ['black_sg_pct', 'l1_g', 'black_bifsg_pct'], 
-        'sg_lg_s', ['black_sg_pct', 'l1_g', 's'], 
-        'lg_bifsg_lsg', ['l1_g', 'black_bifsg_pct', 'lsg'], 
-        's_bifsg_lsg', ['s', 'black_bifsg_pct', 'lsg'], 
-        'sg_bifsg_lsg', ['black_sg_pct', 'black_bifsg_pct', 'lsg'], 
-        'comp_int_1', ['black_sg_pct', 'l1_g', 's', 'black_bifsg_pct', 'lsg'], 
-        'comp_int_2', ['l1_g', 's', 'black_bifsg_pct', 'lsg'], 
-        'comp_int_3', ['black_sg_pct', 'l1_g', 'black_bifsg_pct', 'lsg']
+        'lg_bifsg': ['l1_g', 'black_bifsg_pct'], 
+        'sg_lsg': ['black_sg_pct', 'lsg'], 
+        'lg_lsg': ['l1_g', 'lsg'], 
+        's_lsg': ['s', 'lsg'], 
+        'bifsg_lsg': ['black_bifsg_pct', 'lsg'], 
+        's_bifsg': ['s', 'black_bifsg_pct'], 
+        'sg_s': ['black_sg_pct', 's'], 
+        'lg_s': ['l1_g', 's'], 
+        'lg_s_bifsg': ['l1_g', 's', 'black_bifsg_pct'], 
+        'sg_s_bifsg': ['black_sg_pct', 's', 'black_bifsg_pct'], 
+        'sg_lg_bifsg': ['black_sg_pct', 'l1_g', 'black_bifsg_pct'], 
+        'sg_lg_s': ['black_sg_pct', 'l1_g', 's'], 
+        'lg_bifsg_lsg': ['l1_g', 'black_bifsg_pct', 'lsg'], 
+        's_bifsg_lsg': ['s', 'black_bifsg_pct', 'lsg'], 
+        'sg_bifsg_lsg': ['black_sg_pct', 'black_bifsg_pct', 'lsg'], 
+        'comp_int_1': ['black_sg_pct', 'l1_g', 's', 'black_bifsg_pct', 'lsg'], 
+        'comp_int_2': ['l1_g', 's', 'black_bifsg_pct', 'lsg'], 
+        'comp_int_3': ['black_sg_pct', 'l1_g', 'black_bifsg_pct', 'lsg']
     }
 
     override_interactions: Optional[CustomInteractionMap] = None
