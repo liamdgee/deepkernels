@@ -140,7 +140,7 @@ class DataCleaner(BaseEstimator, TransformerMixin):
             self.impute_vals_ = {col: 0 for col in num_cols}
         else:
             raise ValueError(f"impute strategy must be set to 'mean', 'median', 'mode' or 'zero'. No valid strategy was received-- Current strategy: {self.config.impute_strategy}")
-        current_cols = X_norm.columns.intersectiuon(self.keep_cols_)
+        current_cols = X_norm.columns.intersection(self.keep_cols_)
         obj_cols = X_norm[current_cols].select_dtypes(include=['object']).columns
         candidate_drop_cols = [col for col in obj_cols if col not in self.id_cols]
         for col in candidate_drop_cols:
