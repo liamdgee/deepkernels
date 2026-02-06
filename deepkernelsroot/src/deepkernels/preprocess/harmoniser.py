@@ -29,7 +29,7 @@ class HarmoniserConfig(BaseModel):
     Strict Configuration for cleaning pipeline.
     Validates parameters using Pydantic as a pre pre-processing step.
     """
-    threshold_for_missingness: Annotated[float, Field(ge=0.0, le=1.0)] = 0.92
+    threshold_for_missingness: float = 0.92
     numeric_strategy: Literal['mean', 'median', 'zero', 'mode'] = 'median'
     mode: Literal['union', 'intersection'] = 'union'
     default_id_cols: List[str] = ['unique_borrower', 'lender_clean', 'time']
