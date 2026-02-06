@@ -60,6 +60,7 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         self.impute_values_ = {}
         self.numeric_cols_ = []
         self.processor_ = None
+        self.ids_verified_ = []
     
     def fit(self, dfs_in: List[pd.DataFrame], y=None):
         """Learns master schema across multiple input datasets"""
@@ -94,8 +95,12 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         self.target_schema_ = [k for k in base_schema if pct_null[k] <= self.threshold_for_missingness]
 
         survivors = [df.reindex(columns=self.target_schema_) for df in dfs]
-        temp_master = pd.concat(survivors, ignore_index=True)
-            
+        valid_survivors = [df for df in survivors if not df.empty and not df.isna().all().all()]
+        if valid_survivors:
+            temp_master = pd.concat(valid_survivors, ignore_index=True)
+        else:
+            temp_master = pd.DataFrame(columns=self.target_schema_)
+        
 
         all_num_cols = temp_master.select_dtypes(include=[np.number]).columns.tolist()
         self.numeric_cols_ = [col for col in all_num_cols if col not in self.id_cols]
@@ -141,6 +146,8 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         """
         if 'time' in df.columns:
             return df
+        
+        target_idx = None
         if 'lender_clean' in df.columns:
             target_idx = 'lender_clean'
         elif 'unique_borrower' in df.columns:
@@ -175,12 +182,17 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
 
             if self.impute_values_:
                 temp_df.fillna(self.impute_values_, inplace=True)
-            
             temp_df['src_idx'] = tag
             processed.append(temp_df)
-
-        master = pd.concat(processed, ignore_index=True)
-        return self.processor_.transform(master)
+        
+        valid_processed = [df for df in processed if not df.empty and not df.isna().all().all()]
+        if valid_processed:
+            master = pd.concat(valid_processed, ignore_index=True)
+            return self.processor_.transform(master)
+        else:
+            logger.warning("Returned empty DataFrame in transform")
+            return pd.DataFrame(columns=self.get_feature_names_out())
+        
     
     def get_feature_names_out(self, input_features=None):
         check_is_fitted(self, 'processor_')
