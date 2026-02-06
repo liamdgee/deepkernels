@@ -94,12 +94,8 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         self.target_schema_ = [k for k in base_schema if pct_null[k] <= self.threshold_for_missingness]
 
         survivors = [df.reindex(columns=self.target_schema_) for df in dfs]
-        valid_survivors = [df for df in survivors if not df.empty and not df.isna().all().all()]
-        if not valid_survivors:
-            temp_master = pd.DataFrame(columns=self.target_schema_)
-            logger.warning("Returning an empty pandas data frame to prevent crash. Harmoniser fitting failed.")
-        else:
-            temp_master = pd.concat(valid_survivors, ignore_index=True)
+        temp_master = pd.concat(survivors, ignore_index=True)
+            
 
         all_num_cols = temp_master.select_dtypes(include=[np.number]).columns.tolist()
         self.numeric_cols_ = [col for col in all_num_cols if col not in self.id_cols]
@@ -182,18 +178,8 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
             
             temp_df['src_idx'] = tag
             processed.append(temp_df)
-        
-        validated = [df for df in processed if not df.empty and not df.isna().all().all()]
-        
-        if not validated:
-            master = pd.DataFrame(columns=self.target_schema_)
-            logger.warning("Returning an empty pandas data frame to prevent crash. Harmoniser transform function failed.")
-            if 'src_idx' not in master.columns:
-                master['src_idx'] = 0
-        
-        else:
-            master = pd.concat(validated, ignore_index=True)
-        
+
+        master = pd.concat(processed, ignore_index=True)
         return self.processor_.transform(master)
     
     def get_feature_names_out(self, input_features=None):
