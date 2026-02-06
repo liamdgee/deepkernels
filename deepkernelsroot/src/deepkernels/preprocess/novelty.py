@@ -3,28 +3,111 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import StandardScaler, RobustScaler, PowerTransformer
-
+import yaml
+from pathlib import Path
+import os
 from pydantic import BaseModel, Field
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Tuple, Union, Optional, TypeAlias, Literal
+import logging
 
-class SklearnScalingConfig(BaseModel):
-    method: str
-    eps: float
-    with_centering: bool
 
-class FeatureConfig(BaseModel):
-    # Maps column name -> [transform_method, alias_name]
-    transforms: Dict[str, List[str]]
+#---Init logger---#
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+#-custom type hints for interaction terms-#
+TransformMap: TypeAlias = dict[str, list[str]]
+CustomInteractionMap: TypeAlias = dict[str, list[str]]
+
+
+#-helper function-#
+class ConfigLoader:
+    def __init__(self, filename: str = "config.yaml"):
+        self.filename = filename or "config.yaml"
+        config = self._load_config(self.filename)
+        self._data = config.get("features", {})
+
+    @staticmethod
+    def _load_config(filename: str) -> dict:
+        """
+        Loads a YAML file and returns it as a dictionary.
+        """
+        try:
+            base_dir = Path(__file__).parent.parent.parent
+        except NameError:
+            base_dir = Path.cwd().parent
+
+        config_path = base_dir / filename
+
+        if not config_path.exists():
+            raise FileNotFoundError(f"Failed to locate {filename} at {config_path}")
+
+        try:
+            with open(config_path, 'r') as file:
+                return yaml.load(file, Loader=yaml.SafeLoader) or {}
+        except yaml.YAMLError as e:
+            logger.warning(f"Error parsing YAML file: {e}")
+            return {}
+
+    @property
+    def transforms(self) -> TransformMap:
+        return self._data.get("transforms", {})
     
-    # List of interaction definitions. 
-    # Each item is a Tuple: (New Feature Name, List of Source Terms)
-    # Matches YAML format: - ["name", ["term1", "term2"]]
-    interactions: List[Tuple[str, List[str]]]
-    
-    scaling: SklearnScalingConfig
+    @property
+    def interactions(self) -> CustomInteractionMap:
+        return self._data.get("interactions", {})
 
-class FeatureRootConfig(BaseModel):
-    features: FeatureConfig
+
+class NoveltyConfig(BaseModel):
+    
+    default_transforms: TransformMap = {
+        'black_g_pct': ['log1p', 'l1_g'],
+        'black_fs_pct': ['log', 'lfs'],
+        'black_sg_pct': ['log', 'lsg'],
+        'black_bifsg_pct': ['log1p', 'l1_bifsg'], 
+        'black_s_pct': ['1', 's']
+    }
+
+    override_transforms: Optional[TransformMap] = None
+    
+    default_interactions: CustomInteractionMap = {
+        'lg_bifsg', ['l1_g', 'black_bifsg_pct'], 
+        'sg_lsg', ['black_sg_pct', 'lsg'], 
+        'lg_lsg', ['l1_g', 'lsg'], 
+        's_lsg', ['s', 'lsg'], 
+        'bifsg_lsg', ['black_bifsg_pct', 'lsg'], 
+        's_bifsg', ['s', 'black_bifsg_pct'], 
+        'sg_s', ['black_sg_pct', 's'], 
+        'lg_s', ['l1_g', 's'], 
+        'lg_s_bifsg', ['l1_g', 's', 'black_bifsg_pct'], 
+        'sg_s_bifsg', ['black_sg_pct', 's', 'black_bifsg_pct'], 
+        'sg_lg_bifsg', ['black_sg_pct', 'l1_g', 'black_bifsg_pct'], 
+        'sg_lg_s', ['black_sg_pct', 'l1_g', 's'], 
+        'lg_bifsg_lsg', ['l1_g', 'black_bifsg_pct', 'lsg'], 
+        's_bifsg_lsg', ['s', 'black_bifsg_pct', 'lsg'], 
+        'sg_bifsg_lsg', ['black_sg_pct', 'black_bifsg_pct', 'lsg'], 
+        'comp_int_1', ['black_sg_pct', 'l1_g', 's', 'black_bifsg_pct', 'lsg'], 
+        'comp_int_2', ['l1_g', 's', 'black_bifsg_pct', 'lsg'], 
+        'comp_int_3', ['black_sg_pct', 'l1_g', 'black_bifsg_pct', 'lsg']
+    }
+
+    override_interactions: Optional[CustomInteractionMap] = None
+
+    #-scaling params-#
+    scaling_method: Literal['power', 'standard', 'robust'] = 'power'
+    eps: float = 1e-8
+    centering: bool = True 
+
+    @property
+    def active_interactions(self) -> CustomInteractionMap:
+        return self.override_interactions if self.override_interactions is not None else self.default_interactions
+    
+    @property
+    def active_transforms(self) -> TransformMap:
+        return self.override_transforms if self.override_transforms is not None else self.default_transforms
+
+
 
 #--Class: Feature Engineering Pipeline--#
 class FeatureTransformer(BaseEstimator, TransformerMixin):

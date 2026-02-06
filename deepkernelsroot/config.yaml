@@ -133,7 +133,7 @@ features:
   scaling:
     method: "power"
     eps: 1e-8
-    with_centering: true
+    centering: true
 
 clean:
   missingness_threshold: 0.8
