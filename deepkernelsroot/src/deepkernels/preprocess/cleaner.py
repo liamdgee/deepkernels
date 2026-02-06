@@ -53,7 +53,7 @@ class CleanerConfig(BaseModel):
 class DataCleaner(BaseEstimator, TransformerMixin):
     def __init__(
             self, 
-            config: CleanerConfig, 
+            config: Optional[CleanerConfig] = None, 
             id_cols: Optional[List[str]] = None,
             to_numeric: Optional[List[str]] = None, 
             missingness_threshold: Annotated[float, Field(ge=0, le=1)] = 0.85, 
