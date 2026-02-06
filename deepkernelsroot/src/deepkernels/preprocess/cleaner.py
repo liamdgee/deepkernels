@@ -36,7 +36,7 @@ class CleanerConfig(BaseModel):
     ]
     override_to_numeric_cols: Optional[List[str]] = None
 
-    default_id_cols: List[str] = ['unique_borrower', 'lender_clean']
+    default_id_cols: List[str] = ['unique_borrower', 'lender_clean', 'time']
     override_id_cols: Optional[List[str]] = None
 
     @property
@@ -77,14 +77,17 @@ class DataCleaner(BaseEstimator, TransformerMixin):
             "iat_score_f_scaled", "mdi"
         ]
         
-        self.to_numeric = to_numeric if to_numeric is not None else self.default_to_numeric
+        self.to_numeric = to_numeric if to_numeric is not None else self.default_to_numeric #-for robust testing-#
 
         self.feature_names_out_ = None
         self.dtype_map_ = None
         self.keep_cols_ = None
 
-        self.default_id_cols = ['unique_borrower', 'lender_clean']
-        self.id_cols = id_cols if id_cols is not None else self.config.active_id_cols
+        base_ids = id_cols if id_cols is not None else self.config.active_id_cols
+        self.id_cols = list(base_ids) if base_ids else ['lender_clean']
+        
+        if 'time' not in self.id_cols:
+            self.id_cols.append('time')
 
         self.processor = ColumnTransformer(
             transformers=[
@@ -92,9 +95,38 @@ class DataCleaner(BaseEstimator, TransformerMixin):
                 ('keep_ids', 'passthrough', self.id_cols)
             ]
         )
+        self.processor.set_output(transform="pandas")
     
-    def clean(self, df):
-        return self.processor.fit_transform(df)
+    def _assign_time_index(self, df: pd.DataFrame, target_idx: str = 'lender_clean'):
+        """
+        Unique helper function to assign a time index to specific bisg datasets being used.
+        """
+        if target_idx not in df.columns:
+            warnings.warn(
+                f"Column '{target_idx}' not found for sorting. "
+                "Defaulting 'time' index to original row order.",
+                UserWarning
+            )
+            df['time'] = range(len(df))
+            return df
+        sort_key = df[target_idx].astype(str).str.lower().str.strip()
+        df['time'] = sort_key.rank(method='first').astype(int)
+        df = df.sort_values('time').reset_index(drop=True)
+
+        return df
+
+    def clean(self, df, fit=True):
+        """
+        Args:
+            fit (bool): If True, relearn scaling stats (Training). 
+                        If False, use existing stats (Inference).
+        """
+        df = self._assign_time_index(df)
+        
+        if fit:
+            return self.processor.fit_transform(df)
+        else:
+            return self.processor.transform(df)
     
     def fit(self, X: pd.DataFrame, y=None):
         X_norm = self._canonicalise_headers(X.copy())
