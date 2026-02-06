@@ -5,12 +5,13 @@ sklearn.set_config(transform_output="pandas")
 import pandas as pd
 import numpy as np
 import logging
-from typing import List, Dict, Optional, Literal, Annotated
+from typing import List, Dict, Optional, Literal, Annotated, Union
 from pydantic import BaseModel, Field
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import StandardScaler
+import re
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
@@ -35,10 +36,6 @@ class HarmoniserConfig(BaseModel):
     default_id_cols: List[str] = ['unique_borrower', 'lender_clean', 'time']
     override_id_cols: Optional[List[str]] = None
 
-    @property
-    def active_id_cols(self) -> List[str]:
-        return self.override_id_cols if self.override_id_cols is not None else self.default_id_cols
-
 #--- Schema Harmoniser Class ---#
 class SchemaHarmoniser(BaseEstimator, TransformerMixin):
     def __init__(self, 
@@ -52,66 +49,95 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         self.config = config if config else HarmoniserConfig()
         self.numeric_strategy = numeric_strategy
         self.threshold_for_missingness = threshold_for_missingness or self.config.threshold_for_missingness
-        self.mode = mode if mode else self.config.mode
+        self.mode = mode or self.config.mode or 'union'
+        id_cols_in = id_cols if id_cols is not None else ['lender_clean', 'time', 'unique_borrower']
+        self.id_cols = [self._clean_str(strings) for strings in id_cols_in]
 
+        #-states-#
         self.feature_names_out_ = None
         self.target_schema_ = None
         self.impute_values_ = {}
+        self.numeric_cols_ = []
         self.processor_ = None
-        self.id_cols = id_cols if id_cols is not None else self.config.active_id_cols
     
     def fit(self, dfs_in: List[pd.DataFrame], y=None):
         """Learns master schema across multiple input datasets"""
         dfs = [self._canonicalise_headers(df.copy()) for df in dfs_in]
         all_cols = [set(df.columns) for df in dfs]
 
-        if not hasattr(self, 'mode') or self.mode is None:
-            self.mode = self.config.mode if self.config else 'union'
-
         if self.mode == 'intersection':
-            schema = sorted(list(set.intersection(*all_cols)))
+            base_schema = sorted(list(set.intersection(*all_cols)))
         else:
-            schema = sorted(list(set.union(*all_cols)))
+            base_schema = sorted(list(set.union(*all_cols)))
         
-        concat_for_missingness = pd.concat(dfs)
-        pct_null = concat_for_missingness.isnull().mean()
-        self.target_schema_ = [c for c in schema if pct_null.get(c, 0) <= self.threshold_for_missingness]
+        total_rows = 0
+        null_count = {col: 0 for col in base_schema}
+        
+        #-iterative missingness check --vectorised logic upgrade-#
+        for df in dfs:
+            nrows = len(df)
+            total_rows += nrows
+            nulls = df.isnull().sum()
+            for col in base_schema:
+                if col in nulls.index:
+                    null_count[col] += nulls[col]
+                else:
+                    null_count[col] += nrows
+        
+        if total_rows == 0:
+            pct_null = {col: 1.0 for col in base_schema}
+        else:
+            pct_null = {k: v / total_rows for k, v in null_count.items()}
+        
+        self.target_schema_ = [k for k in base_schema if pct_null[k] <= self.threshold_for_missingness]
 
-        temp_master = concat_for_missingness.reindex(columns=self.target_schema_)
-        num_cols = temp_master.select_dtypes(include=[np.number]).columns.tolist()
-        numeric_cols = [col for col in num_cols if col not in self.id_cols]
+        survivors = [df.reindex(columns=self.target_schema_) for df in dfs]
+        temp_master = pd.concat(survivors, ignore_index=True)
+
+        all_num_cols = temp_master.select_dtypes(include=[np.number]).columns.tolist()
+        self.numeric_cols_ = [col for col in all_num_cols if col not in self.id_cols]
 
         if self.numeric_strategy == 'median':
-            self.impute_values_ = temp_master[numeric_cols].median().to_dict()
+            self.impute_values_ = temp_master[self.numeric_cols_].median().to_dict()
         elif self.numeric_strategy == 'mean':
-            self.impute_values_ = temp_master[numeric_cols].mean().to_dict()
+            self.impute_values_ = temp_master[self.numeric_cols_].mean().to_dict()
         elif self.numeric_strategy == 'mode':
-            self.impute_values_ = temp_master[numeric_cols].mode().iloc[0].to_dict()
+            modes = temp_master[self.numeric_cols_].mode()
+            self.impute_values_ = modes.iloc[0].to_dict() if not modes.empty else {}
         elif self.numeric_strategy == 'zero':
             logger.warning("All missing values will be replaced with 0")
-            self.impute_values_ = {col: 0 for col in numeric_cols}
+            self.impute_values_ = {col: 0 for col in self.numeric_cols_}
         else:
             raise ValueError(f"numeric strategy must be set to 'mean', 'median', 'mode' or 'zero'. No valid strategy was received-- Current strategy: {self.numeric_strategy}")
         
-        self.numeric_cols_ = numeric_cols
-        temp_master['src_idx'] = 0
-        self.id_cols_with_src_idx_ = self.id_cols + ['src_idx']
+        if 'src_idx' not in temp_master.columns:
+            temp_master['src_idx'] = 0
+        
+        self.ids_verified_ = [col for col in (self.id_cols + ['src_idx']) if col in temp_master.columns]
+        
         self.processor_ = ColumnTransformer(
             transformers=[
                 ('scaler', StandardScaler(), self.numeric_cols_),
-                ('keep_ids', 'passthrough', self.id_cols_with_src_idx_)
+                ('keep_ids', 'passthrough', self.ids_verified_)
             ],
-            remainder='drop'
+            remainder='drop',
+            verbose_feature_names_out=False
         )
 
-        self.processor_.fit(temp_master.fillna(self.impute_values_))
+        data_to_fit = temp_master.fillna(self.impute_values_)
+
+        self.processor_.fit(data_to_fit)
 
         self.feature_names_out_ = self.target_schema_
+        
         return self
     
-    def transform(self, dfs_in: List[pd.DataFrame], y=None) -> pd.DataFrame:
+    def transform(self, dfs_in: Union[List[pd.DataFrame], pd.DataFrame], y=None) -> pd.DataFrame:
         """Aligns, tags and merges input datasets into a master data frame"""
         check_is_fitted(self, ['target_schema_', 'impute_values_', 'processor_'])
+        
+        if isinstance(dfs_in, pd.DataFrame):
+            dfs_in = [dfs_in]
         
         processed = []
         
@@ -119,16 +145,14 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
             temp_df = self._canonicalise_headers(df.copy())
 
             temp_df = temp_df.reindex(columns=self.target_schema_ )
+
+            if self.impute_values_:
+                temp_df.fillna(self.impute_values_, inplace=True)
             
             temp_df['src_idx'] = tag
-
             processed.append(temp_df)
         
         master = pd.concat(processed, ignore_index=True)
-
-        for k, v in self.impute_values_.items():
-            if k in master.columns:
-                master[k] = master[k].fillna(v)
         
         return self.processor_.transform(master)
     
@@ -138,12 +162,13 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
     
     def _canonicalise_headers(self, df:pd.DataFrame) -> pd.DataFrame:
         """Seperate for column consistency throughout class"""
-        df.columns = (
-            df.columns.str.strip().str.lower()
-            .str.replace(r'[^\w\s]', '', regex=True)
-            .str.replace(r'\s+', '_', regex=True)
-        )
+        df.columns = [self._clean_str(col) for col in df.columns]
         return df
+    
+    def _clean_str(self, s: str) -> str:
+        """Helper to ensure ID strings match canonical format"""
+        if not isinstance(s, str): return str(s)
+        return re.sub(r'\s+', '_', re.sub(r'[^\w\s]', '', s.strip().lower()))
         
 
 
