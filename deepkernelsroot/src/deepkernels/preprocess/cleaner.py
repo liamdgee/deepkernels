@@ -146,7 +146,8 @@ class DataCleaner(BaseEstimator, TransformerMixin):
             raise ValueError(f"impute strategy must be set to 'mean', 'median', 'mode' or 'zero'. No valid strategy was received-- Current strategy: {self.config.impute_strategy}")
         
         obj_cols = X_norm[self.keep_cols_].select_dtypes(include=['object']).columns
-        for col in obj_cols:
+        candidate_drop_cols = [col for col in obj_cols if col not in self.id_cols]
+        for col in candidate_drop_cols:
             unique_ratio = X_norm[col].nunique() / len(X_norm)
             if unique_ratio > self.categorical_threshold:
                 logger.info(f"Dropping high-cardinality col: {col} (Ratio: {unique_ratio:.4f})")
@@ -169,13 +170,14 @@ class DataCleaner(BaseEstimator, TransformerMixin):
 
         #--Normalise non-numeric cols--#
         obj_cols = df.select_dtypes(include=['object']).columns
-        if not obj_cols.empty:
-            df[obj_cols] = df[obj_cols].apply(lambda x: x.str.strip().str.lower())
-            df[obj_cols] = df[obj_cols].replace(
+        cols_to_clean = [col for col in obj_cols if col not in self.id_cols]
+        if cols_to_clean:
+            df[cols_to_clean] = df[cols_to_clean].apply(lambda x: x.str.strip().str.lower())
+            df[cols_to_clean] = df[cols_to_clean].replace(
                 ["na", "n/a", "unknown", "nan", "null", "none", ""], np.nan
             )
     
-        #--Handle Missingness--#
+        #--Handle Missingness in numeric cols--#
         for k, v in self.impute_vals_.items():
             if k in df.columns:
                 df[k] = df[k].fillna(v)
