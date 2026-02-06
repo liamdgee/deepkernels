@@ -29,7 +29,7 @@ class HarmoniserConfig(BaseModel):
     Strict Configuration for cleaning pipeline.
     Validates parameters using Pydantic as a pre pre-processing step.
     """
-    threshold_for_missingness: float = 0.92
+    threshold_for_missingness: Annotated[float, Field(le=0.995, ge=0.01)] = 0.92
     numeric_strategy: Literal['mean', 'median', 'zero', 'mode'] = 'median'
     mode: Literal['union', 'intersection'] = 'union'
     default_id_cols: List[str] = ['unique_borrower', 'lender_clean', 'time']
@@ -46,7 +46,7 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
                  id_cols: Optional[List[str]] = None,
                  numeric_strategy: Literal['mean', 'median', 'zero', 'mode'] = 'median',
                  mode: Literal['union', 'intersection'] = 'union',
-                 threshold_for_missingness: float = None,
+                 threshold_for_missingness: float = 0.92,
                  **kwargs
         ):
         self.config = config if config else HarmoniserConfig()
