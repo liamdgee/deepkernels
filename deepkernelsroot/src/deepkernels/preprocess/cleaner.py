@@ -89,10 +89,14 @@ class DataCleaner(BaseEstimator, TransformerMixin):
         )
         self.processor.set_output(transform="pandas")
     
-    def _assign_time_index(self, df: pd.DataFrame, target_idx: str = 'lender_clean'):
+    def _assign_time_index(self, df: pd.DataFrame):
         """
         Unique helper function to assign a time index to specific bisg datasets being used.
         """
+        if 'lender_clean' in df.columns:
+            target_idx = 'lender_clean'
+        elif 'unique_borrower' in df.columns:
+            target_idx = 'unique_borrower'
         if target_idx not in df.columns:
             warnings.warn(
                 f"Column '{target_idx}' not found for sorting. "
@@ -100,10 +104,17 @@ class DataCleaner(BaseEstimator, TransformerMixin):
                 UserWarning
             )
             df['time'] = range(len(df))
+        else:
+            warnings.warn(
+                "Neither 'lender_clean' nor 'unique_borrower' found. "
+                "Defaulting 'time' index to original row order.",
+                UserWarning
+            )
+            df['time'] = range(len(df))
             return df
+        
         sort_key = df[target_idx].astype(str).str.lower().str.strip()
         df['time'] = sort_key.rank(method='first').astype(int)
-        df = df.sort_values('time').reset_index(drop=True)
 
         return df
 
