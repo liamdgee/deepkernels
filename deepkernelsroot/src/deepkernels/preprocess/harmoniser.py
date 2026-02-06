@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 import re
 
 #---Init logger---#
@@ -125,7 +125,7 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         
         self.processor_ = ColumnTransformer(
             transformers=[
-                ('scaler', StandardScaler(), self.numeric_cols_),
+                ('scaler', RobustScaler(), self.numeric_cols_),
                 ('keep_ids', 'passthrough', self.ids_verified_)
             ],
             remainder='drop',
