@@ -79,20 +79,21 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
 
         temp_master = concat_for_missingness.reindex(columns=self.target_schema_)
         num_cols = temp_master.select_dtypes(include=[np.number]).columns.tolist()
-        self.numeric_cols_ = [c for c in num_cols if c not in self.id_cols]
+        numeric_cols = [col for col in num_cols if col not in self.id_cols]
 
         if self.numeric_strategy == 'median':
-            self.impute_values_ = temp_master[num_cols].median().to_dict()
+            self.impute_values_ = temp_master[numeric_cols].median().to_dict()
         elif self.numeric_strategy == 'mean':
-            self.impute_values_ = temp_master[num_cols].mean().to_dict()
+            self.impute_values_ = temp_master[numeric_cols].mean().to_dict()
         elif self.numeric_strategy == 'mode':
-            self.impute_values_ = temp_master[num_cols].mode().iloc[0].to_dict()
+            self.impute_values_ = temp_master[numeric_cols].mode().iloc[0].to_dict()
         elif self.numeric_strategy == 'zero':
             logger.warning("All missing values will be replaced with 0")
-            self.impute_values_ = {col: 0 for col in num_cols}
+            self.impute_values_ = {col: 0 for col in numeric_cols}
         else:
             raise ValueError(f"numeric strategy must be set to 'mean', 'median', 'mode' or 'zero'. No valid strategy was received-- Current strategy: {self.numeric_strategy}")
         
+        self.numeric_cols_ = numeric_cols
         temp_master['src_idx'] = 0
         self.id_cols_with_src_idx_ = self.id_cols + ['src_idx']
         self.processor_ = ColumnTransformer(
