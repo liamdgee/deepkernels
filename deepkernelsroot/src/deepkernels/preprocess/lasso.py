@@ -1,15 +1,20 @@
 #filename: lasso_features.py
 
-#-Dependencies-
+#---Dependencies--#
+import sklearn
+sklearn.set_config(transform_output="pandas")
+
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.linear_model import LassoCV
-from sklearn.preprocessing import RobustScaler, PolynomialFeatures
+from sklearn.preprocessing import RobustScaler, PolynomialFeatures, StandardScaler
 from scipy.stats import spearmanr
 import logging
 from pydantic import BaseModel, Field
 from sklearn.utils.validation import check_is_fitted
+from typing import Dict, List, Tuple, Union, Optional, TypeAlias, Literal, Annotated
+from sklearn.model_selection import TimeSeriesSplit
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
@@ -17,145 +22,229 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class FeatureEngConfig(BaseModel):
-    spearman_corr_threshold: float = Field(0.9, ge=0, le=1.0)
-    lasso_cv: int = Field(5, gt=1)
-    lasso_max_samples: int = Field(24000, gt=1, le=24998)
-    vif_threshold: float = Field(8.5, gt=1.0, le=10.0)
+    spearman_corr_threshold: Annotated[float, Field(ge=0, le=1)] = 0.9
+    lasso_cv: Annotated[int, Field(gt=1)] = 5
+    lasso_max_samples: Annotated[int, Field(gt=1, le=24977)] = 24000 #-less than 25k for computational efficiency (24977 is an arbitrarily chosen numerical safeguard)
+    vif_threshold: Annotated[float, Field(gt=1, le=17.0)] = 9.0
     interaction_only: bool = True
     random_state: int = 42
+    power_scaler_override: bool = False
+    ts_split_as_cv_strategy: bool = True
+    cv_split: Annotated[int, Field(gt=1)] = 5
 
 class LassoFeatures(BaseEstimator, TransformerMixin):
-    def __init__(self, config: FeatureEngConfig):
-        self.config = config
-        self.scaler_ = RobustScaler()
+    def __init__(
+            self, 
+                 config: Optional[FeatureEngConfig]=None,
+                 lasso_cv: Optional[int] = None, #-use for static estimates-#
+                 ts_split_as_cv_strategy: bool = True,
+                 cv_split: Optional[int] = None, #-use for time evolving target variable-#
+                 lasso_max_samples: Annotated[int, Field(le=24977, gt=1)] = 24000, 
+                 vif_threshold: float = 9.0,
+                 interaction_only: bool = True, #-only computes polynomial interactions for engineered terms-#
+                 random_state: int = 42,
+                 spearman_corr_threshold: Annotated[float, Field(ge=0, le=1)] = 0.9,
+                 standard_scaler_override: bool = False,  #-assigns standard scaler over robust scaler for speed-#
+                 **kwargs
+        ):
 
+        self.config = config if config else FeatureEngConfig()
+        self.lasso_cv = lasso_cv or self.config.lasso_cv or 5 #-static-#
+        self.cv_split = cv_split or self.config.cv_split or 5 #-time evolving y-#
+        self.ts_split_as_cv_strategy = ts_split_as_cv_strategy
+        self.lasso_max_samples = lasso_max_samples or self.config.lasso_max_samples
+        self.vif_threshold = vif_threshold or self.config.vif_threshold or 10.0
+        self.random_state = random_state or self.config.random_state or 42
+        self.interaction_only = interaction_only if interaction_only else True
+        self.spearman_corr_threshold = spearman_corr_threshold or self.config.spearman_corr_threshold or 0.9
+        self.scaler_ = StandardScaler() if standard_scaler_override else RobustScaler()
+        self.poly_ = None
         self.shipped_features_ = None
-        self.selected_features_ = None
+        self.selected_lasso_features_ = None
     
     def _vif_prune(self, X: pd.DataFrame) -> pd.DataFrame:
-        Xv = X.copy()
-
-        #--Short circuit--#
-
-        if 'const' not in Xv.columns:
-            Xv.insert(0, 'const', 1)
+        """
+        Optimised VIF calculation using Matrix Inversion.
         
-        while True:
-            cols = Xv.columns
-            vals = Xv.values
-            ncol = vals.shape[1]
-
-            if ncol <= 2:
+        Logic:
+            The diagonal elements of the inverted correlation matrix are the VIFs.
+            This allows us to calculate VIF for ALL features in one matrix operation,
+            replacing the need to run N separate OLS regressions per iteration.
+        """
+        df_to_prune = X.copy()
+        dropped = True
+        while dropped:
+            dropped = False
+            cols = df_to_prune.columns
+            if len(cols) < 2:
                 break
-
-            vifs = []
-
-            for idx in range(1, ncol):
-                #--Target (current col)
-                y = vals[:, idx]
-                
-                #-Predict using remaining columns--#
-                mask = np.ones(ncol, dtype=bool)
-                mask[idx] = False
-                Xr = vals[:, mask] #--r for remaining cols--#
-
-                #--Vectorised OLS--#
-                coef, *diagnostics = np.linalg.lstsq(Xr, y, rcond=None)
-
-                rss = np.sum((y - Xr @ coef) ** 2)
-                tss = np.sum((y - np.mean(y)) **2)
-                tss = np.clip(tss, a_min=1e-8, a_max=None)
-
-                rsquared = 1 - (rss / tss)
-                vif = 1 / (1 - rsquared)
-                vifs.append(vif)
             
-            vif_max = max(vifs)
-            if vif_max > self.config.vif_threshold:
-                idx_max = vifs.index(vif_max) + 1
-                drop_cols_ = cols[idx_max]
+            #-corr over cov because vif is scale invariant-#
+            corr_mat = df_to_prune.corr(method='pearson').values
+            
+            try:
+                corr_mat_inv = np.linalg.inv(corr_mat)
+            except np.linalg.LinAlgError:
+                logger.warning("Singular matrix encountered in VIF. Dropping last column to resolve.")
+                df_to_prune = df_to_prune.drop(columns=[cols[-1]])
+                dropped = True
+                continue
+            
+            #-extract vifs (diag values)-#
+            vifs = np.diag(corr_mat_inv)
+            vif_idx = np.argmax(vifs)
+            max_vif_found = vifs[vif_idx]
+            
+            if max_vif_found > self.vif_threshold:
+                drop_cols = cols[vif_idx]
+                logger.info(f"Pruning {drop_cols} (VIF: {max_vif_found:.2f})")
+                df_to_prune = df_to_prune.drop(columns=[drop_cols])
+                dropped = True
+                
+        return df_to_prune
 
-                logger.info(f"-- Pruning {drop_cols_} cols -- variance inflation factor (max): {vif_max:.2f}")
+    def _spearman_thinner(self, X: pd.DataFrame) -> pd.DataFrame:
+        """
+        Removes highly correlated features before computationally heavy steps
+        """
+        corr_mat = X.corr(method='spearman').abs()
+        upper = corr_mat.where(np.triu(np.ones(corr_mat.shape), k=1).astype(bool)) #-upper triangle select-#
+        cols_dropped = [col for col in upper.columns if any(upper[col] > self.spearman_corr_threshold)]
+        if cols_dropped:
+            logger.info(f"Spearman Thinner dropping {len(cols_dropped)} cols: {cols_dropped}")
+        return X.drop(columns=cols_dropped)
+    
+    def _lasso_selector(self, X: pd.DataFrame, y: Union[pd.Series, pd.DataFrame]) -> pd.DataFrame:
+        """
+        Uses L1 regularization to select the most predictive base features
+        Args:
+            X: pandas data frame for feature selection and pruning
+            y: pandas series / data frame of chosen target variable (sometimes identified as y_target)
+        """
+        
+        if isinstance(y, pd.DataFrame):
+            y = y.squeeze()
 
-                Xv = Xv.drop(columns=[drop_cols_])
+        if not isinstance(y, pd.Series):
+            y = pd.Series(y, index=X.index)
+        
+        X = pd.DataFrame(X)
+
+        X_scaled_vals = self.scaler_.fit_transform(X)
+        X_scaled = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
+
+        is_time_series = getattr(self, 'ts_split_as_cv_strategy', False)
+        cv_desc = "Unknown"
+        
+        if is_time_series:
+            # --- Time Series Path ---
+            if self.cv_split is None:
+                cv_obj = TimeSeriesSplit(n_splits=5)
+            elif isinstance(self.cv_split, int):
+                cv_obj = TimeSeriesSplit(n_splits=self.cv_split)
             else:
-                break
+                cv_obj = self.cv_split
+            
+            cv_desc = f"Time Series Split ({cv_obj})"
+            logger.info(f"Fitting Lasso with 8000 max iters using {cv_desc}")
 
-        return Xv.drop(columns=['const'])
+            lasso = LassoCV(
+                cv=cv_obj, 
+                random_state=self.random_state, 
+                n_jobs=-1,
+                max_iter=8000
+            )
+            lasso.fit(X_scaled, y)
 
-    def _spearman_thinner(self, X):
-        X_df = pd.DataFrame(X)
-        corr_matrix = X_df.corr(method='spearman').abs()
-        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-        drop_cols = [col for col in upper.columns if any(upper[col] > self.config.spearman_corr_threshold)]
-        kept_cols = [c for c in X_df.columns if c not in drop_cols]
-        return X_df[kept_cols]
-    
-    def _lasso_selector(self, X, y):
-        X_df = pd.DataFrame(X)
-        X_scld = pd.DataFrame(self.scaler_.fit_transform(X_df), columns=X_df.columns, index=X_df.index)
-        if len(X_df) > self.config.lasso_max_samples:
-            sample_idx = np.random.RandomState(self.config.random_state).choice(len(X_df), self.config.lasso_max_samples, replace=False)
-            X_train = X_scld.loc[sample_idx]
-            y_train = y.loc[sample_idx]
         else:
-            X_train = X_scld
-            y_train = y
-        lasso = LassoCV(cv=self.config.lasso_cv, random_state=self.config.random_state, n_jobs=-1)
-        lasso.fit(X_train, y_train)
-        coef_series = pd.Series(lasso.coef_, index=X_df.columns)
-        selected_features = coef_series[coef_series != 0].index.tolist()
-        return X_df[selected_features]
-    
-    def _create_interactions(self, X):
-        X_df = pd.DataFrame(X)
-        poly = PolynomialFeatures(degree=2, interaction_only=self.config.interaction_only, include_bias=False)
-        X_poly = poly.fit_transform(X_df)
-        shipped_features_ = poly.get_feature_names_out(X_df.columns)
-        X_poly_df = pd.DataFrame(X_poly, columns=shipped_features_, index=X_df.index)
-        return X_poly_df
-    
-    def fit(self, X, y):
-        """Sequential Selection: Spearman -> Lasso -> interaction_terms -> vif_factor"""
-        X_df = pd.DataFrame(X).copy() 
-        y_series = pd.Series(y).copy()
+            # --- Static Path ---
+            cv_desc = f"Static {self.lasso_cv}-Fold CV"
+            if len(X_scaled) > self.lasso_max_samples:
+                sample_idx = np.random.RandomState(self.random_state).choice(
+                    len(X_scaled), self.lasso_max_samples, replace=False
+                )
+                X_train = X_scaled.iloc[sample_idx]
+                y_train = y.iloc[sample_idx]
+                logger.info(f"Subsampled static data to {self.lasso_max_samples} rows.")
+            else:
+                X_train = X_scaled
+                y_train = y
+            
+            lasso = LassoCV(
+                cv=self.lasso_cv,
+                random_state=self.random_state,
+                n_jobs=-1,
+                selection='random'
+            )
+            logger.info("Fitting static Lasso with random selection")
+            lasso.fit(X_train, y_train)
         
-        #--Spearman thinner to filter collinear input cols--#
-        X_thin = self._spearman_thinner(X_df)
+        # --- 4. Feature Extraction ---
+        coef = pd.Series(lasso.coef_, index=X.columns)
+        selected = coef[coef != 0].index.tolist()
         
-        # 2. Lasso Selection (Sparsity filter)
-        X_lasso = self._lasso_selector(X_thin, y_series)
-        self.selected_features_ = X_lasso.columns.tolist()
+        logger.info(f"Lasso selection ({cv_desc}) kept {len(selected)}/{len(X.columns)} features.")
+        
+        # --- 5. Empty Selection Safety Guard ---
+        if not selected:
+             logger.warning("Lasso dropped ALL features. Returning full original set as fallback.")
+             return X
 
-        if not self.selected_features_:
+        return X[selected]
+    
+    def fit(self, X: pd.DataFrame, y: Union[pd.Series, pd.DataFrame]):
+        """Sequential Selection: Spearman -> Lasso -> interaction_terms -> vif_factor"""
+        
+        if isinstance(y, pd.DataFrame):
+            y = y.squeeze()
+        if not isinstance(y, pd.Series):
+            y = pd.Series(y)
+        
+        y_series = pd.Series(y).copy()
+        X_df = pd.DataFrame(X).copy()
+
+        X_thin = self._spearman_thinner(X_df) #-filter collinear inputs-#
+        X_lasso = self._lasso_selector(X_thin, y_series) #-filter sparsity-#
+        self.selected_lasso_features_ = X_lasso.columns.tolist()
+
+        if not self.selected_lasso_features_:
             logger.warning("Lasso selected 0 features -- shipping empty features")
             self.shipped_features_ = []
             return self
         
-        #--Create Interaction Terms--#
-        X_interactions = self._create_interactions(X_lasso)
-        
-        # 4. VIF Prune (Multicollinearity filter for interactions)
-        X_final = self._vif_prune(X_interactions)
-        
-        # 5. THE LOCK: Record exactly which features survived the gauntlet
+        self.poly_ = PolynomialFeatures(
+            degree=2,
+            interaction_only=self.interaction_only,
+            include_bias=False
+        )
+
+        polynomial_feature_vals = self.poly_.fit_transform(X_lasso)
+        selected_poly_features = self.poly_.get_feature_names_out(X_lasso.columns)
+        X_poly = pd.DataFrame(polynomial_feature_vals, columns=selected_poly_features, index=X_lasso.index)
+        X_final = self._vif_prune(X_poly) #-vif prune on interactions only-#
         self.shipped_features_ = X_final.columns.tolist()
         
         return self
     
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         """Applies learned feature transform"""
-
-        check_is_fitted(self, ['shipped_features_', 'selected_features_'])
+        check_is_fitted(self, ['shipped_features_', 'selected_lasso_features_', 'poly_'])
         
         X_df = pd.DataFrame(X)
+        missing_base = [col for col in self.selected_lasso_features_ if col not in X_df.columns]
+        if missing_base:
+            for col in missing_base:
+                X_df[col] = 0
         
-        #--1st order interactions--#
-        X_base = X_df[self.selected_features_]
-        X_poly = self._create_interactions(X_base)
+        X_base = X_df[self.selected_lasso_features_]
         
-        #--Reindex--#
+        # 2. Apply the EXACT SAME polynomial transform
+        polynomial_feature_vals = self.poly_.transform(X_base)
+        selected_poly_features = self.poly_.get_feature_names_out(X_base.columns)
+        X_poly = pd.DataFrame(polynomial_feature_vals, columns=selected_poly_features, index=X_base.index)
+    
         return X_poly.reindex(columns=self.shipped_features_, fill_value=0)
+    
 
     def get_feature_names_out(self, input_features=None):
         check_is_fitted(self, 'shipped_features_')
