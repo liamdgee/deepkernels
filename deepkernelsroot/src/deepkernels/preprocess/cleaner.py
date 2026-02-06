@@ -84,9 +84,6 @@ class DataCleaner(BaseEstimator, TransformerMixin):
         self.keep_cols_ = None
 
         self.id_cols = id_cols if id_cols is not None else self.config.active_id_cols
-        
-        if 'time' not in self.id_cols:
-            self.id_cols.append('time')
 
         self.processor = ColumnTransformer(
             transformers=[
