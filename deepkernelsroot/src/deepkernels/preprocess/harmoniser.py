@@ -64,6 +64,7 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
     def fit(self, dfs_in: List[pd.DataFrame], y=None):
         """Learns master schema across multiple input datasets"""
         dfs = [self._canonicalise_headers(df.copy()) for df in dfs_in]
+        dfs = [self._assign_time_index(df) for df in dfs]
         all_cols = [set(df.columns) for df in dfs]
 
         if self.mode == 'intersection':
@@ -93,7 +94,12 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         self.target_schema_ = [k for k in base_schema if pct_null[k] <= self.threshold_for_missingness]
 
         survivors = [df.reindex(columns=self.target_schema_) for df in dfs]
-        temp_master = pd.concat(survivors, ignore_index=True)
+        valid_survivors = [df for df in survivors if not df.empty and not df.isna().all().all()]
+        if not valid_survivors:
+            temp_master = pd.DataFrame(columns=self.target_schema_)
+            logger.warning("Returning an empty pandas data frame to prevent crash. Harmoniser fitting failed.")
+        else:
+            temp_master = pd.concat(valid_survivors, ignore_index=True)
 
         all_num_cols = temp_master.select_dtypes(include=[np.number]).columns.tolist()
         self.numeric_cols_ = [col for col in all_num_cols if col not in self.id_cols]
@@ -143,14 +149,7 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
             target_idx = 'lender_clean'
         elif 'unique_borrower' in df.columns:
             target_idx = 'unique_borrower'
-        if target_idx not in df.columns:
-            warnings.warn(
-                f"Column '{target_idx}' not found for sorting. "
-                "Defaulting 'time' index to original row order.",
-                UserWarning
-            )
-            df['time'] = range(len(df))
-        else:
+        if target_idx is None:
             warnings.warn(
                 "Neither 'lender_clean' nor 'unique_borrower' found. "
                 "Defaulting 'time' index to original row order.",
@@ -175,7 +174,7 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         
         for tag, df in enumerate(dfs_in):
             temp_df = self._canonicalise_headers(df.copy())
-
+            temp_df = self._assign_time_index(temp_df)
             temp_df = temp_df.reindex(columns=self.target_schema_ )
 
             if self.impute_values_:
@@ -184,7 +183,16 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
             temp_df['src_idx'] = tag
             processed.append(temp_df)
         
-        master = pd.concat(processed, ignore_index=True)
+        validated = [df for df in processed if not df.empty and not df.isna().all().all()]
+        
+        if not validated:
+            master = pd.DataFrame(columns=self.target_schema_)
+            logger.warning("Returning an empty pandas data frame to prevent crash. Harmoniser transform function failed.")
+            if 'src_idx' not in master.columns:
+                master['src_idx'] = 0
+        
+        else:
+            master = pd.concat(validated, ignore_index=True)
         
         return self.processor_.transform(master)
     

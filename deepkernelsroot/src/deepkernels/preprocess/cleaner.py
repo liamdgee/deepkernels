@@ -97,14 +97,7 @@ class DataCleaner(BaseEstimator, TransformerMixin):
             target_idx = 'lender_clean'
         elif 'unique_borrower' in df.columns:
             target_idx = 'unique_borrower'
-        if target_idx not in df.columns:
-            warnings.warn(
-                f"Column '{target_idx}' not found for sorting. "
-                "Defaulting 'time' index to original row order.",
-                UserWarning
-            )
-            df['time'] = range(len(df))
-        else:
+        if target_idx is None:
             warnings.warn(
                 "Neither 'lender_clean' nor 'unique_borrower' found. "
                 "Defaulting 'time' index to original row order.",
