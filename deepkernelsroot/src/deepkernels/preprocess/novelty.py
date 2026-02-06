@@ -35,15 +35,16 @@ class ConfigLoader:
         Loads a YAML file and returns it as a dictionary.
         """
         try:
-            base_dir = Path(__file__).parent.parent.parent
+            base_dir = Path(__file__).resolve().parent.parent.parent
         except NameError:
-            base_dir = Path.cwd().parent
+            base_dir = Path.cwd()
 
         config_path = base_dir / filename
 
         if not config_path.exists():
-            raise FileNotFoundError(f"Failed to locate {filename} at {config_path}")
-
+            logger.warning(f"Config file not found at {config_path}. Using internal defaults.")
+            return {}
+        
         try:
             with open(config_path, 'r') as file:
                 return yaml.load(file, Loader=yaml.SafeLoader) or {}
@@ -99,15 +100,6 @@ class NoveltyConfig(BaseModel):
     #-scaling params-#
     scaling_method: Literal['power', 'standard', 'robust'] = 'power'
     eps: Annotated[float, Field(ge=1e-14, le=1e-2)] = 1e-8
-    centering: bool = True 
-
-    @property
-    def active_interactions(self) -> CustomInteractionMap:
-        return self.override_interactions if self.override_interactions is not None else self.default_interactions
-    
-    @property
-    def active_transforms(self) -> TransformMap:
-        return self.override_transforms if self.override_transforms is not None else self.default_transforms
 
 
 
@@ -120,15 +112,43 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
             interactions: Optional[CustomInteractionMap] = None,
             scaling_method: Literal['power', 'standard', 'robust'] = 'power',
             eps: Annotated[float, Field(ge=1e-14, le=1e-2)] = 1e-8,
-            centering: bool = True,
             **kwargs
         ):
 
         self.config = config if config else NoveltyConfig()
-        self.transforms = transforms if transforms is not None else self.config.active_transforms
-        self.interactions = interactions if interactions is not None else self.config.active_interactions
-        self.eps = eps or self.config.eps
-        self.scaling_method = scaling_method or self.config.scaling_method
+        default_interactions = {
+            'lg_bifsg': ['l1_g', 'black_bifsg_pct'], 
+            'sg_lsg': ['black_sg_pct', 'lsg'], 
+            'lg_lsg': ['l1_g', 'lsg'], 
+            's_lsg': ['s', 'lsg'], 
+            'bifsg_lsg': ['black_bifsg_pct', 'lsg'], 
+            's_bifsg': ['s', 'black_bifsg_pct'], 
+            'sg_s': ['black_sg_pct', 's'], 
+            'lg_s': ['l1_g', 's'], 
+            'lg_s_bifsg': ['l1_g', 's', 'black_bifsg_pct'], 
+            'sg_s_bifsg': ['black_sg_pct', 's', 'black_bifsg_pct'], 
+            'sg_lg_bifsg': ['black_sg_pct', 'l1_g', 'black_bifsg_pct'], 
+            'sg_lg_s': ['black_sg_pct', 'l1_g', 's'], 
+            'lg_bifsg_lsg': ['l1_g', 'black_bifsg_pct', 'lsg'], 
+            's_bifsg_lsg': ['s', 'black_bifsg_pct', 'lsg'], 
+            'sg_bifsg_lsg': ['black_sg_pct', 'black_bifsg_pct', 'lsg'], 
+            'comp_int_1': ['black_sg_pct', 'l1_g', 's', 'black_bifsg_pct', 'lsg'], 
+            'comp_int_2': ['l1_g', 's', 'black_bifsg_pct', 'lsg'], 
+            'comp_int_3': ['black_sg_pct', 'l1_g', 'black_bifsg_pct', 'lsg']
+        }
+
+        default_transforms = {
+            'black_g_pct': ('log1p', 'l1_g'),
+            'black_fs_pct': ('log', 'lfs'),
+            'black_sg_pct': ('log', 'lsg'),
+            'black_bifsg_pct': ('log1p', 'l1_bifsg'), 
+            'black_s_pct': ('1', 's')
+        }
+
+        self.transforms = transforms if transforms is not None else default_transforms
+        self.interactions = interactions if interactions is not None else default_interactions
+        self.eps = eps or self.config.eps or 1e-8
+        self.scaling_method = scaling_method or self.config.scaling_method or 'power'
         self.scaler_ = None
         
 
