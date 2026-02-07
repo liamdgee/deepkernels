@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class FeatureEngConfig(BaseModel):
+class LassoConfig(BaseModel):
     spearman_corr_threshold: Annotated[float, Field(ge=0, le=1)] = 0.9
     lasso_cv: Annotated[int, Field(gt=1)] = 5
     lasso_max_samples: Annotated[int, Field(gt=1, le=24977)] = 24000 #-less than 25k for computational efficiency (24977 is an arbitrarily chosen numerical safeguard)
@@ -35,7 +35,7 @@ class FeatureEngConfig(BaseModel):
 class LassoFeatures(BaseEstimator, TransformerMixin):
     def __init__(
             self, 
-                 config: Optional[FeatureEngConfig]=None,
+                 config: Optional[LassoConfig]=None,
                  lasso_cv: Optional[int] = None, #-use for static estimates-#
                  ts_split_as_cv_strategy: bool = True,
                  cv_split: Optional[int] = None, #-use for time evolving target variable-#
@@ -48,7 +48,7 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
                  **kwargs
         ):
 
-        self.config = config if config else FeatureEngConfig()
+        self.config = config if config else LassoConfig()
         self.lasso_cv = lasso_cv or self.config.lasso_cv or 5 #-static-#
         self.cv_split = cv_split or self.config.cv_split or 5 #-time evolving y-#
         self.ts_split_as_cv_strategy = ts_split_as_cv_strategy
