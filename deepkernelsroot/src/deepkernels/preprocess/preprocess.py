@@ -46,10 +46,10 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
                  num_overrides: Optional[List[str]] = ['log_amountsought', 'log_total_percap_inc'],
                  cat_overrides: Optional[List[str]] = ['black_final_race_flag'],
                  id_cols: Optional[List[str]] = None,
-                 task_type: Literal['classification', 'regression'] = 'regression', 
+                 task_type: Optional[Literal['classification', 'regression']] = 'regression', 
                  use_robust_scaler: bool = True, 
                  batch_size: Optional[int] = 512, 
-                 device: Optional[str] = "auto", 
+                 device: Optional[Literal['auto', 'cpu', 'cuda', 'mps']] = "auto", 
                  random_state: Optional[int] = 42, test_pct: Optional[float] = None, 
                  target_variable: Optional[str] = 'lmean_rejected'):
         
@@ -66,7 +66,7 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
         self.numeric_features = num_overrides or self.config.numeric_features or []
         self.categorical_features = cat_overrides or self.config.categorical_features or []
         
-        self.device_str_arg_ = device if device != "auto" else self.config.device or "auto"
+        self.device_str = device if device else "auto"
         self.device = self._get_device()
         self.random_state = random_state if random_state else self.config.random_state or 42
         self.batch_size = batch_size if batch_size else self.config.batch_size or 512
@@ -80,8 +80,8 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
     
     def _get_device(self) -> torch.device:
         """Fetches device for computations"""
-        if self.device_str_arg_ != "auto":
-            return torch.device(self.device_str_arg_)
+        if self.device_str != "auto":
+            return torch.device(self.device_str)
         
         if torch.cuda.is_available():
             return torch.device('cuda')
