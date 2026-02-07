@@ -180,11 +180,11 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
             'comp_int_3': ['black_sg_pct', 'l1_g', 'black_bifsg_pct', 'lsg']
         }
 
-        default_transforms ={
-            'log1p' : ['l1_g', 'black_g_pct'],
-            'log': ['lfs', 'black_fs_pct'],
-            'log': ['lsg', 'black_sg_pct'],
-            'log1p' : ['l1_bifsg', 'black_bifsg_pct']
+        default_transforms = {
+            'l1_g' : ('log1p', 'black_g_pct'),
+            'lfs': ('log', 'black_fs_pct'),
+            'lsg': ('log', 'black_sg_pct'),
+            'l1_bifsg': ('log1p', 'black_bifsg_pct')
         }
 
         y_target = 'lmean_rejected'
@@ -218,6 +218,7 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
             "shr_app_white_sg_cont"
         ] #-clip -> logits -> logit_z--#
 
+        self.transforms = transforms if transforms is not None else default_transforms
         self.drop_cols = drop_cols if drop_cols is not None else default_drop_cols
         self.id_cols = id_cols if id_cols is not None else default_id_cols
         self.seg_cols = seg_cols if seg_cols is not None else default_seg_cols
@@ -228,7 +229,6 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         self.to_log_transform = to_log_transform if to_log_transform is not None else default_to_log_transform
         self.shr_cols = shr_cols if shr_cols is not None else default_shr_cols
         self.y_target = y_target or self.config.y_target or 'lmean_rejected'
-        self.transforms = transforms if transforms is not None else default_transforms
         self.interactions = interactions if interactions is not None else default_interactions
         self.eps = eps or self.config.eps or 1e-8
         self.scaling_method = scaling_method or self.config.scaling_method or 'power'
@@ -236,7 +236,6 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         self.stats_ = {}
         self.features_out_ = None
         self.numeric_cols_out = []
-        self.df_ids = None
     
     def _to_log(self, df_in: pd.DataFrame) -> pd.DataFrame:
         """Helper function to log transform specified columns."""
@@ -333,18 +332,18 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
     def _apply_transforms(self, X: pd.DataFrame) -> pd.DataFrame:
         """Applies the log/log1p identities defined in YAML."""
         df = X.copy()
-        for transform, (alias, source) in self.transforms.items():
-             logger.info(f"Applying transform: {transform} to source column: {source} with alias: {alias}")
+        for alias, (func, source) in self.transforms.items():
              if source in df.columns:
-                if transform == "log1p":
+                logger.info(f"Applying {func} on {source} -> {alias}")
+                if func == "log1p":
                     df[alias] = np.log1p(df[source])
-                elif transform == "log":
-                    clipped = df[source].clip(lower=self.eps) #-clip to avoid log(0) and log of negatives-#
+                elif func == "log":
+                    clipped = df[source].clip(lower=self.eps)
                     df[alias] = np.log(clipped)
                 else:
-                    logger.warning(f"Unsupported transform function: {transform} for alias: {alias}. Skipping this transform.")
+                    logger.warning(f"Unsupported transform: {func}")
              else:
-                logger.warning(f"Source column {source} not found for transform: {transform} with alias: {alias}. Skipping this transform.")
+                logger.warning(f"Source {source} missing for {alias}")
         return df
 
     def _create_interactions(self, X: pd.DataFrame) -> pd.DataFrame:
@@ -368,8 +367,6 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         #--Orchestration--#
         self.stats_ = {} #-reset state-#
         df = X.copy()
-        self.available_ids = [c for c in self.id_cols if c in df.columns]
-        self.df_ids = df[self.available_ids].copy()
 
         #-dynamic transforms-#
         df = self._to_z_score(df, fit_mode=True)
@@ -383,6 +380,7 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         #-interactions-#
         df_engineered, cols_created = self._create_interactions(df)
         self.features_out_ = cols_created
+        
         df = self._drop_unwanted(df_engineered)
 
         self.numeric_cols_out_ = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -408,8 +406,8 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         #-execute feature engineering steps using saved stats-#
         check_is_fitted(self, ['scaler_', 'features_out_', 'stats_'])
         df = X.copy()
-        self.available_ids = [c for c in self.id_cols if c in df.columns]
-        self.df_ids = df[self.available_ids].copy()
+        available_ids = [c for c in self.id_cols if c in df.columns]
+        df_ids = df[available_ids].copy()
 
         df = self._to_z_score(df, fit_mode=False)
         df = self._to_logit_z(df, fit_mode=False)
@@ -417,21 +415,21 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         df = self._create_binary_flags(df)
         df = self._apply_transforms(df)
 
-        #-interaction terms-#
         df_engineered, _ = self._create_interactions(df)
+
         df_engineered = self._drop_unwanted(df_engineered)
         
         missing_cols = set(self.numeric_cols_out_) - set(df_engineered.columns)
         if missing_cols:
             logger.warning(f"Missing columns in transform: {missing_cols}. Filling with 0.")
-            for c in missing_cols:
-                df_engineered[c] = 0.0
+            for col in missing_cols:
+                df_engineered[col] = 0.0
     
         if self.numeric_cols_out_:
             df_engineered[self.numeric_cols_out_] = self.scaler_.transform(df_engineered[self.numeric_cols_out_])
             df_engineered = df_engineered[self.numeric_cols_out_]
         
-        logger.info(f"Re-attaching {len(self.available_ids)} ID columns to output.")
-        df_final = pd.concat([self.df_ids, df_engineered], axis=1)
+        logger.info(f"Re-attaching {len(available_ids)} ID columns to output.")
+        df_out = pd.concat([df_ids, df_engineered], axis=1)
         
-        return df_final
+        return df_out
