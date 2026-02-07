@@ -55,8 +55,10 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
         
         self.config = config if config is not None else PreprocessConfig()
         
-        self.target_variable = target_variable or self.config.target_variable or 'lmean_rejected'
-        self.id_cols = id_cols if id_cols is not None else self.config.id_cols
+        default_target = 'lmean_rejected'
+        self.target_variable = target_variable if target_variable else default_target
+        default_id_cols = ['unique_borrower', 'lender_clean', 'time', 'black_final_race']
+        self.id_cols = id_cols if id_cols else default_id_cols
         self.categorical_features = cat_overrides or self.config.categorical_features or []
         self.drop_cols = self.id_cols.copy()
         if self.target_variable:
