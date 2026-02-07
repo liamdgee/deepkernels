@@ -26,8 +26,8 @@ if not logger.handlers:
 
 #---Class: Config--#
 class PreprocessConfig(BaseModel):
-    numeric_features: List[str] = Field(default_factory=list)
-    categorical_features: List[str] = Field(default_factory=list)
+    numeric_features: List[str] = Field(default_factory=lambda: ['log_amountsought', 'log_total_percap_inc'])
+    categorical_features: List[str] = Field(default_factory=lambda: ['black_final_race_flag'])
     task_type: Literal['regression', 'classification'] = 'regression'
     scaler: Literal['robust', 'standard'] = 'robust'
     batch_size: int = Field(512, gt=1, le=4096)
@@ -43,8 +43,8 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
     Scikit-Learn compliant transformer that manages feature engineering.
     """
     def __init__(self, config: Optional[PreprocessConfig] = None,
-                 num_overrides: Optional[List[str]] = None,
-                 cat_overrides: Optional[List[str]] = None,
+                 num_overrides: Optional[List[str]] = ['log_amountsought', 'log_total_percap_inc'],
+                 cat_overrides: Optional[List[str]] = ['black_final_race_flag'],
                  id_cols: Optional[List[str]] = None,
                  task_type: Literal['classification', 'regression'] = 'regression', 
                  use_robust_scaler: bool = True, 
@@ -53,13 +53,12 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
                  random_state: Optional[int] = 42, test_pct: Optional[float] = None, 
                  target_variable: Optional[str] = 'lmean_rejected'):
         
-        self.config = config if config is not None else PreprocessConfig()
+        self.config = config if config else PreprocessConfig()
         
         default_target = 'lmean_rejected'
         self.target_variable = target_variable if target_variable else default_target
         default_id_cols = ['unique_borrower', 'lender_clean', 'time', 'black_final_race']
         self.id_cols = id_cols if id_cols else default_id_cols
-        self.categorical_features = cat_overrides or self.config.categorical_features or []
         self.drop_cols = self.id_cols.copy()
         if self.target_variable:
             self.drop_cols.append(self.target_variable)
