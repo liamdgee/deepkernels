@@ -104,7 +104,7 @@ class NoveltyConfig(BaseModel):
             'shr_app_black_final_race', 'shr_app_white_final_race',
             'shr_appr_black_final_race', 'shr_appr_white_final_race',
             'shr_rej_black_final_race', 'shr_rej_white_final_race', 'amountfunded', 
-            'approved_all', 'lmean_approved_all',
+            'approved_all', 'lmean_approved_all', 'rejected',
             'shr_appr_black_sg_cont', 'shr_appr_white_sg_cont', 'lmean_amountfunded',
             'shr_rej_black_sg_cont', 'shr_rej_white_sg_cont', 'delta_shr_appr_bc',
             'delta_shr_appr_wc', 'delta_shr_loan_bc', 'delta_shr_loan_wc', 
@@ -160,23 +160,31 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
 
         self.config = config if config else NoveltyConfig()
         default_interactions = {
+            'lg_bifsg': ['l1_g', 'black_bifsg_pct'], 
             'sg_lsg': ['black_sg_pct', 'lsg'], 
             'lg_lsg': ['l1_g', 'lsg'], 
             's_lsg': ['black_s_pct', 'lsg'], 
             'bifsg_lsg': ['black_bifsg_pct', 'lsg'], 
+            's_bifsg': ['black_s_pct', 'black_bifsg_pct'], 
             'sg_s': ['black_sg_pct', 'black_s_pct'], 
             'lg_s': ['l1_g', 'black_s_pct'], 
+            'lg_s_bifsg': ['l1_g', 'black_s_pct', 'black_bifsg_pct'], 
+            'sg_s_bifsg': ['black_sg_pct', 'black_s_pct', 'black_bifsg_pct'], 
+            'sg_lg_bifsg': ['black_sg_pct', 'l1_g', 'black_bifsg_pct'], 
             'sg_lg_s': ['black_sg_pct', 'l1_g', 'black_s_pct'], 
-            'lg_bifsg_lsg': ['l1_g', 'black_bifsg_pct', 'lsg'],
+            'lg_bifsg_lsg': ['l1_g', 'black_bifsg_pct', 'lsg'], 
+            's_bifsg_lsg': ['black_s_pct', 'black_bifsg_pct', 'lsg'], 
             'sg_bifsg_lsg': ['black_sg_pct', 'black_bifsg_pct', 'lsg'], 
             'comp_int_1': ['black_sg_pct', 'l1_g', 'black_s_pct', 'black_bifsg_pct', 'lsg'], 
-            'comp_int_2': ['l1_g', 'black_s_pct', 'black_bifsg_pct', 'lsg']
+            'comp_int_2': ['l1_g', 'black_s_pct', 'black_bifsg_pct', 'lsg'], 
+            'comp_int_3': ['black_sg_pct', 'l1_g', 'black_bifsg_pct', 'lsg']
         }
 
-        default_transforms = {
-            'l1_g' : ('log1p', 'black_g_pct'),
-            'lsg': ('log', 'black_sg_pct'),
-            'log1p_bifsg': ('log1p', 'black_bifsg_pct')
+        default_transforms ={
+            'log1p' : ['l1_g', 'black_g_pct'],
+            'log': ['lfs', 'black_fs_pct'],
+            'log': ['lsg', 'black_sg_pct'],
+            'log1p' : ['l1_bifsg', 'black_bifsg_pct']
         }
 
         y_target = 'lmean_rejected'
@@ -228,6 +236,7 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         self.stats_ = {}
         self.features_out_ = None
         self.numeric_cols_out = []
+        self.df_ids = None
     
     def _to_log(self, df_in: pd.DataFrame) -> pd.DataFrame:
         """Helper function to log transform specified columns."""
@@ -324,15 +333,18 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
     def _apply_transforms(self, X: pd.DataFrame) -> pd.DataFrame:
         """Applies the log/log1p identities defined in YAML."""
         df = X.copy()
-        for alias, (func, src) in self.transforms.items():
-            logger.info(f"Creating {alias} term using math base: {func} from source term: {src}")
-            if func == "log1p":
-                df[alias] = np.log1p(df[src])
-            elif func == "log":
-                clipped = df[src].clip(lower=self.eps) #-clip to avoid log(0) and log of negatives-#
-                df[alias] = np.log(clipped)
-            else:
-                logger.warning(f"Unsupported transform function: {func} for alias: {alias}. Skipping this transform.")
+        for transform, (alias, source) in self.transforms.items():
+             logger.info(f"Applying transform: {transform} to source column: {source} with alias: {alias}")
+             if source in df.columns:
+                if transform == "log1p":
+                    df[alias] = np.log1p(df[source])
+                elif transform == "log":
+                    clipped = df[source].clip(lower=self.eps) #-clip to avoid log(0) and log of negatives-#
+                    df[alias] = np.log(clipped)
+                else:
+                    logger.warning(f"Unsupported transform function: {transform} for alias: {alias}. Skipping this transform.")
+             else:
+                logger.warning(f"Source column {source} not found for transform: {transform} with alias: {alias}. Skipping this transform.")
         return df
 
     def _create_interactions(self, X: pd.DataFrame) -> pd.DataFrame:
@@ -356,6 +368,8 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         #--Orchestration--#
         self.stats_ = {} #-reset state-#
         df = X.copy()
+        self.available_ids = [c for c in self.id_cols if c in df.columns]
+        self.df_ids = df[self.available_ids].copy()
 
         #-dynamic transforms-#
         df = self._to_z_score(df, fit_mode=True)
@@ -394,6 +408,9 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         #-execute feature engineering steps using saved stats-#
         check_is_fitted(self, ['scaler_', 'features_out_', 'stats_'])
         df = X.copy()
+        self.available_ids = [c for c in self.id_cols if c in df.columns]
+        self.df_ids = df[self.available_ids].copy()
+
         df = self._to_z_score(df, fit_mode=False)
         df = self._to_logit_z(df, fit_mode=False)
         df = self._to_log(df)
@@ -412,5 +429,9 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
     
         if self.numeric_cols_out_:
             df_engineered[self.numeric_cols_out_] = self.scaler_.transform(df_engineered[self.numeric_cols_out_])
-
-        return df_engineered[self.numeric_cols_out_]
+            df_engineered = df_engineered[self.numeric_cols_out_]
+        
+        logger.info(f"Re-attaching {len(self.available_ids)} ID columns to output.")
+        df_final = pd.concat([self.df_ids, df_engineered], axis=1)
+        
+        return df_final
