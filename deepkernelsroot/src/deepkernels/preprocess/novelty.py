@@ -145,7 +145,7 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
             transforms: Optional[TransformMap] = None,
             interactions: Optional[CustomInteractionMap] = None,
             scaling_method: Literal['power', 'standard', 'robust'] = 'power',
-            eps: Annotated[float, Field(ge=1e-14, le=1e-2)] = 1e-8,
+            eps: float = 1e-8,
             drop_cols: Optional[List[str]] = None,
             id_cols: Optional[List[str]] = None,
             seg_cols: Optional[List[str]] = None,
@@ -227,6 +227,7 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         self.scaler_ = None
         self.stats_ = {}
         self.features_out_ = None
+        self.numeric_cols_out = []
     
     def _to_log(self, df_in: pd.DataFrame) -> pd.DataFrame:
         """Helper function to log transform specified columns."""
@@ -239,6 +240,17 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
                 logger.warning(f"Column {col} not found for log transformation.")
         return df
     
+    def _drop_unwanted(self, df: pd.DataFrame) -> pd.DataFrame:
+            """Explicitly drops ID and Ignore columns."""
+            cols_to_drop = list(set(self.drop_cols + self.id_cols))
+            dropping = [c for c in cols_to_drop if c in df.columns]
+            
+            if dropping:
+                logger.info(f"Dropping {len(dropping)} columns explicitly.")
+                df = df.drop(columns=dropping)
+                
+            return df
+
     def _to_z_score(self, df: pd.DataFrame, fit_mode: bool = False) -> pd.DataFrame:
         """
         Applies Z-score. 
@@ -344,7 +356,8 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         #--Orchestration--#
         self.stats_ = {} #-reset state-#
         df = X.copy()
-        #-dynamic learnable stats-#
+
+        #-dynamic transforms-#
         df = self._to_z_score(df, fit_mode=True)
         df = self._to_logit_z(df, fit_mode=True)
 
@@ -356,6 +369,9 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         #-interactions-#
         df_engineered, cols_created = self._create_interactions(df)
         self.features_out_ = cols_created
+        df = self._drop_unwanted(df_engineered)
+
+        self.numeric_cols_out_ = df.select_dtypes(include=[np.number]).columns.tolist()
         
         #--Scaler as per config---#
         scalers = {
@@ -367,36 +383,34 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         self.scaler_ = scalers.get(self.scaling_method, PowerTransformer(method='yeo-johnson'))
         
         #-fit scaler on newly engineered terms under "_create_interactions()" --#
-        if self.features_out_:
-            verified = [col for col in self.features_out_ if col in df_engineered.columns]
-            if verified:
-                logger.info(f"Fitting scaler on {len(verified)} newly engineered features: {verified}")
-                self.scaler_.fit(df_engineered[verified])
-            else:
-                logger.warning("No newly engineered features found for scaler fitting.")
-
+        if self.numeric_cols_out_:
+            logger.info(f"Fitting final {self.scaling_method} scaler on {len(self.numeric_cols_out_)} features.")
+            self.scaler_.fit(df[self.numeric_cols_out_])
+        
         return self
 
     def transform(self, X):
         """Orchestration module"""
-        #-execute (transform df)-#
+        #-execute feature engineering steps using saved stats-#
         check_is_fitted(self, ['scaler_', 'features_out_', 'stats_'])
         df = X.copy()
         df = self._to_z_score(df, fit_mode=False)
         df = self._to_logit_z(df, fit_mode=False)
-
         df = self._to_log(df)
         df = self._create_binary_flags(df)
-
         df = self._apply_transforms(df)
 
         #-interaction terms-#
         df_engineered, _ = self._create_interactions(df)
+        df_engineered = self._drop_unwanted(df_engineered)
         
-        #-final scaler-#
-        verified = [col for col in self.features_out_ if col in df_engineered.columns]
-        if verified:
-            logger.info(f"Adding {len(verified)} cols to final df and scaling using {self.scaler_}")
-            df_engineered[verified] = self.scaler_.transform(df_engineered[verified])
-             
-        return df_engineered
+        missing_cols = set(self.numeric_cols_out_) - set(df_engineered.columns)
+        if missing_cols:
+            logger.warning(f"Missing columns in transform: {missing_cols}. Filling with 0.")
+            for c in missing_cols:
+                df_engineered[c] = 0.0
+    
+        if self.numeric_cols_out_:
+            df_engineered[self.numeric_cols_out_] = self.scaler_.transform(df_engineered[self.numeric_cols_out_])
+
+        return df_engineered[self.numeric_cols_out_]
