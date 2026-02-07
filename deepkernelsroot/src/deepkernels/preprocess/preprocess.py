@@ -26,34 +26,58 @@ if not logger.handlers:
 
 #---Class: Config--#
 class PreprocessConfig(BaseModel):
-    num_features: List[str]
-    cat_features: List[str]
+    numeric_features: List[str] = Field(default_factory=list)
+    categorical_features: List[str] = Field(default_factory=list)
     task_type: Literal['regression', 'classification'] = 'regression'
     scaler: Literal['robust', 'standard'] = 'robust'
     batch_size: int = Field(512, gt=1, le=4096)
-    device: str = "auto" #--also can be cuda mps or cpu--#
+    device: str = "cpu" #--also can be cuda mps or cpu--#
     random_state: int = 42
     test_pct: float = Field(0.2, gt=0.0, lt=1.0)
-    target_variable: str
+    target_variable: str = 'lmean_rejected'
+    id_cols : List[str] = Field(default_factory=lambda: ['unique_borrower', 'lender_clean', 'time', 'black_final_race'])
 
 #---Class Definition: Torch Preprocessor--#
 class TorchPreprocessor(BaseEstimator, TransformerMixin):
     """
     Scikit-Learn compliant transformer that manages feature engineering.
     """
-    def __init__(self, config: PreprocessConfig):
-        self.config = config
+    def __init__(self, config: Optional[PreprocessConfig] = None,
+                 num_overrides: Optional[List[str]] = None,
+                 cat_overrides: Optional[List[str]] = None,
+                 id_cols: Optional[List[str]] = None,
+                 task_type: Literal['classification', 'regression'] = 'regression', 
+                 use_robust_scaler: bool = True, 
+                 batch_size: Optional[int] = 512, 
+                 device: Optional[str] = "auto", 
+                 random_state: Optional[int] = 42, test_pct: Optional[float] = None, 
+                 target_variable: Optional[str] = None):
         
-        self.preprocessor_: Optional[ColumnTransformer] = None
-        self.label_encoder_: Optional[LabelEncoder] = None
+        self.config = config if config is not None else PreprocessConfig()
+        
+        self.target_variable = target_variable if target_variable else self.config.target_variable or 'lmean_rejected'
+        self.id_cols = id_cols if id_cols is not None else self.config.id_cols
+        self.categorical_features = cat_overrides or self.config.categorical_features or []
+        
+        if self.target_variable:
+            self.drop_cols.append(self.target_variable)
+        self.device_str_arg_ = device if device != "auto" else self.config.device or "auto"
+        self.device = self._get_device()
+
+        self.random_state = random_state if random_state else self.config.random_state or 42
+        self.batch_size = batch_size if batch_size else self.config.batch_size or 512
+        self.scaler = RobustScaler() if use_robust_scaler else StandardScaler()
+        self.task_type = task_type if task_type else self.config.task_type or 'regression'
+        
         
         self.feature_names_out_ = None
-        self.device_ = self._get_device()
+        self.preprocessor_: Optional[ColumnTransformer] = None
+        self.label_encoder_: Optional[LabelEncoder] = None
     
     def _get_device(self) -> torch.device:
         """Fetches device for computations"""
-        if self.config.device != "auto":
-            return torch.device(self.config.device)
+        if self.device_str_arg_ != "auto":
+            return torch.device(self.device_str_arg_)
         
         if torch.cuda.is_available():
             return torch.device('cuda')
@@ -63,7 +87,7 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
             return torch.device('cpu')
     
     def _get_scaler(self):
-        return RobustScaler() if self.config.scaler == "robust" else StandardScaler()
+        return RobustScaler() if self.scaler == "robust" else StandardScaler()
     
     def _assemble_preprocessor(self) -> ColumnTransformer:
         """Builds scikit-learn ColumnTransformer"""
@@ -71,18 +95,20 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
         cat_transformer = Pipeline(steps=[('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))])
         return ColumnTransformer(
             transformers=[
-                ('num', num_transformer, self.config.num_features),
-                ('cat', cat_transformer, self.config.cat_features)
+                ('num', num_transformer, self.numeric_features),
+                ('cat', cat_transformer, self.categorical_features)
             ],
             remainder='drop',
             verbose_feature_names_out=False
         )
     
-    def _fit_target(self, y:np.ndarray):
+    def _fit_target(self, y: np.ndarray):
         """fots encoder if classification task"""
-        if self.config.task_type == 'classification':
+        if self.task_type == 'classification':
             self.label_encoder_ = LabelEncoder()
             self.label_encoder_.fit(y)
+            return self.label_encoder_.classes_
+        return self
     
     def _target_to_tensor(self, y:np.ndarray):
         if self.config.task_type == 'regression':
@@ -97,11 +123,14 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
         
         return y_tensor.to(self.device_)
     
-    def _attempt_extract_y(self, X: pd.DataFrame, y=None) -> Tuple[pd.DataFrame, Optional[np.ndarray]]:
+    def _attempt_extract_y(self, X: pd.DataFrame, y=None):
         """Helper to separate target variable from dataframe if needed."""
-        if y is None and self.config.target_variable in X.columns:
-            y = X[self.config.target_variable].values
-            X = X.drop(columns=[self.config.target_variable])
+        if self.target_variable in X.columns:
+            y_temp = X[self.target_variable].values
+            X = X.drop(columns=[self.target_variable])
+            if y is None:
+                y = y_temp
+                
         return X, y
     
     def _engineer_transform(self, X: pd.DataFrame) -> np.ndarray:
@@ -112,7 +141,6 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
 
         X_proc = self.preprocessor_.transform(X)
 
-        #--Dense Tensor Outputs-#
         if hasattr(X_proc, "toarray"):
             X_proc = X_proc.toarray()
             
@@ -122,18 +150,18 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
         """Fits preprocessor on X and encoder on Y"""
 
         #--seperate X and y --#
-        if y is None and self.config.target_variable in X.columns:
-            y = X[self.config.target_variable].values
-            X = X.drop(columns=[self.config.target_variable])
-        
+        X, y = self._attempt_extract_y(X, y)
+        self.numeric_features, self.categorical_features = self._get_column_types(X)
         self.preprocessor_ = self._assemble_preprocessor()
         self.preprocessor_.fit(X)
         self.feature_names_out_ = self.preprocessor_.get_feature_names_out()
 
-        if y is not None:
-            self._fit_target(y)
-        
+        if y is not None and self.config.task_type == 'classification':
+            self.label_encoder_ = LabelEncoder()
+            self.label_encoder_.fit(y)
+            
         return self
+
 
     def transform(self, X:pd.DataFrame, y=None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Converts input data into pytorch tensors from input data"""
@@ -142,16 +170,38 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
 
         X_in, y_in = self._attempt_extract_y(X, y)
 
-        X_np = self._engineer_transform(X_in)
-        
-        Xt = torch.tensor(X_np, dtype=torch.float32).to(self.device_)
+        X_proc = self.preprocessor_.transform(X_in)
 
+        if hasattr(X_proc, "toarray"):
+            X_proc = X_proc.toarray()
+        
+        Xt = torch.tensor(X_proc, dtype=torch.float64)
         yt = None
 
         if y_in is not None:
-            yt = self._target_to_tensor(y_in)
+            if self.config.task_type == 'classification':
+                y_enc = self.label_encoder_.transform(y_in)
+                yt = torch.tensor(y_enc, dtype=torch.long)
+            else:
+                yt = torch.tensor(y_in.astype(float), dtype=torch.float64).view(-1, 1)
         
+        Xt = Xt.to(self.device_)
+        if yt is not None:
+            yt = yt.to(self.device_)
         return Xt, yt
+    
+    def _get_column_types(self, X_df):
+        """Auto-detects columns, respecting overrides and drop_cols"""
+        final_num = self.numeric_features.copy()
+        final_cat = self.categorical_features.copy()
+        auto_detect = (len(final_num) == 0 and len(final_cat) == 0)
+        
+        if auto_detect:
+            num_cols = X_df.select_dtypes(include=['number']).columns.tolist()
+            cat_cols = X_df.select_dtypes(include=['object', 'category']).columns.tolist()
+            final_num = [c for c in num_cols if c not in self.drop_cols]
+            final_cat = [c for c in cat_cols if c not in self.drop_cols]
+        return final_num, final_cat
 
     def get_feature_names_out(self, input_features=None):
         return self.feature_names_out_
