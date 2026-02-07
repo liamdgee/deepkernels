@@ -47,11 +47,12 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
                  threshold_for_missingness: float = 0.92,
                  **kwargs
         ):
-        self.config = config if config else HarmoniserConfig()
+        self.config = config if config is not None else HarmoniserConfig()
         self.numeric_strategy = numeric_strategy or self.config.numeric_strategy or 'median'
         self.threshold_for_missingness = threshold_for_missingness if threshold_for_missingness else self.config.threshold_for_missingness or 0.92
         self.mode = mode or self.config.mode
-        raw_id_cols = id_cols if id_cols is not None else self.config.default_id_cols
+        default_id_cols =['unique_borrower', 'lender_clean', 'time', 'black_final_race']
+        raw_id_cols = id_cols if id_cols is not None else default_id_cols
         self.id_cols = [self._clean_str(strings) for strings in raw_id_cols]
 
         #-states-#
