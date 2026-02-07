@@ -194,7 +194,7 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
             'non_fintech_lenders_sent_to', 'random_race_sg'
         ]
 
-        default_id_cols = ['lender_clean', 'time', 'unique_borrower'] #-create lender_id from lender_clean, drop time for non-TS models, create repeat borrower from unique borrower-#
+        default_id_cols = ['lender_clean', 'time', 'unique_borrower', 'black_final_race'] #-create lender_id from lender_clean, drop time for non-TS models, create repeat borrower from unique borrower-#
         default_seg_cols = ["dissim_scaled", "isolation_scaled", "animus_scaled", "iat_score_f_scaled", "mdi"] #-to z score-#
         default_bisg_cols = ["black_s_pct", "black_g_pct", "black_fs_pct", "black_bifsg_pct", "black_sg_pct"] #-clip -> logits -> logit_z--#--mean_bisg-#
         default_pop_cols = ["share_pop_black", "share_black_pop_geba"] #-clip -> logits -> logit_z--#

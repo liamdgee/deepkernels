@@ -36,7 +36,7 @@ class CleanerConfig(BaseModel):
     ]
     override_to_numeric_cols: Optional[List[str]] = None
 
-    default_id_cols: List[str] = ['unique_borrower', 'lender_clean', 'time']
+    default_id_cols: List[str] = ['unique_borrower', 'lender_clean', 'time', 'black_final_race']
     override_id_cols: Optional[List[str]] = None
     
     @property
@@ -79,7 +79,7 @@ class DataCleaner(BaseEstimator, TransformerMixin):
         self.dtype_map_ = None
         self.keep_cols_ = None
 
-        self.id_cols = id_cols if id_cols is not None else ['lender_clean', 'time', 'unique_borrower']
+        self.id_cols = id_cols if id_cols is not None else ['lender_clean', 'time', 'unique_borrower', 'black_final_race']
 
         self.processor = ColumnTransformer(
             transformers=[

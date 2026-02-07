@@ -31,10 +31,10 @@ class HarmoniserConfig(BaseModel):
     Strict Configuration for cleaning pipeline.
     Validates parameters using Pydantic as a pre pre-processing step.
     """
-    threshold_for_missingness: Annotated[float, Field(le=0.995, ge=0.01)] = 0.92
+    threshold_for_missingness: Annotated[float, Field(le=1.0, ge=0.0)] = 0.92
     numeric_strategy: Literal['mean', 'median', 'zero', 'mode'] = 'median'
     mode: Literal['union', 'intersection'] = 'union'
-    default_id_cols: List[str] = ['unique_borrower', 'lender_clean', 'time']
+    default_id_cols: List[str] = ['unique_borrower', 'lender_clean', 'time', 'black_final_race']
     override_id_cols: Optional[List[str]] = None
 
 #--- Schema Harmoniser Class ---#
@@ -48,10 +48,10 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
                  **kwargs
         ):
         self.config = config if config else HarmoniserConfig()
-        self.numeric_strategy = numeric_strategy
-        self.threshold_for_missingness = threshold_for_missingness or self.config.threshold_for_missingness
+        self.numeric_strategy = numeric_strategy or self.config.numeric_strategy or 'median'
+        self.threshold_for_missingness = threshold_for_missingness if threshold_for_missingness else self.config.threshold_for_missingness or 0.92
         self.mode = mode or self.config.mode or 'union'
-        id_cols_in = id_cols if id_cols is not None else ['lender_clean', 'time', 'unique_borrower']
+        id_cols_in = id_cols if id_cols is not None else ['lender_clean', 'time', 'unique_borrower', 'black_final_race']
         self.id_cols = [self._clean_str(strings) for strings in id_cols_in]
 
         #-states-#
