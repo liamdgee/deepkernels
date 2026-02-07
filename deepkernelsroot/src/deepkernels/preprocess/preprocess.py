@@ -51,19 +51,22 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
                  batch_size: Optional[int] = 512, 
                  device: Optional[str] = "auto", 
                  random_state: Optional[int] = 42, test_pct: Optional[float] = None, 
-                 target_variable: Optional[str] = None):
+                 target_variable: Optional[str] = 'lmean_rejected'):
         
         self.config = config if config is not None else PreprocessConfig()
         
-        self.target_variable = target_variable if target_variable else self.config.target_variable or 'lmean_rejected'
+        self.target_variable = target_variable or self.config.target_variable or 'lmean_rejected'
         self.id_cols = id_cols if id_cols is not None else self.config.id_cols
         self.categorical_features = cat_overrides or self.config.categorical_features or []
-        
+        self.drop_cols = self.id_cols.copy()
         if self.target_variable:
             self.drop_cols.append(self.target_variable)
+        
+        self.numeric_features = num_overrides or self.config.numeric_features or []
+        self.categorical_features = cat_overrides or self.config.categorical_features or []
+        
         self.device_str_arg_ = device if device != "auto" else self.config.device or "auto"
         self.device = self._get_device()
-
         self.random_state = random_state if random_state else self.config.random_state or 42
         self.batch_size = batch_size if batch_size else self.config.batch_size or 512
         self.scaler = RobustScaler() if use_robust_scaler else StandardScaler()
@@ -175,7 +178,7 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
         if hasattr(X_proc, "toarray"):
             X_proc = X_proc.toarray()
         
-        Xt = torch.tensor(X_proc, dtype=torch.float64)
+        Xt = torch.tensor(X_proc, dtype=torch.float32)
         yt = None
 
         if y_in is not None:
@@ -183,7 +186,7 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
                 y_enc = self.label_encoder_.transform(y_in)
                 yt = torch.tensor(y_enc, dtype=torch.long)
             else:
-                yt = torch.tensor(y_in.astype(float), dtype=torch.float64).view(-1, 1)
+                yt = torch.tensor(y_in.astype(float), dtype=torch.float32).view(-1, 1)
         
         Xt = Xt.to(self.device_)
         if yt is not None:
