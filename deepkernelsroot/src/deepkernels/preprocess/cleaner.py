@@ -12,7 +12,7 @@ from typing import List, Dict, Optional, Union, Literal, Annotated
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler, OneHotEncoder
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
@@ -24,24 +24,10 @@ class CleanerConfig(BaseModel):
     missingness_threshold: Annotated[float, Field(ge=0, le=1)] = 0.85
     impute_strategy: Literal['mean', 'median', 'mode', 'zero'] = 'mean'
     categorical_threshold: Annotated[float, Field(ge=0, le=1)] = 0.025
-    default_to_numeric: Optional[List[str]] = [
-    "black_s_pct", "black_g_pct", "black_fs_pct", "black_bifsg_pct", "black_sg_pct",
-    "share_pop_black", "share_black_pop_geba",
-    "shr_loan_black_final_race", "shr_loan_black_sg_cont", 
-    "shr_loan_white_final_race", "shr_loan_white_sg_cont",
-    "shr_app_black_sg_cont", "shr_app_white_sg_cont",
-    "total_percap_inc", "amountsought",
-    "dissim_scaled", "isolation_scaled", "animus_scaled", 
-    "iat_score_f_scaled", "mdi"
-    ]
-    override_to_numeric_cols: Optional[List[str]] = None
-
-    default_id_cols: List[str] = ['unique_borrower', 'lender_clean', 'time', 'black_final_race']
-    override_id_cols: Optional[List[str]] = None
-    
-    @property
-    def active_numeric_cols(self) -> List[str]:
-        return self.override_to_numeric_cols if self.override_to_numeric_cols is not None else self.default_to_numeric
+    num_cols: list[str] = ['amountsought', 'animus_scaled', 'black_bifsg_pct', 'black_fs_pct', 'black_g_pct', 'black_s_pct', 'black_sg_pct', 'dissim_scaled', 'iat_score_f_scaled', 'isolation_scaled', 'ln_tenure', 'log_amountsought', 'num_apps', 'num_loans', 'share_black_pop_geba', 'share_pop_black', 'total_percap_inc']
+    cat_cols: list[str] = ['bank', 'cdfi', 'creditunion', 'fintech',  'mdi', 'factoringccmca']
+    id_cols: list[str] = ['lender_clean', 'time', 'unique_borrower']
+    target: list[str] = ['lmean_rejected']
 
 
 
@@ -51,7 +37,8 @@ class DataCleaner(BaseEstimator, TransformerMixin):
             self, 
             config: Optional[CleanerConfig] = None, 
             id_cols: Optional[List[str]] = None,
-            to_numeric: Optional[List[str]] = None, 
+            num_cols: Optional[List[str]] = None,
+            cat_cols: Optional[List[str]] = None,
             missingness_threshold: Annotated[float, Field(ge=0, le=1)] = 0.85, 
             impute_strategy: Literal['mean', 'median', 'mode', 'zero'] = 'mean', 
             categorical_threshold: Annotated[float, Field(ge=0, le=1)] = 0.025, 
@@ -61,38 +48,22 @@ class DataCleaner(BaseEstimator, TransformerMixin):
         self.config = config or CleanerConfig()
         self.missingness_threshold = missingness_threshold or self.config.missingness_threshold or 0.9
         self.impute_strategy = impute_strategy or self.config.impute_strategy
+        self.id_cols = id_cols if id_cols is not None else self.config.id_cols
         self.categorical_threshold = categorical_threshold or self.config.categorical_threshold or 0.025
-        self.default_to_numeric = [
-            "black_s_pct", "black_g_pct", "black_fs_pct", "black_bifsg_pct", "black_sg_pct",
-            "share_pop_black", "share_black_pop_geba",
-            "shr_loan_black_final_race", "shr_loan_black_sg_cont", 
-            "shr_loan_white_final_race", "shr_loan_white_sg_cont",
-            "shr_app_black_sg_cont", "shr_app_white_sg_cont",
-            "total_percap_inc", "amountsought",
-            "dissim_scaled", "isolation_scaled", "animus_scaled", 
-            "iat_score_f_scaled", "mdi"
-        ]
-        
-        self.to_numeric = to_numeric if to_numeric is not None else self.default_to_numeric #-for robust testing-#
+        self.num_cols = num_cols if num_cols is not None else self.config.num_cols
+        self.cat_cols = cat_cols if cat_cols is not None else self.config.cat_cols
 
         self.feature_names_out_ = None
-        self.dtype_map_ = None
-        self.keep_cols_ = None
-
-        self.id_cols = id_cols if id_cols is not None else ['lender_clean', 'time', 'unique_borrower', 'black_final_race']
-
-        self.processor = ColumnTransformer(
-            transformers=[
-                ('scaler', StandardScaler(), self.to_numeric),
-                ('keep_ids', 'passthrough', self.id_cols)
-            ]
-        )
-        self.processor.set_output(transform="pandas")
+        self.impute_vals_ = {}
+        self.keep_cols_ = []
     
     def _assign_time_index(self, df: pd.DataFrame):
         """
         Unique helper function to assign a time index to specific bisg datasets being used.
         """
+        if 'time' in df.columns:
+            return df
+        target_idx = None
         if 'lender_clean' in df.columns:
             target_idx = 'lender_clean'
         elif 'unique_borrower' in df.columns:
@@ -104,84 +75,76 @@ class DataCleaner(BaseEstimator, TransformerMixin):
                 UserWarning
             )
             df['time'] = range(len(df))
-            return df
-        
-        sort_key = df[target_idx].astype(str).str.lower().str.strip()
-        df['time'] = sort_key.rank(method='first').astype(int)
-
-        return df
-
-    def clean(self, df, fit=True):
-        """
-        Args:
-            fit (bool): If True, relearn scaling stats (Training). 
-                        If False, use existing stats (Inference).
-        """
-        df = self._assign_time_index(df)
-        
-        if fit:
-            return self.processor.fit_transform(df)
         else:
-            return self.processor.transform(df)
+            sort_key = df[target_idx].astype(str).str.lower().str.strip()
+            df['time'] = sort_key.rank(method='first').astype(int)
+        return df
     
     def fit(self, X: pd.DataFrame, y=None):
-        X_norm = self._canonicalise_headers(X.copy())
-        #--Normalise Numeric cols--#
-        for c in self.to_numeric:
-            if c in X_norm.columns:
-                X_norm[c] = pd.to_numeric(X_norm[c],errors='coerce')
-        mask = X_norm.isna().mean() < self.missingness_threshold
-        self.keep_cols_ = X_norm.columns[mask].tolist()
-        num_cols = X_norm[self.keep_cols_].select_dtypes(include=[np.number]).columns
+        df = self._canonicalise_headers(X.copy())
+        df = self._assign_time_index(df)
+        existing_nums = [c for c in self.num_cols if c in df.columns]
+        for c in existing_nums:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        mask = df.isna().mean() < self.missingness_threshold
+        initial_keep = df.columns[mask].tolist()
+        current_cols = df[initial_keep]
+        obj_cols = current_cols.select_dtypes(include=['object', 'category']).columns
+        
+        final_keep = []
+        for col in initial_keep:
+            if col in self.id_cols:
+                final_keep.append(col)
+                continue
+            
+            if col in obj_cols:
+                unique_ratio = df[col].nunique() / len(df)
+                if unique_ratio > self.categorical_threshold:
+                    logger.info(f"Dropping high-cardinality col: {col} (Ratio: {unique_ratio:.4f})")
+                    continue
+            
+            final_keep.append(col)
+            
+        self.keep_cols_ = final_keep
+        kept_nums = [c for c in existing_nums if c in final_keep]
+
         if self.impute_strategy == 'mean':
-            self.impute_vals_ = X_norm[num_cols].mean().to_dict()
+            self.impute_vals_ = df[kept_nums].mean().to_dict()
         elif self.impute_strategy == 'median':
-            self.impute_vals_ = X_norm[num_cols].median().to_dict()
+            self.impute_vals_ = df[kept_nums].median().to_dict()
         elif self.impute_strategy == 'mode':
-            self.impute_vals_ = X_norm[num_cols].mode().iloc[0].to_dict()
-        elif self.impute_strategy == 'zero':
-            logger.warning("All missing values will be replaced with 0")
-            self.impute_vals_ = {col: 0 for col in num_cols}
+            modes = df[kept_nums].mode()
+            self.impute_vals_ = modes.iloc[0].to_dict() if not modes.empty else {}
         else:
-            raise ValueError(f"impute strategy must be set to 'mean', 'median', 'mode' or 'zero'. No valid strategy was received-- Current strategy: {self.config.impute_strategy}")
-        current_cols = X_norm.columns.intersection(self.keep_cols_)
-        obj_cols = X_norm[current_cols].select_dtypes(include=['object']).columns
-        candidate_drop_cols = [col for col in obj_cols if col not in self.id_cols]
-        for col in candidate_drop_cols:
-            unique_ratio = X_norm[col].nunique() / len(X_norm)
-            if unique_ratio > self.categorical_threshold:
-                logger.info(f"Dropping high-cardinality col: {col} (Ratio: {unique_ratio:.4f})")
-                self.keep_cols_.remove(col)
+            logger.warning("All missing values will be replaced with 0")
+            self.impute_vals_ = {col: 0 for col in kept_nums}
     
         return self
     
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ['keep_cols_', 'impute_vals_'])
         df = self._canonicalise_headers(X.copy())
-
-        #-to numeric safeguard-#
-        for c in self.to_numeric:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors='coerce')
-
-        #--Reindex cols from fit--#
+        df = self._assign_time_index(df)
         df = df.reindex(columns=self.keep_cols_)
-
-
-        #--Normalise non-numeric cols--#
+        existing_nums = [c for c in self.num_cols if c in df.columns]
+        for c in existing_nums:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+            
         obj_cols = df.select_dtypes(include=['object']).columns
-        cols_to_clean = [col for col in obj_cols if col not in self.id_cols]
+        cols_to_clean = [c for c in obj_cols if c not in self.id_cols]
+        
         if cols_to_clean:
-            df[cols_to_clean] = df[cols_to_clean].apply(lambda x: x.str.strip().str.lower())
+            df[cols_to_clean] = df[cols_to_clean].apply(
+                lambda x: x.str.strip().str.lower()
+                if x.dtype == "object" else x
+            )
             df[cols_to_clean] = df[cols_to_clean].replace(
                 ["na", "n/a", "unknown", "nan", "null", "none", ""], np.nan
             )
-    
-        #--Handle Missingness in numeric cols--#
-        for k, v in self.impute_vals_.items():
-            if k in df.columns:
-                df[k] = df[k].fillna(v)
-        
+
+        if self.impute_vals_:
+            df = df.fillna(self.impute_vals_)
+        df = df.fillna('missing')
         self.feature_names_out_ = df.columns.tolist()
         
         return df
