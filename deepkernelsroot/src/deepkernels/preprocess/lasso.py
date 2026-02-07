@@ -62,6 +62,38 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
         self.shipped_features_ = None
         self.selected_lasso_features_ = None
     
+    @staticmethod
+    def sort_by_time(X: pd.DataFrame, y: Union[pd.Series, pd.DataFrame], time_col: Optional[str] = 'time') -> tuple[pd.DataFrame, Union[pd.Series, pd.DataFrame]]:
+        """
+        run this first if needing to sort df by time for ts cv split!
+         Logic:
+            - If time_col exists, sort by it
+            - If not, sort by index and log a warning (since this may not be ideal for time series data)
+         This ensures that the temporal order of data is preserved for time series cross-validation strategies.
+         If y is provided as a DataFrame, it will be reindexed to match the sorted X.
+         Returns sorted X and y.
+         """
+        X_sorted = X.copy()
+        time_col = time_col if time_col else 'time'
+
+        if time_col:
+            if time_col not in X_sorted.columns:
+                logger.warning("No time column found in X")
+            if not pd.api.types.is_datetime64_any_dtype(X_sorted[time_col]):
+                logger.info(f"Converting '{time_col}' to datetime...")
+                X_sorted[time_col] = pd.to_datetime(X_sorted[time_col])
+            X_sorted = X_sorted.sort_values(by=time_col)
+        else:
+            X_sorted = X_sorted.sort_index()
+            logger.warning("No time col found")
+        
+        if isinstance(y, pd.DataFrame):
+            y_sorted = y.reindex(X_sorted.index)
+        else:
+            y_sorted = y.reindex(X_sorted.index)
+
+        return X_sorted, y_sorted
+    
     def _vif_prune(self, X: pd.DataFrame) -> pd.DataFrame:
         """
         Optimised VIF calculation using Matrix Inversion.
@@ -237,8 +269,6 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
                 X_df[col] = 0
         
         X_base = X_df[self.selected_lasso_features_]
-        
-        # 2. Apply the EXACT SAME polynomial transform
         polynomial_feature_vals = self.poly_.transform(X_base)
         selected_poly_features = self.poly_.get_feature_names_out(X_base.columns)
         X_poly = pd.DataFrame(polynomial_feature_vals, columns=selected_poly_features, index=X_base.index)
