@@ -50,9 +50,9 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         self.config = config if config else HarmoniserConfig()
         self.numeric_strategy = numeric_strategy or self.config.numeric_strategy or 'median'
         self.threshold_for_missingness = threshold_for_missingness if threshold_for_missingness else self.config.threshold_for_missingness or 0.92
-        self.mode = mode or self.config.mode or 'union'
-        id_cols_in = id_cols if id_cols is not None else ['lender_clean', 'time', 'unique_borrower', 'black_final_race']
-        self.id_cols = [self._clean_str(strings) for strings in id_cols_in]
+        self.mode = mode or self.config.mode
+        raw_id_cols = id_cols if id_cols is not None else self.config.default_id_cols
+        self.id_cols = [self._clean_str(strings) for strings in raw_id_cols]
 
         #-states-#
         self.feature_names_out_ = None
@@ -103,25 +103,25 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
         
 
         all_num_cols = temp_master.select_dtypes(include=[np.number]).columns.tolist()
-        self.numeric_cols_ = [col for col in all_num_cols if col not in self.id_cols]
-
-        if self.numeric_strategy == 'median':
-            self.impute_values_ = temp_master[self.numeric_cols_].median().to_dict()
-        elif self.numeric_strategy == 'mean':
-            self.impute_values_ = temp_master[self.numeric_cols_].mean().to_dict()
-        elif self.numeric_strategy == 'mode':
-            modes = temp_master[self.numeric_cols_].mode()
-            self.impute_values_ = modes.iloc[0].to_dict() if not modes.empty else {}
-        elif self.numeric_strategy == 'zero':
-            logger.warning("All missing values will be replaced with 0")
-            self.impute_values_ = {col: 0 for col in self.numeric_cols_}
-        else:
-            raise ValueError(f"numeric strategy must be set to 'mean', 'median', 'mode' or 'zero'. No valid strategy was received-- Current strategy: {self.numeric_strategy}")
+        self.numeric_cols_ = [col for col in all_num_cols if col in self.target_schema_ and col not in self.id_cols]
+        
+        if self.numeric_cols_:
+            if self.numeric_strategy == 'median':
+                self.impute_values_ = temp_master[self.numeric_cols_].median().to_dict()
+            elif self.numeric_strategy == 'mean':
+                self.impute_values_ = temp_master[self.numeric_cols_].mean().to_dict()
+            elif self.numeric_strategy == 'mode':
+                modes = temp_master[self.numeric_cols_].mode()
+                self.impute_values_ = modes.iloc[0].to_dict() if not modes.empty else {col: 0 for col in self.numeric_cols_}
+            else:
+                logger.warning("All missing values will be replaced with 0")
+                self.impute_values_ = {col: 0 for col in self.numeric_cols_}
         
         if 'src_idx' not in temp_master.columns:
             temp_master['src_idx'] = 0
         
-        self.ids_verified_ = [col for col in (self.id_cols + ['src_idx']) if col in temp_master.columns]
+        candidates = self.id_cols + ['src_idx']
+        self.ids_verified_ = [col for col in candidates if col in temp_master.columns or col == 'src_idx']
         
         self.processor_ = ColumnTransformer(
             transformers=[
@@ -136,7 +136,7 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
 
         self.processor_.fit(data_to_fit)
 
-        self.feature_names_out_ = self.target_schema_
+        self.feature_names_out_ = self.processor_.get_feature_names_out()
         
         return self
     
@@ -182,10 +182,12 @@ class SchemaHarmoniser(BaseEstimator, TransformerMixin):
 
             if self.impute_values_:
                 temp_df.fillna(self.impute_values_, inplace=True)
+            
             temp_df['src_idx'] = tag
             processed.append(temp_df)
         
         valid_processed = [df for df in processed if not df.empty and not df.isna().all().all()]
+        
         if valid_processed:
             master = pd.concat(valid_processed, ignore_index=True)
             return self.processor_.transform(master)
