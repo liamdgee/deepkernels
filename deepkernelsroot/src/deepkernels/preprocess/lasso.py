@@ -36,9 +36,8 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
     def __init__(
             self, 
                  config: Optional[LassoConfig]=None,
-                 lasso_cv: Optional[int] = None, #-use for static estimates-#
                  ts_split_as_cv_strategy: bool = True,
-                 cv_split: Optional[int] = None, #-use for time evolving target variable-#
+                 cv_split: Optional[int] = 5, #-use for time evolving target variable-#
                  lasso_max_samples: Annotated[int, Field(le=24977, gt=1)] = 24000, 
                  vif_threshold: float = 9.0,
                  interaction_only: bool = True, #-only computes polynomial interactions for engineered terms-#
@@ -49,8 +48,6 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
         ):
 
         self.config = config if config else LassoConfig()
-        self.lasso_cv = lasso_cv or self.config.lasso_cv or 5 #-static-#
-        self.cv_split = cv_split or self.config.cv_split or 5 #-time evolving y-#
         self.ts_split_as_cv_strategy = ts_split_as_cv_strategy
         self.lasso_max_samples = lasso_max_samples or self.config.lasso_max_samples
         self.vif_threshold = vif_threshold or self.config.vif_threshold or 10.0
@@ -58,6 +55,13 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
         self.interaction_only = interaction_only if interaction_only else True
         self.spearman_corr_threshold = spearman_corr_threshold or self.config.spearman_corr_threshold or 0.9
         self.scaler_ = StandardScaler() if standard_scaler_override else RobustScaler()
+        
+        raw_split = cv_split or self.config.cv_split or 5
+        if self.ts_split_as_cv_strategy:
+            self.cv_obj_ = TimeSeriesSplit(n_splits=raw_split)
+        else:
+            self.cv_obj_ = raw_split
+        
         self.poly_ = None
         self.shipped_features_ = None
         self.selected_lasso_features_ = None
@@ -153,35 +157,25 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
             X: pandas data frame for feature selection and pruning
             y: pandas series / data frame of chosen target variable (sometimes identified as y_target)
         """
-        
-        if isinstance(y, pd.DataFrame):
-            y = y.squeeze()
-
-        if not isinstance(y, pd.Series):
-            y = pd.Series(y, index=X.index)
+        if isinstance(y, pd.DataFrame): y = y.squeeze()
+        if not isinstance(y, pd.Series): y = pd.Series(y, index=X.index)
         
         X = pd.DataFrame(X)
+        if X.empty:
+            logger.warning("Input to Lasso Selector is empty. Skipping selection.")
+            return X
 
         X_scaled_vals = self.scaler_.fit_transform(X)
         X_scaled = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
 
-        is_time_series = getattr(self, 'ts_split_as_cv_strategy', False)
-        cv_desc = "Unknown"
-        
-        if is_time_series:
-            # --- Time Series Path ---
-            if self.cv_split is None:
-                cv_obj = TimeSeriesSplit(n_splits=5)
-            elif isinstance(self.cv_split, int):
-                cv_obj = TimeSeriesSplit(n_splits=self.cv_split)
-            else:
-                cv_obj = self.cv_split
-            
-            cv_desc = f"Time Series Split ({cv_obj})"
+        if self.ts_split_as_cv_strategy:
+            # We know it's a TimeSeriesSplit object because of __init__ logic
+            n_splits = self.cv_obj_.get_n_splits(X_scaled)
+            cv_desc = f"Time Series Split ({n_splits} folds)"
             logger.info(f"Fitting Lasso with 8000 max iters using {cv_desc}")
 
             lasso = LassoCV(
-                cv=cv_obj, 
+                cv=self.cv_obj_, # Pass the object
                 random_state=self.random_state, 
                 n_jobs=-1,
                 max_iter=8000
@@ -189,35 +183,32 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
             lasso.fit(X_scaled, y)
 
         else:
-            # --- Static Path ---
-            cv_desc = f"Static {self.lasso_cv}-Fold CV"
+            cv_desc = f"Static {self.cv_obj_}-Fold CV"
+            
             if len(X_scaled) > self.lasso_max_samples:
                 sample_idx = np.random.RandomState(self.random_state).choice(
                     len(X_scaled), self.lasso_max_samples, replace=False
                 )
                 X_train = X_scaled.iloc[sample_idx]
                 y_train = y.iloc[sample_idx]
-                logger.info(f"Subsampled static data to {self.lasso_max_samples} rows.")
             else:
                 X_train = X_scaled
                 y_train = y
             
             lasso = LassoCV(
-                cv=self.lasso_cv,
+                cv=self.cv_obj_,
                 random_state=self.random_state,
                 n_jobs=-1,
                 selection='random'
             )
-            logger.info("Fitting static Lasso with random selection")
+            logger.info(f"Fitting static Lasso with random selection ({cv_desc})")
             lasso.fit(X_train, y_train)
         
-        # --- 4. Feature Extraction ---
         coef = pd.Series(lasso.coef_, index=X.columns)
         selected = coef[coef != 0].index.tolist()
         
         logger.info(f"Lasso selection ({cv_desc}) kept {len(selected)}/{len(X.columns)} features.")
         
-        # --- 5. Empty Selection Safety Guard ---
         if not selected:
              logger.warning("Lasso dropped ALL features. Returning full original set as fallback.")
              return X
