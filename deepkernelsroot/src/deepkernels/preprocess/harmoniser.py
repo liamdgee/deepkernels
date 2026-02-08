@@ -31,13 +31,13 @@ class HarmoniserConfig(BaseModel):
     Strict Configuration for cleaning pipeline.
     Validates parameters using Pydantic as a pre pre-processing step.
     """
-    threshold_for_missingness: Annotated[float, Field(le=1.0, ge=0.0)] = 0.92
+    threshold_for_missingness: Annotated[float, Field(gt=0.0, le=1.0)] = 0.92
     numeric_strategy: Literal['mean', 'median', 'zero', 'mode'] = 'median'
     mode: Literal['union', 'intersection'] = 'union'
-    num_cols = ['amountsought', 'animus_scaled', 'black_bifsg_pct', 'black_fs_pct', 'black_g_pct', 'black_s_pct', 'black_sg_pct', 'dissim_scaled', 'iat_score_f_scaled', 'isolation_scaled', 'ln_tenure', 'log_amountsought', 'num_apps', 'num_loans', 'share_black_pop_geba', 'share_pop_black', 'total_percap_inc']
-    cat_cols = ['bank', 'cdfi', 'creditunion', 'fintech',  'mdi', 'factoringccmca']
-    id_cols = ['lender_clean', 'time', 'unique_borrower']
-    y_target = ['lmean_rejected']
+    num_cols: list[str] = ['animus_scaled', 'black_bifsg_pct', 'black_fs_pct', 'black_g_pct', 'black_s_pct', 'black_sg_pct', 'dissim_scaled', 'iat_score_f_scaled', 'isolation_scaled', 'ln_tenure', 'log_amountsought', 'num_apps', 'num_loans', 'share_black_pop_geba', 'share_pop_black', 'total_percap_inc']
+    cat_cols: list[str] = ['bank', 'cdfi', 'creditunion', 'fintech',  'mdi', 'factoringccmca']
+    id_cols: list[str] = ['lender_clean', 'time', 'unique_borrower']
+    y_target: Union[list[str], str] = ['lmean_rejected']
 
 #--- Schema Harmoniser Class ---#
 class SchemaHarmoniser(BaseEstimator, TransformerMixin):

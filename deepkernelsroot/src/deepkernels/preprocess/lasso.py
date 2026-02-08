@@ -212,11 +212,10 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
     
     def fit(self, X: pd.DataFrame, y: Union[pd.Series, pd.DataFrame] = None):
         """Sequential Selection: Spearman -> Lasso -> interaction_terms -> vif_factor"""
+        target = self.y_target[0] if isinstance(self.y_target, list) else self.y_target
         if y is None:
-            target = self.y_target[0] if isinstance(self.y_target, list) else self.y_target
             if target in X.columns:
                 y = X[target]
-                X = X.drop(columns=[target])
             else:
                 raise ValueError('Target y is None and cannot be found.')
         
@@ -224,9 +223,12 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
         if isinstance(y, pd.DataFrame):
             y = y.squeeze()
         if not isinstance(y, pd.Series):
-            y = pd.Series(y)
+            y = pd.Series(y, index = X.index)
         
         df = X.copy()
+
+        if target in df.columns:
+            df = df.drop(columns=[target])
 
         ignore = [col for col in df.columns if col in self.id_cols or col in self.cat_cols]
         X_features = df.drop(columns=ignore, errors='ignore')
