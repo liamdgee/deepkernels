@@ -252,7 +252,7 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
             for lender in self.lender_cols:
                 if lender in df.columns:
                     df[f'is_{lender}'] = (df[lender] == 1).astype(int)
-                df.drop(columns=existing_lenders, inplace=True)
+            df.drop(columns=existing_lenders, inplace=True)
         
         return df
     def _apply_transforms(self, X: pd.DataFrame) -> pd.DataFrame:
@@ -294,7 +294,7 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         df = X.copy()
 
         available_ids = [id for id in self.id_cols if id in df.columns]
-        df_feats = df.drop(columns=available_ids, errors='ignore')
+        df = df.drop(columns=available_ids, errors='ignore')
 
         #-dynamic transforms-#
         df = self._to_z_score(df, fit_mode=True)

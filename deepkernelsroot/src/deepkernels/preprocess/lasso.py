@@ -32,19 +32,29 @@ class LassoConfig(BaseModel):
     ts_split_as_cv_strategy: bool = True
     cv_split: Annotated[int, Field(gt=1)] = 5
 
+    #-core-#
+    num_cols: list[str] = ['amountsought', 'animus_scaled', 'black_bifsg_pct', 'black_fs_pct', 'black_g_pct', 'black_s_pct', 'black_sg_pct', 'dissim_scaled', 'iat_score_f_scaled', 'isolation_scaled', 'ln_tenure', 'log_amountsought', 'num_apps', 'num_loans', 'share_black_pop_geba', 'share_pop_black', 'total_percap_inc']
+    cat_cols: list[str] = ['bank', 'cdfi', 'creditunion', 'fintech',  'mdi', 'factoringccmca']
+    id_cols: list[str] = ['lender_clean', 'time', 'unique_borrower']
+    y_target: Union[list[str], str] = ['lmean_rejected']
+
 class LassoFeatures(BaseEstimator, TransformerMixin):
     def __init__(
             self, 
-                 config: Optional[LassoConfig]=None,
-                 ts_split_as_cv_strategy: bool = True,
-                 cv_split: Optional[int] = 5, #-use for time evolving target variable-#
-                 lasso_max_samples: Annotated[int, Field(le=24977, gt=1)] = 24000, 
-                 vif_threshold: float = 9.0,
-                 interaction_only: bool = True, #-only computes polynomial interactions for engineered terms-#
-                 random_state: int = 42,
-                 spearman_corr_threshold: Annotated[float, Field(ge=0, le=1)] = 0.9,
-                 standard_scaler_override: bool = False,  #-assigns standard scaler over robust scaler for speed-#
-                 **kwargs
+            config: Optional[LassoConfig]=None,
+            ts_split_as_cv_strategy: bool = True,
+            cv_split: Optional[int] = 5, #-use for time evolving target variable-#
+            lasso_max_samples: Annotated[int, Field(le=24977, gt=1)] = 24000, 
+            vif_threshold: float = 9.0,
+            interaction_only: bool = True, #-only computes polynomial interactions for engineered terms-#
+            random_state: int = 42,
+            spearman_corr_threshold: Annotated[float, Field(ge=0, le=1)] = 0.9,
+            standard_scaler_override: bool = False,
+            num_cols: Optional[List[str]] = None,
+            cat_cols: Optional[List[str]] = None,
+            id_cols: Optional[List[str]] = None,
+            y_target: Optional[Union[List[str], str]] = None,
+            **kwargs
         ):
 
         self.config = config if config else LassoConfig()
@@ -54,9 +64,16 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
         self.random_state = random_state or self.config.random_state or 42
         self.interaction_only = interaction_only if interaction_only else True
         self.spearman_corr_threshold = spearman_corr_threshold or self.config.spearman_corr_threshold or 0.9
-        self.scaler_ = StandardScaler() if standard_scaler_override else RobustScaler()
         
-        raw_split = cv_split or self.config.cv_split or 5
+        self.scaler_ = StandardScaler() if standard_scaler_override else RobustScaler()
+
+        self.num_cols = num_cols if num_cols is not None else self.config.num_cols
+        self.cat_cols = cat_cols if cat_cols is not None else self.config.cat_cols
+        self.id_cols = id_cols if id_cols is not None else self.config.id_cols
+        self.y_target = y_target if y_target is not None else self.config.y_target
+        
+
+        raw_split = cv_split or self.config.cv_split
         if self.ts_split_as_cv_strategy:
             self.cv_obj_ = TimeSeriesSplit(n_splits=raw_split)
         else:
@@ -169,45 +186,23 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
         X_scaled = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
 
         if self.ts_split_as_cv_strategy:
-            # We know it's a TimeSeriesSplit object because of __init__ logic
-            n_splits = self.cv_obj_.get_n_splits(X_scaled)
-            cv_desc = f"Time Series Split ({n_splits} folds)"
-            logger.info(f"Fitting Lasso with 8000 max iters using {cv_desc}")
-
-            lasso = LassoCV(
-                cv=self.cv_obj_, # Pass the object
-                random_state=self.random_state, 
-                n_jobs=-1,
-                max_iter=8000
-            )
+            lasso = LassoCV(cv=self.cv_obj_, random_state=self.random_state, n_jobs=-1, max_iter=8000)
             lasso.fit(X_scaled, y)
 
         else:
-            cv_desc = f"Static {self.cv_obj_}-Fold CV"
-            
             if len(X_scaled) > self.lasso_max_samples:
-                sample_idx = np.random.RandomState(self.random_state).choice(
-                    len(X_scaled), self.lasso_max_samples, replace=False
-                )
+                sample_idx = np.random.RandomState(self.random_state).choice(len(X_scaled), self.lasso_max_samples, replace=False)
                 X_train = X_scaled.iloc[sample_idx]
                 y_train = y.iloc[sample_idx]
             else:
                 X_train = X_scaled
                 y_train = y
             
-            lasso = LassoCV(
-                cv=self.cv_obj_,
-                random_state=self.random_state,
-                n_jobs=-1,
-                selection='random'
-            )
-            logger.info(f"Fitting static Lasso with random selection ({cv_desc})")
+            lasso = LassoCV(cv=self.cv_obj_, random_state=self.random_state, n_jobs=-1, selection='random')
             lasso.fit(X_train, y_train)
         
         coef = pd.Series(lasso.coef_, index=X.columns)
         selected = coef[coef != 0].index.tolist()
-        
-        logger.info(f"Lasso selection ({cv_desc}) kept {len(selected)}/{len(X.columns)} features.")
         
         if not selected:
              logger.warning("Lasso dropped ALL features. Returning full original set as fallback.")
@@ -215,23 +210,33 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
 
         return X[selected]
     
-    def fit(self, X: pd.DataFrame, y: Union[pd.Series, pd.DataFrame]):
+    def fit(self, X: pd.DataFrame, y: Union[pd.Series, pd.DataFrame] = None):
         """Sequential Selection: Spearman -> Lasso -> interaction_terms -> vif_factor"""
+        if y is None:
+            target = self.y_target[0] if isinstance(self.y_target, list) else self.y_target
+            if target in X.columns:
+                y = X[target]
+                X = X.drop(columns=[target])
+            else:
+                raise ValueError('Target y is None and cannot be found.')
+        
         
         if isinstance(y, pd.DataFrame):
             y = y.squeeze()
         if not isinstance(y, pd.Series):
             y = pd.Series(y)
         
-        y_series = pd.Series(y).copy()
-        X_df = pd.DataFrame(X).copy()
+        df = X.copy()
 
-        X_thin = self._spearman_thinner(X_df) #-filter collinear inputs-#
-        X_lasso = self._lasso_selector(X_thin, y_series) #-filter sparsity-#
+        ignore = [col for col in df.columns if col in self.id_cols or col in self.cat_cols]
+        X_features = df.drop(columns=ignore, errors='ignore')
+        X_features = X_features.select_dtypes(include=[np.number])
+
+        X_thin = self._spearman_thinner(X_features) #-filter collinear inputs-#
+        X_lasso = self._lasso_selector(X_thin, y) #-filter sparsity-#
         self.selected_lasso_features_ = X_lasso.columns.tolist()
 
         if not self.selected_lasso_features_:
-            logger.warning("Lasso selected 0 features -- shipping empty features")
             self.shipped_features_ = []
             return self
         
@@ -253,18 +258,27 @@ class LassoFeatures(BaseEstimator, TransformerMixin):
         """Applies learned feature transform"""
         check_is_fitted(self, ['shipped_features_', 'selected_lasso_features_', 'poly_'])
         
-        X_df = pd.DataFrame(X)
-        missing_base = [col for col in self.selected_lasso_features_ if col not in X_df.columns]
-        if missing_base:
-            for col in missing_base:
-                X_df[col] = 0
+        df = pd.DataFrame(X.copy())
+        passthrough_cols = [id for id in df.columns if id in self.id_cols or id in self.cat_cols]
+        passthrough = df[passthrough_cols].copy()
         
-        X_base = X_df[self.selected_lasso_features_]
+        missing_base = []
+        for col in self.selected_lasso_features_:
+            if col not in df.columns:
+                df[col] = 0.0
+                missing_base.append(col)
+        
+        X_base = df[self.selected_lasso_features_]
+
         polynomial_feature_vals = self.poly_.transform(X_base)
         selected_poly_features = self.poly_.get_feature_names_out(X_base.columns)
         X_poly = pd.DataFrame(polynomial_feature_vals, columns=selected_poly_features, index=X_base.index)
-    
-        return X_poly.reindex(columns=self.shipped_features_, fill_value=0)
+
+        X_selected = X_poly.reindex(columns=self.shipped_features_, fill_value=0)
+
+        X_out = pd.concat([passthrough, X_selected], axis=1)
+
+        return X_out
     
 
     def get_feature_names_out(self, input_features=None):
