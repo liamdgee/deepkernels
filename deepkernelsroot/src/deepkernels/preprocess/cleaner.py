@@ -24,10 +24,10 @@ class CleanerConfig(BaseModel):
     missingness_threshold: Annotated[float, Field(ge=0, le=1)] = 0.85
     impute_strategy: Literal['mean', 'median', 'mode', 'zero'] = 'mean'
     categorical_threshold: Annotated[float, Field(ge=0, le=1)] = 0.025
-    num_cols: list[str] = ['amountsought', 'animus_scaled', 'black_bifsg_pct', 'black_fs_pct', 'black_g_pct', 'black_s_pct', 'black_sg_pct', 'dissim_scaled', 'iat_score_f_scaled', 'isolation_scaled', 'ln_tenure', 'log_amountsought', 'num_apps', 'num_loans', 'share_black_pop_geba', 'share_pop_black', 'total_percap_inc']
+    num_cols: list[str] = ['animus_scaled', 'black_bifsg_pct', 'black_fs_pct', 'black_g_pct', 'black_s_pct', 'black_sg_pct', 'dissim_scaled', 'iat_score_f_scaled', 'isolation_scaled', 'ln_tenure', 'log_amountsought', 'num_apps', 'num_loans', 'share_black_pop_geba', 'share_pop_black', 'total_percap_inc']
     cat_cols: list[str] = ['bank', 'cdfi', 'creditunion', 'fintech',  'mdi', 'factoringccmca']
     id_cols: list[str] = ['lender_clean', 'time', 'unique_borrower']
-    y_target: list[str] = ['lmean_rejected']
+    y_target: Union[list[str], str] = ['lmean_rejected']
 
 
 
@@ -36,10 +36,10 @@ class DataCleaner(BaseEstimator, TransformerMixin):
     def __init__(
             self, 
             config: Optional[CleanerConfig] = None, 
-            id_cols: Optional[List[str]] = None,
-            num_cols: Optional[List[str]] = None,
-            cat_cols: Optional[List[str]] = None,
-            y_target: Optional[Union[str, List[str]]] = None,
+            id_cols: Optional[list[str]] = None,
+            num_cols: Optional[list[str]] = None,
+            cat_cols: Optional[list[str]] = None,
+            y_target: Optional[Union[str, list[str]]] = 'lmean_rejected',
             missingness_threshold: Annotated[float, Field(ge=0, le=1)] = 0.85, 
             impute_strategy: Literal['mean', 'median', 'mode', 'zero'] = 'mean', 
             categorical_threshold: Annotated[float, Field(ge=0, le=1)] = 0.025, 
@@ -49,7 +49,7 @@ class DataCleaner(BaseEstimator, TransformerMixin):
         self.config = config or CleanerConfig()
         self.missingness_threshold = missingness_threshold if missingness_threshold is not None else self.config.missingness_threshold
         self.impute_strategy = impute_strategy or self.config.impute_strategy
-        self.y_target = y_target if y_target is not None else self.config.y_target
+        self.y_target = y_target or self.config.y_target
         self.id_cols = id_cols if id_cols is not None else self.config.id_cols
         self.categorical_threshold = categorical_threshold or self.config.categorical_threshold or 0.025
         self.num_cols = num_cols if num_cols is not None else self.config.num_cols
