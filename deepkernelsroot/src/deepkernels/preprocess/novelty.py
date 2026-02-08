@@ -259,10 +259,6 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
             for flag in other_flags:
                 if flag in df.columns:
                     df[f'{flag}_flag'] = (df[flag] == 1).astype(int)
-            
-            cols_to_drop = [i for i in other_flags if i in df.columns]
-            if cols_to_drop:
-                df.drop(columns=cols_to_drop, inplace=True)
         
         return df
     
@@ -313,18 +309,19 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         df = self._to_z_score(df, fit_mode=True)
         df = self._to_logit_z(df, fit_mode=True)
 
+        #-new features-#
+        df = self._apply_transforms(df)
+        df, self.features_out_ = self._create_interactions(df)
+
         #-static transforms-#
         df = self._to_log(df)
         df = self._create_binary_flags(df)
-        df = self._apply_transforms(df)
-
-        #-interactions-#
-        df_engineered, cols_created = self._create_interactions(df)
-        self.features_out_ = cols_created
         
-        df_out = self._drop_unwanted(df_engineered)
+        df = self._drop_unwanted(df)
+        df = self._final_cleanup(df)
 
-        self.numeric_cols_out_ = df_out.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_df = df.select_dtypes(include=[np.number])
+        self.numeric_cols_out_ = [c for c in numeric_df.columns if c not in self.id_cols]
         
         #--Scaler as per config---#
         scalers = {
@@ -338,7 +335,7 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         #-fit scaler on newly engineered terms under "_create_interactions()" --#
         if self.numeric_cols_out_:
             logger.info(f"Fitting final {self.scaling_method} scaler on {len(self.numeric_cols_out_)} features.")
-            self.scaler_.fit(df_out[self.numeric_cols_out_])
+            self.scaler_.fit(df[self.numeric_cols_out_])
         
         return self
 
@@ -348,48 +345,42 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         check_is_fitted(self, ['scaler_', 'features_out_', 'stats_'])
         df = X.copy()
 
-        available_ids = [id for id in self.id_cols if id in df.columns]
+        passthroughs = [id for id in self.id_cols if id in df.columns]
         target_list = self.y_target if isinstance(self.y_target, list) else [self.y_target]
-        available_ids.extend([t for t in target_list if t in df.columns])
-        df_ids = df[available_ids].copy()
-        df = df.drop(columns=available_ids, errors='ignore')
+        passthroughs.extend([t for t in target_list if t in df.columns])
+        
+        df_pass = df[passthroughs].copy()
+        
+        df = df.drop(columns=passthroughs, errors='ignore')
 
         #-feature eng-#
         df = self._to_z_score(df, fit_mode=False)
         df = self._to_logit_z(df, fit_mode=False)
-        df = self._to_log(df)
-        df = self._create_binary_flags(df)
+
         df = self._apply_transforms(df)
 
-        df_engineered, _ = self._create_interactions(df)
+        df, _ = self._create_interactions(df)
 
-        df_engineered = self._drop_unwanted(df_engineered)
+        df = self._to_log(df)
+        df = self._create_binary_flags(df)
+
+        df = self._drop_unwanted(df)
+        df = self._final_cleanup(df)
         
-        missing_cols = set(self.numeric_cols_out_) - set(df_engineered.columns)
-        if missing_cols:
-            logger.warning(f"Missing columns in transform: {missing_cols}. Filling with 0.")
-            for col in missing_cols:
-                df_engineered[col] = 0.0
-    
+        missing = set(self.numeric_cols_out_) - set(df.columns)
+        if missing:
+            logger.warning(f"Transform input missing {len(missing)} cols. Filling 0.")
+            for c in missing:
+                df[c] = 0.0
+        
         if self.numeric_cols_out_:
-            df_engineered[self.numeric_cols_out_] = self.scaler_.transform(df_engineered[self.numeric_cols_out_])
-            df_out = df_engineered[self.numeric_cols_out_]
+            scaled_vals = self.scaler_.transform(df[self.numeric_cols_out_])
+            df_scaled = pd.DataFrame(scaled_vals, columns=self.numeric_cols_out_, index=df.index)
         else:
-            df_out = df_engineered.copy()
+            df_scaled = df
         
-        logger.info(f"Re-attaching {len(available_ids)} ID columns to output.")
-        df_final = pd.concat([df_ids.reset_index(drop=True), df_out.reset_index(drop=True)], axis=1)
-        df_final = self._final_cleanup(df_final)
+        df_final = pd.concat([df_pass, df_scaled], axis=1)
         
-        if not df_ids.empty:
-            df_final.index = df_ids.index
-            features = df_final.drop(columns=available_ids, errors='ignore')
-        
-        if features:
-            logger.info(f"Returning df with df with ids of length: {len(df_final)} and features df: {len(features)}")
-            return df_final, features
-        
-        logger.info("Only returning final df with id & target in data frame")
         return df_final
     
     def _final_cleanup(self, df_in: pd.DataFrame) -> pd.DataFrame:
@@ -407,7 +398,7 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
                     drop_list.append(col)
         
         noise_patterns = [
-            'lg_bifsg', 's_bifsg', 'sg_lg_bifsg', 'sg_s_bifsg', 'lg_s_bifsg' 'lg_bifsg_lsg',
+            'lg_bifsg', 's_bifsg', 'sg_lg_bifsg', 'sg_s_bifsg', 'lg_s_bifsg', 'lg_bifsg_lsg', # <--- COMMA ADDED
             'lg_s_bifsg',  'comp_int_3', 's_bifsg_lsg'
         ]
 
