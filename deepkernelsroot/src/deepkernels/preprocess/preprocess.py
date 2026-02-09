@@ -10,14 +10,12 @@ from typing import List, Tuple, Literal, Optional, Annotated
 from pydantic import BaseModel, Field
 
 #-Scikit-Learn Dependencies-#
-import sklearn
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import StandardScaler, RobustScaler, OneHotEncoder, LabelEncoder
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 from sklearn.utils.validation import check_is_fitted
-
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
@@ -28,18 +26,18 @@ if not logger.handlers:
 class PreprocessConfig(BaseModel):
     numeric_features: List[str] = Field(default_factory=lambda: [
         'ln_tenure', 'log_amountsought', 'log_total_percap_inc', 'dissim_scaled_z',
-       'isolation_scaled_z', 'animus_scaled_z', 'iat_score_f_scaled_z',
+        'isolation_scaled_z', 'animus_scaled_z', 'iat_score_f_scaled_z',
         'black_sg_pct_logit_z', 'share_black_pop_geba_logit_z',
-       'black_s_pct_logit_z', 'share_pop_black_logit_z',
-       'black_bifsg_pct_logit_z', 'black_fs_pct_logit_z',
-       'black_g_pct_logit_z', 'l1_g', 'lfs', 'lsg', 'l1_bifsg', 'sg_lsg',
-       'lg_lsg', 's_lsg', 'bifsg_lsg', 'sg_s', 'lg_s', 'comp_int_1',
-       'comp_int_2'
+        'black_s_pct_logit_z', 'share_pop_black_logit_z',
+        'black_bifsg_pct_logit_z', 'black_fs_pct_logit_z',
+        'black_g_pct_logit_z', 'l1_g', 'lfs', 'lsg', 'l1_bifsg', 'sg_lsg',
+        'lg_lsg', 's_lsg', 'bifsg_lsg', 'sg_s', 'lg_s', 'comp_int_1',
+        'comp_int_2'
     ])
     categorical_features: List[str] = Field(default_factory=lambda: [
         'is_fintech', 'is_cdfi', 'is_creditunion', 'is_bank',
-       'mdi_flag', 'factoringccmca_flag', 'is_ever_ceo_flag',
-       'has_masters_flag', 'has_postgrad_flag'
+        'mdi_flag', 'factoringccmca_flag', 'is_ever_ceo_flag',
+        'has_masters_flag', 'has_postgrad_flag'
     ])
     task_type: Literal['regression', 'classification'] = 'regression'
     scaler: Literal['robust', 'standard'] = 'robust'
@@ -52,14 +50,11 @@ class PreprocessConfig(BaseModel):
 
 #---Class Definition: Torch Preprocessor--#
 class TorchPreprocessor(BaseEstimator, TransformerMixin):
-    """
-    Scikit-Learn compliant transformer. - currently redundant in pipeline -- syntax is slightly jarred after var changes
-    """
     def __init__(self, config: Optional[PreprocessConfig] = None,
                  num_overrides: Optional[List[str]] = None,
                  cat_overrides: Optional[List[str]] = None,
                  id_cols: Optional[List[str]] = None,
-                 task_type: Optional[Literal['classification', 'regression']] = 'regression', 
+                 task_type: Optional[Literal['classification', 'regression']] = None, 
                  use_robust_scaler: bool = True, 
                  batch_size: Optional[int] = None, 
                  device: Optional[Literal['auto', 'cpu', 'cuda', 'mps']] = None, 
@@ -83,129 +78,132 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
         self.scaler = RobustScaler() if use_robust_scaler else StandardScaler()
         self.task_type = task_type or self.config.task_type or 'regression'
         
-        
         self.feature_names_out_ = None
         self.preprocessor_: Optional[ColumnTransformer] = None
         self.label_encoder_: Optional[LabelEncoder] = None
     
     def _get_device(self) -> torch.device:
-        """Fetches device for computations"""
         if self.device_str != "auto":
             return torch.device(self.device_str)
-        
         if torch.cuda.is_available():
             return torch.device('cuda')
         elif torch.backends.mps.is_available():
             return torch.device('mps')
         else:
             return torch.device('cpu')
+            
+    def _to_numpy(self, data) -> np.ndarray:
+        """
+        Sanitizes input data to ensures it is a dense Numpy array.
+        Handles MPS/GPU Tensors by moving to CPU first.
+        """
+        if data is None:
+            return None
+
+        if isinstance(data, torch.Tensor):
+            data = data.detach().cpu()
+            return data.numpy()
+            
+        # 2. Handle Sparse Matrix (from OneHotEncoder)
+        if hasattr(data, "toarray"):
+            return data.toarray()
+            
+        # 3. Handle Pandas DataFrame/Series
+        if hasattr(data, "values"):
+            return data.values
+            
+        # 4. Handle Lists or generic iterables
+        return np.array(data)
     
     def _assemble_preprocessor(self) -> ColumnTransformer:
-        """Builds scikit-learn ColumnTransformer"""
         num_scaler = self.scaler if self.scaler else RobustScaler()
         cat_scaler = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
         num_transformer = Pipeline(steps=[('scaler', num_scaler)])
         cat_transformer = Pipeline(steps=[('onehot', cat_scaler)])
-        return ColumnTransformer(transformers=[('num', num_transformer, self.numeric_features), ('cat', cat_transformer, self.categorical_features)], remainder='drop', verbose_feature_names_out=False)
-    
-    def _fit_target(self, y: np.ndarray):
-        """fits encoder if classification task"""
-        y = y if y else self.config.y_target
-        if self.task_type == 'classification':
-            self.label_encoder_ = LabelEncoder()
-            self.label_encoder_.fit(y)
-            return self.label_encoder_.classes_
-        return self
-    
-    def _target_to_tensor(self, y:np.ndarray):
-        if self.task_type == 'regression':
-            if y.dtype == 'object':
-                 y = y.astype(float)
-            y_tensor = torch.tensor(y, dtype=torch.float32).view(-1, 1)
-        else:
-            if self.label_encoder_ is None:
-                raise ValueError(f"Label Encoder is currently set to: {self.label_encoder_} -- This param should not be null given task is set to: {self.config.task_type}")
-            y_enc = self.label_encoder_.transform(y)
-            y_tensor = torch.tensor(y_enc, dtype=torch.long)
         
-        return y_tensor.to(self.device_)
+        return ColumnTransformer(
+            transformers=[
+                ('num', num_transformer, self.numeric_features), 
+                ('cat', cat_transformer, self.categorical_features)
+            ], 
+            remainder='drop', 
+            verbose_feature_names_out=False
+        )
     
     def _attempt_extract_y(self, X: pd.DataFrame, y=None):
-        """Helper to separate target variable from dataframe if needed."""
-        y = y if y is not None else self.config.y_target
-        if y in X.columns:
-            y_out = X[y].values
-            X = X.drop(columns=[y])
-            if y is None:
-                y = y_out           
-        return X, y
+        """Robustly separate target from X."""
+        target = y if y is not None else self.y_target
+        
+        # 1. Check if target is a string name inside X
+        if isinstance(target, str):
+            if target in X.columns:
+                y_out = X[target].values # Grab values immediately
+                X = X.drop(columns=[target])
+                return X, y_out
+            # Provided string but not in columns? Assume y is missing/None
+            return X, None
+        
+        # 2. If target is already data (Series, Array), return it
+        return X, target
     
-    def _engineer_transform(self, X: pd.DataFrame) -> np.ndarray:
-        """
-        Handles the Scikit-Learn transformation logic.
-        """
-        check_is_fitted(self, ['preprocessor_'])
-
-        X_processed = self.preprocessor_.transform(X)
-
-        if hasattr(X_processed, "toarray"):
-            X_processed = X_processed.toarray()
-            
-        return X_processed
-
     def fit(self, X: pd.DataFrame, y=None):
-        """Fits preprocessor on X and encoder on Y"""
-
-        #--seperate X and y --#
         X, y = self._attempt_extract_y(X, y)
         self.numeric_features, self.categorical_features = self._get_column_types(X)
         self.preprocessor_ = self._assemble_preprocessor()
         self.preprocessor_.fit(X)
         self.feature_names_out_ = self.preprocessor_.get_feature_names_out()
 
-        if y is not None and self.config.task_type == 'classification':
+        if y is not None and self.task_type == 'classification':
             self.label_encoder_ = LabelEncoder()
-            self.label_encoder_.fit(y)
+            # Ensure y is clean numpy before fitting encoder
+            self.label_encoder_.fit(self._to_numpy(y))
             
         return self
 
-
-    def transform(self, X:pd.DataFrame, y=None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Converts input data into pytorch tensors from input data"""
-        
+    def transform(self, X: pd.DataFrame, y=None) -> Tuple[torch.Tensor, Optional[torch.Tensor], None]:
+        """Converts input data into pytorch tensors safely."""
         check_is_fitted(self, ['preprocessor_'])
         
-        meta_cols = [col for col in self.id_cols if col in X.columns]
-        meta = X[meta_cols].copy().reset_index(drop=True)
+        # 1. Drop Metadata (ensure X is not just a numpy array here)
+        if isinstance(X, pd.DataFrame):
+            meta_cols = [col for col in self.id_cols if col in X.columns]
+            X = X.drop(columns=meta_cols, errors='ignore')
         
-        X = X.drop(columns=meta_cols, errors='ignore')
-        
+        # 2. Extract Y and process X
         X_in, y_in = self._attempt_extract_y(X, y)
-
         X_proc = self.preprocessor_.transform(X_in)
-        if hasattr(X_proc, "toarray"):
-            X_proc = X_proc.toarray()
         
-        Xt = torch.tensor(X_proc, dtype=torch.float32)
+        # 3. Aggressive Type Sanitization
+        X_np = self._to_numpy(X_proc)
+        Xt = torch.tensor(X_np, dtype=torch.float32)
         
         yt = None
         if y_in is not None:
+            y_np = self._to_numpy(y_in)
+            
             if self.task_type == 'classification':
-                y_enc = self.label_encoder_.transform(y_in)
+                y_enc = self.label_encoder_.transform(y_np)
                 yt = torch.tensor(y_enc, dtype=torch.long)
             else:
-                yt = torch.tensor(y_in.astype(float), dtype=torch.float32).view(-1, 1)
+                # DKL Requirement: Float32 targets
+                yt = torch.tensor(y_np.astype(float), dtype=torch.float32).view(-1, 1)
         
+        # 4. Move to Device (This puts it back on MPS for training)
         Xt = Xt.to(self.device)
         if yt is not None:
             yt = yt.to(self.device)
-        return Xt, yt, meta
+            
+        return Xt, yt
     
     def _get_column_types(self, X_df):
         exclude = set(self.id_cols + [self.y_target])
+        
+        # Safety check if X_df is already numpy
+        if not hasattr(X_df, "select_dtypes"):
+            return self.numeric_features, self.categorical_features
+
         final_num = self.numeric_features if self.numeric_features else \
                     [c for c in X_df.select_dtypes(include=['number']).columns if c not in exclude]
-                    
         final_cat = self.categorical_features if self.categorical_features else \
                     [c for c in X_df.select_dtypes(include=['object', 'category']).columns if c not in exclude]
         
@@ -215,39 +213,33 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
         return self.feature_names_out_
     
     def get_dataloader(self, X: pd.DataFrame, y=None, shuffle: bool = True) -> DataLoader:
-        """Final step: Wraps transformed tensors into a PyTorch DataLoader."""
-        Xt, yt, _ = self.transform(X, y)
-        
+        Xt, yt = self.transform(X, y)
         if yt is None:
             dataset = TensorDataset(Xt)
         else:
             dataset = TensorDataset(Xt, yt)
-            
-        return DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle)
+        # Drop last batch to prevent single-sample errors in DKL
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle, drop_last=True)
     
     def test_split(self, X: pd.DataFrame, y=None) -> Tuple[DataLoader, DataLoader]:
-        """
-        Orchestrates the full split, fit, and loader generation.
-        """
-        target_name = y if isinstance(y, str) else self.y_target
+        # 1. Separate Target Name vs Data
+        y_data = None
+        X_data = X.copy()
         
-        if target_name in X.columns:
-            y_data = X[target_name].values
-            X_data = X.drop(columns=[target_name])
-        elif y is not None and not isinstance(y, str):
-            y_data = y
-            X_data = X
+        if isinstance(y, str):
+            if y in X.columns:
+                y_data = X[y].values # FORCE NUMPY
+                X_data = X.drop(columns=[y])
         else:
-            raise ValueError(f"Target '{target_name}' not found in DataFrame.")
-
-        stratify_val = y_data if self.task_type == 'classification' else None
+             if self.y_target in X.columns:
+                 y_data = X[self.y_target].values # FORCE NUMPY
+                 X_data = X.drop(columns=[self.y_target])
         
         X_train, X_test, y_train, y_test = train_test_split(
             X_data, 
             y_data, 
             test_size=self.test_pct, 
-            random_state=self.random_state,
-            stratify=stratify_val
+            random_state=self.random_state
         )
         
         self.fit(X_train, y_train)
