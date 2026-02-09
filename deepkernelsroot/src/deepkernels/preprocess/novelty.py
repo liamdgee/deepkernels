@@ -391,16 +391,17 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         df = df_in.copy()
         drop_list = []
   
-        potential_dupes = self.bisg_cols + self.pop_cols + self.seg_cols + self.to_log_transform
+        potential_dupes = self.bisg_cols + self.pop_cols + self.seg_cols + self.to_log_transform + self.cat_cols
         for col in potential_dupes:
             if col in df.columns:
                 if f"{col}_logit_z" in df.columns or f"{col}_logit" in df.columns or f"{col}_z" in df.columns or f"log_{col}" in df.columns:
                     drop_list.append(col)
         
         noise_patterns = [
-            'lg_bifsg', 's_bifsg', 'sg_lg_bifsg', 'sg_s_bifsg', 'lg_s_bifsg', 'lg_bifsg_lsg', # <--- COMMA ADDED
-            'lg_s_bifsg',  'comp_int_3', 's_bifsg_lsg'
-        ]
+            'lg_bifsg', 's_bifsg', 'sg_lg_bifsg', 'sg_s_bifsg', 'lg_s_bifsg', 'lg_bifsg_lsg',
+            'lg_s_bifsg',  'comp_int_3', 's_bifsg_lsg', 'amountsought', 'sg_lg_s',
+            'sg_bifsg_lsg', 'factoringccmca', 'has_masters', 'has_postgrad', 'is_ever_ceo', 'mdi_z'
+        ] #-added amountsought because log_amountsought is in the original df -- this also includes ghost cols
 
         drop_list.extend([c for c in noise_patterns if c in df.columns])
              
