@@ -48,6 +48,7 @@ class PreprocessConfig(BaseModel):
     y_target: str = 'lmean_rejected'
     id_cols : List[str] = Field(default_factory=lambda: ['lender_clean', 'time'])
 
+
 #---Class Definition: Torch Preprocessor--#
 class TorchPreprocessor(BaseEstimator, TransformerMixin):
     def __init__(self, config: Optional[PreprocessConfig] = None,
@@ -99,20 +100,16 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
         """
         if data is None:
             return None
-
+        
         if isinstance(data, torch.Tensor):
-            data = data.detach().cpu()
-            return data.numpy()
+            return data.detach().cpu().numpy()
             
-        # 2. Handle Sparse Matrix (from OneHotEncoder)
         if hasattr(data, "toarray"):
             return data.toarray()
             
-        # 3. Handle Pandas DataFrame/Series
         if hasattr(data, "values"):
             return data.values
             
-        # 4. Handle Lists or generic iterables
         return np.array(data)
     
     def _assemble_preprocessor(self) -> ColumnTransformer:
@@ -134,16 +131,14 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
         """Robustly separate target from X."""
         target = y if y is not None else self.y_target
         
-        # 1. Check if target is a string name inside X
+        # Check string vs data
         if isinstance(target, str):
             if target in X.columns:
-                y_out = X[target].values # Grab values immediately
+                y_out = X[target].values
                 X = X.drop(columns=[target])
                 return X, y_out
-            # Provided string but not in columns? Assume y is missing/None
             return X, None
         
-        # 2. If target is already data (Series, Array), return it
         return X, target
     
     def fit(self, X: pd.DataFrame, y=None):
@@ -155,25 +150,23 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
 
         if y is not None and self.task_type == 'classification':
             self.label_encoder_ = LabelEncoder()
-            # Ensure y is clean numpy before fitting encoder
             self.label_encoder_.fit(self._to_numpy(y))
             
         return self
 
-    def transform(self, X: pd.DataFrame, y=None) -> Tuple[torch.Tensor, Optional[torch.Tensor], None]:
+    # RENAMED to avoid Scikit-Learn 'transform' hook collision
+    def process_to_tensors(self, X: pd.DataFrame, y=None) -> Tuple[torch.Tensor, Optional[torch.Tensor], None]:
         """Converts input data into pytorch tensors safely."""
         check_is_fitted(self, ['preprocessor_'])
         
-        # 1. Drop Metadata (ensure X is not just a numpy array here)
         if isinstance(X, pd.DataFrame):
             meta_cols = [col for col in self.id_cols if col in X.columns]
             X = X.drop(columns=meta_cols, errors='ignore')
         
-        # 2. Extract Y and process X
         X_in, y_in = self._attempt_extract_y(X, y)
         X_proc = self.preprocessor_.transform(X_in)
         
-        # 3. Aggressive Type Sanitization
+        # Explicit Numpy conversion
         X_np = self._to_numpy(X_proc)
         Xt = torch.tensor(X_np, dtype=torch.float32)
         
@@ -185,20 +178,18 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
                 y_enc = self.label_encoder_.transform(y_np)
                 yt = torch.tensor(y_enc, dtype=torch.long)
             else:
-                # DKL Requirement: Float32 targets
-                yt = torch.tensor(y_np.astype(float), dtype=torch.float32).view(-1, 1)
+                yt = torch.tensor(y_np.astype(float), dtype=torch.float32).view(-1)
         
-        # 4. Move to Device (This puts it back on MPS for training)
+        # Move to Device
         Xt = Xt.to(self.device)
         if yt is not None:
             yt = yt.to(self.device)
             
-        return Xt, yt
+        return Xt, yt, None 
     
     def _get_column_types(self, X_df):
         exclude = set(self.id_cols + [self.y_target])
         
-        # Safety check if X_df is already numpy
         if not hasattr(X_df, "select_dtypes"):
             return self.numeric_features, self.categorical_features
 
@@ -213,40 +204,29 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
         return self.feature_names_out_
     
     def get_dataloader(self, X: pd.DataFrame, y=None, shuffle: bool = True) -> DataLoader:
-        Xt, yt = self.transform(X, y)
+        # Call the RENAMED function
+        Xt, yt, _ = self.process_to_tensors(X, y)
+        
         if yt is None:
             dataset = TensorDataset(Xt)
         else:
             dataset = TensorDataset(Xt, yt)
-        # Drop last batch to prevent single-sample errors in DKL
+            
         return DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle, drop_last=True)
+
+#--- Helper Function ---#
+def prepare_loaders(df: pd.DataFrame, target_col: str, test_pct: float = 0.2, batch_size: int = 256):
+    y = df[target_col].values
+    X = df.drop(columns=[target_col])
     
-    def test_split(self, X: pd.DataFrame, y=None) -> Tuple[DataLoader, DataLoader]:
-        # 1. Separate Target Name vs Data
-        y_data = None
-        X_data = X.copy()
-        
-        if isinstance(y, str):
-            if y in X.columns:
-                y_data = X[y].values # FORCE NUMPY
-                X_data = X.drop(columns=[y])
-        else:
-             if self.y_target in X.columns:
-                 y_data = X[self.y_target].values # FORCE NUMPY
-                 X_data = X.drop(columns=[self.y_target])
-        
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_data, 
-            y_data, 
-            test_size=self.test_pct, 
-            random_state=self.random_state
-        )
-        
-        self.fit(X_train, y_train)
-        
-        train_loader = self.get_dataloader(X_train, y_train, shuffle=True)
-        test_loader = self.get_dataloader(X_test, y_test, shuffle=False)
-        
-        logger.info(f"Pipeline ready. Train: {len(X_train)} samples, Test: {len(X_test)} samples")
-        
-        return train_loader, test_loader
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_pct, random_state=42)
+    
+    preprocessor = TorchPreprocessor(y_target=target_col, batch_size=batch_size)
+    preprocessor.fit(X_train, y_train)
+    
+    train_loader = preprocessor.get_dataloader(X_train, y_train, shuffle=True)
+    test_loader = preprocessor.get_dataloader(X_test, y_test, shuffle=False)
+    
+    input_dim = len(preprocessor.get_feature_names_out())
+    
+    return train_loader, test_loader, input_dim
