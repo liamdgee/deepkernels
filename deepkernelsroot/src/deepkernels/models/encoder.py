@@ -68,7 +68,7 @@ class VAEConfig(BaseModel):
             }
         }
 
-class Encoder(nn.Module):
+class RecurrentEncoder(nn.Module):
     def __init__(self,
                  config: Optional[VAEConfig]=None, 
                  input_dim: Optional[int] = 44,
@@ -87,20 +87,20 @@ class Encoder(nn.Module):
 
         # --- Deep Encoder Network (x -> h) ---
         layers = []
-        prev_dim = input_dim
+        current_dim = self.input_dim + self.k_atoms
         
         for hdim in hidden_dims:
-            layers.append(sn(nn.Linear(prev_dim, hdim)))
+            layers.append(sn(nn.Linear(current_dim, hdim)))
             layers.append(nn.BatchNorm1d(hdim))
             layers.append(nn.SiLU())
             layers.append(nn.Dropout(dropout))
-            prev_dim = hdim
+            current_dim = hdim
         
-        self.encoder_net = nn.Sequential(*layers)
+        self.encoder_network = nn.Sequential(*layers)
 
         # --- Latent Projections (h -> mu, logvar) ---
-        self.fc_mu = nn.Linear(prev_dim, self.latent_dim)
-        self.fc_var = nn.Linear(prev_dim, self.latent_dim)
+        self.fc_mu = nn.Linear(current_dim, self.latent_dim)
+        self.fc_var = nn.Linear(current_dim, self.latent_dim)
 
         #-DKL Heads (GP Parameters)-
         #-predict these from Z (the bottleneck) to encourage latent manifold learning-#
@@ -116,16 +116,35 @@ class Encoder(nn.Module):
             return mu + eps * std
         return mu
 
-    def forward(self, x):
-        h = self.encoder_net(x)
+    def forward(self, real_x: torch.Tensor, pi: Optional[torch.Tensor] = None, pi_init_scale_factor: float = 2.1):
+        """
+        Args:
+            real_x: Input features [Batch, Input_Dim]
+            pi: Dirichlet mixture weights [Batch, K_Atoms]. 
+                If None (1st iteration), it is initialized to zeros.
+        """
+        #-for first iter-#
+        if pi is None:
+            p_uniform = 1.0 / self.k_atoms
+            pi_init = p_uniform * pi_init_scale_factor #-flexible scale for first cluster assignment-#
+            pi = torch.full((real_x.size(0), self.k_atoms), pi_init, device=real_x.device)
+        
+        #-log transform-#
+        log_pi = torch.log(pi + self.jitter)
+        
+        #-concat data input and probabilistic weights in log space-#
+        x = torch.cat([real_x, log_pi], dim=-1)
+
+        h = self.encoder_network(x)
+        
         mu = self.fc_mu(h)
         logvar = self.fc_var(h)
-        z = self.reparameterize(mu, logvar)
+        z = self.reparameterize(mu, logvar) #-latent reparameterisation-#
 
-        #-GP Parameters
+        #-Dirichlet Parameters-#
         alpha = F.softplus(self.alpha_head(z)) + self.jitter
         
-        #-reshape lengthscale head out [Batch, K * D] -> [Batch, K, D]
+        #-Kernel parameters- [Batch, K * D] -> [Batch, K, D]-#
         ls_flat = F.softplus(self.ls_head(z)) + self.jitter
         ls = ls_flat.view(-1, self.k_atoms, self.input_dim)
 
