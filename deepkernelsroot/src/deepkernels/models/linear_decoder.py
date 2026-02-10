@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.utils.spectral_norm as sn
 
 #-where decoder_input_dim = k_atoms * M_inducing_points * 2
 class BayesDecoder(nn.Module):
     def __init__(self, latent_dim=64, original_dim=256, sigma_min=1e-5):
         """
+        inputs pi
         Reconstructs the original input space from the latent code z.
         latent_dim: dim of z
         original_dim: dim of your input data x
@@ -14,6 +16,17 @@ class BayesDecoder(nn.Module):
         self.mu_fn = nn.Linear(latent_dim, original_dim)
         self.logvar_fn = nn.Linear(latent_dim, original_dim)
         self.sigma_min = sigma_min
+
+        # --- 1. Orthogonal Init for the Mean (Structure) ---
+        # Acts like a random PCA projection at step 0
+        nn.init.orthogonal_(self.mu_fn.weight)
+        nn.init.constant_(self.mu_fn.bias, 0)
+
+        # --- 2. Zero Init for the Variance (Stability) ---
+        # Initialize logvar to 0 so variance starts at ~0.69 (softplus(0))
+        # This prevents division-by-zero explosions in the first epoch
+        nn.init.constant_(self.logvar_fn.weight, 0)
+        nn.init.constant_(self.logvar_fn.bias, 0)
 
     def forward(self, z):
         mu = self.mu_fn(z)

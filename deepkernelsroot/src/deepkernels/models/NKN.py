@@ -20,6 +20,7 @@ class NeuralKernelNetwork(nn.Module):
         #-Linear Primitive-=global trends-#
         #kernel: linear
         self.linear = nn.Linear(self.input_dim, self.H)
+        self.linear_scale = nn.Parameter(torch.tensor(0.13))
         
         #- Periodic Primitive - texture -#
         #- kernel: spectral mixture
@@ -36,8 +37,10 @@ class NeuralKernelNetwork(nn.Module):
 
         # --- 5. Constant Primitive (Bias) ---
         # Kernel: Constant
-        self.constant = nn.Parameter(torch.zeros(1, self.H))
+        self.constant = nn.Parameter(torch.randn(1, self.H) * 0.13)
         
+        self.primitive_norm = nn.LayerNorm(self.H * 9)
+
         #-kernel mixer-#
         # Mixer: 5 (Bases) + 4 (Interactions) = 9
         self.mixer = nn.Sequential(
@@ -49,7 +52,9 @@ class NeuralKernelNetwork(nn.Module):
 
     def forward(self, z):
         #-primitive kernels-#
-        lin_out, period_out, rbf_out = self.linear(z), torch.cos(self.periodic(z)), torch.exp(-torch.pow(self.rbf(z), 2))
+        lin_out = self.linear(z) * self.linear_scale
+        period_out = torch.cos(self.periodic(z))
+        rbf_out = torch.exp(-torch.pow(self.rbf(z), 2))
         rat_out = 1.0 / (1.0 + torch.pow(self.rational(z), 2))
         const_out = self.constant.expand(z.size(0), -1) #-count = 5/9-#
 
@@ -60,5 +65,7 @@ class NeuralKernelNetwork(nn.Module):
         tails = period_out * rat_out
 
         combined = torch.cat([lin_out, period_out, rbf_out, rat_out, const_out, seasonal, local, decay, tails], dim=-1)
+
+        combined = self.primitive_norm(combined)
 
         return self.mixer(combined)
