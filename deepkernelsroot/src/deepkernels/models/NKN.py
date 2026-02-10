@@ -19,21 +19,21 @@ class NeuralKernelNetwork(nn.Module):
         
         #-Linear Primitive-=global trends-#
         #kernel: linear
-        self.linear = nn.Linear(self.input_dim, self.H)
+        self.linear = sn(nn.Linear(self.input_dim, self.H))
         self.linear_scale = nn.Parameter(torch.tensor(0.13))
         
         #- Periodic Primitive - texture -#
         #- kernel: spectral mixture
-        self.periodic = nn.Linear(self.input_dim, self.H)
+        self.periodic = sn(nn.Linear(self.input_dim, self.H))
 
         # --- 3. RBF Primitive (Local Smoothness) ---
         #- kernel: RBF (sq exponential)
-        self.rbf = nn.Linear(self.input_dim, self.H)
+        self.rbf = sn(nn.Linear(self.input_dim, self.H))
 
         # --- 4. Rational Primitive (Multi-Scale/Heavy Tail) ---
         # Kernel: Rational Quadratic
         # Activation: 1 / (1 + (Wx + b)^2) -> Cauchy/Inverse Multiquadric
-        self.rational = nn.Linear(self.input_dim, self.H)
+        self.rational = sn(nn.Linear(self.input_dim, self.H))
 
         # --- 5. Constant Primitive (Bias) ---
         # Kernel: Constant
@@ -49,7 +49,29 @@ class NeuralKernelNetwork(nn.Module):
             nn.SiLU(),
             sn(nn.Linear(self.H * 12, self.output_dim))
         )
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        # 1. Linear Primitive (Identity)
+        nn.init.orthogonal_(self.linear.weight, gain=1.0)
+        
+        # 2. Periodic Primitive (Cosine) -> gain = sqrt(2)
+        nn.init.orthogonal_(self.periodic.weight, gain=1.41)
+        
+        # 3. RBF Primitive (Gaussian) - centres of rbfs
+        nn.init.orthogonal_(self.rbf.weight, gain=2.0)
+        nn.init.uniform_(self.rbf.bias, -1.0, 1.0)
+        
+        # 4. Rational Primitive (Cauchy)
+        nn.init.orthogonal_(self.rational.weight, gain=1.41)
 
+        # 5. The Mixer
+        # Standard Orthogonal Init for the MLP part
+        for module in self.mixer.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=nn.init.calculate_gain('silu'))
+        
     def forward(self, z):
         #-primitive kernels-#
         lin_out = self.linear(z) * self.linear_scale
