@@ -1,0 +1,64 @@
+import torch
+import torch.nn as nn
+import math
+import torch.nn.utils.parametrizations as P
+import torch.nn.functional as F
+import torch.nn.utils.spectral_norm as sn
+
+class NeuralKernelNetwork(nn.Module):
+    """
+    The 'Neural Kernel' Head.
+    It takes the stable, flat latent code 'z' and explodes it into 
+    structural primitives (Linear, Periodic, Multiplicative) for the GP.
+    """
+    def __init__(self, input_dim, output_dim, hidden_dim=32):
+        super().__init__()
+        self.input_dim = input_dim
+        self.H = hidden_dim if hidden_dim else 32
+        self.output_dim = output_dim if output_dim else 128 #-gp feature dim-#
+        
+        #-Linear Primitive-=global trends-#
+        #kernel: linear
+        self.linear = nn.Linear(self.input_dim, self.H)
+        
+        #- Periodic Primitive - texture -#
+        #- kernel: spectral mixture
+        self.periodic = nn.Linear(self.input_dim, self.H)
+
+        # --- 3. RBF Primitive (Local Smoothness) ---
+        #- kernel: RBF (sq exponential)
+        self.rbf = nn.Linear(self.input_dim, self.H)
+
+        # --- 4. Rational Primitive (Multi-Scale/Heavy Tail) ---
+        # Kernel: Rational Quadratic
+        # Activation: 1 / (1 + (Wx + b)^2) -> Cauchy/Inverse Multiquadric
+        self.rational = nn.Linear(self.input_dim, self.H)
+
+        # --- 5. Constant Primitive (Bias) ---
+        # Kernel: Constant
+        self.constant = nn.Parameter(torch.zeros(1, self.H))
+        
+        #-kernel mixer-#
+        # Mixer: 5 (Bases) + 4 (Interactions) = 9
+        self.mixer = nn.Sequential(
+            sn(nn.Linear(self.H * 9, self.H * 12)),
+            nn.LayerNorm(self.H * 12),
+            nn.SiLU(),
+            sn(nn.Linear(self.H * 12, self.output_dim))
+        )
+
+    def forward(self, z):
+        #-primitive kernels-#
+        lin_out, period_out, rbf_out = self.linear(z), torch.cos(self.periodic(z)), torch.exp(-torch.pow(self.rbf(z), 2))
+        rat_out = 1.0 / (1.0 + torch.pow(self.rational(z), 2))
+        const_out = self.constant.expand(z.size(0), -1) #-count = 5/9-#
+
+        #-interactions-#:
+        seasonal = lin_out * period_out
+        local = lin_out * rbf_out
+        decay = period_out * rbf_out
+        tails = period_out * rat_out
+
+        combined = torch.cat([lin_out, period_out, rbf_out, rat_out, const_out, seasonal, local, decay, tails], dim=-1)
+
+        return self.mixer(combined)

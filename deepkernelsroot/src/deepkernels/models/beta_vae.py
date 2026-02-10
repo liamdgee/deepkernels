@@ -210,3 +210,6 @@ class SpectralVAE(nn.Module):
         target_rff = target_rff / math.sqrt(self.config.M)
         
         return target_rff
+
+
+

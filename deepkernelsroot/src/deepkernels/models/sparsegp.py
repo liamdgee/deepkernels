@@ -5,8 +5,10 @@ import math
 
 from src.deepkernels.models.dirichlet import AmortisedDirichlet, HDPConfig
 from src.deepkernels.kernels.lmckernel import DeepStatelessEigenKernel
-from src.deepkernels.models.transformer import VisionTransformerFeatureExtractor, TransformerConfig
 from src.deepkernels.models.beta_vae import SpectralVAE, VAEConfig
+from src.deepkernels.models.encoder import Encoder
+from src.deepkernels.models.decoder import NystromDecoder
+from src.deepkernels.kernels.deepkernel import DeepKernel
 
 #-custom mean class-#
 class SlicedMean(gpytorch.means.Mean):
@@ -38,8 +40,8 @@ class DeepGaussianProcess(gpytorch.models.ApproximateGP):
         
         super().__init__(variational_strategy)
         
-        self.vit = vit_module if vit_module is not None else VisionTransformerFeatureExtractor(config=TransformerConfig())
-        self.vae = vae_module if vae_module is not None else SpectralVAE(config=VAEConfig())
+        self.encoder = Encoder(config=VAEConfig())
+        self.vae = NystromDecoder(config=VAEConfig())
         self.dirichlet = dirichlet_module if dirichlet_module is not None else AmortisedDirichlet(config=HDPConfig())
         self.input_dim = input_dim
         self.num_experts = num_experts
@@ -48,7 +50,7 @@ class DeepGaussianProcess(gpytorch.models.ApproximateGP):
         self.mean_module = SlicedMean(input_dim=self.input_dim)
         
         #-Cov module (stateless)-#
-        self.covar_module = DeepStatelessEigenKernel(num_experts=self.num_experts)
+        self.covar_module = DeepKernel(num_experts=self.num_experts)
 
         self.auxiliary_loss = torch.tensor(0.0)
     
@@ -77,12 +79,12 @@ class DeepGaussianProcess(gpytorch.models.ApproximateGP):
             
         #-if raw data-#
         else:
-            z = self.vit(x)
+            z = self.encoder(x)
             pi, beta, spectral_means, bw = self.dirichlet(z)
             if self.training:
                 target_rff_tensor = self._comp_target_rff(z, spectral_means, bw, pi)
-                vae_out = self.vae(z)
-                vae_loss = self.vae.loss(vae_out, target_rff = target_rff_tensor)
+                vae_out = self.decoder(z)
+                vae_loss = self.decoder.loss(vae_out, target_rff = target_rff_tensor)
                 self.auxiliary_loss = vae_loss
             
             #-concat and feed back to kernel-#
@@ -114,20 +116,13 @@ class DeepSpectralObjective(gpytorch.mlls.MarginalLogLikelihood):
         self.beta_vae = beta_vae
 
     def forward(self, function_dist, target, *args, **kwargs):
-        # 1. Calculate Standard GP ELBO
-        # This calls the model's forward() internally to get the distribution
+     
         gp_elbo = self.base_mll(function_dist, target, *args, **kwargs)
         
-        # 2. Retrieve Auxiliary Loss (VAE) stored in the model
-        # The model computed this during its forward pass
+     
         vae_loss = self.model.auxiliary_loss
         
-        # 3. Combine
-        # Maximize ELBO implies Minimize -ELBO.
-        # Typically MLL returns a value to be MAXIMIZED.
-        # VAE loss is usually strictly positive (to be minimized).
-        # So: Total Objective = GP_ELBO - (Beta * VAE_Loss)
-        
+       
         total_objective = gp_elbo - (self.beta_vae * vae_loss)
         
         return total_objective

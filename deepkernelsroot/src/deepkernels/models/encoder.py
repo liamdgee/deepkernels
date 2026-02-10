@@ -82,7 +82,6 @@ class ResBlock(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # Learnable skip connection scaling (helps initial convergence)
         self.skip_scale = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(self, x):

@@ -12,8 +12,13 @@ from gpytorch.priors import NormalPrior, GammaPrior
 
 from src.deepkernels.losses.kl_divergence import KLDivergence
 from src.deepkernels.models.beta_vae import SpectralVAE
-from src.deepkernels.models.model_config import RootConfig
 
+import logging
+
+#---Init logger---#
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
 class HDPConfig(BaseModel):
@@ -232,9 +237,9 @@ class AmortisedDirichlet(gpytorch.Module):
         #omega: [K, M, D] -> spectral frequencies
         #bias: [K, M] -> spectral phases (fixed)
         if rff_kernel:
-            print("Outputs are tailored for RFF kernel")
-            return pi, beta, omega, self.noise_bias
+            logger.info("Outputs are tailored for RFF kernel")
+            return pi, beta, omega, bw
         
-        else:
-            print("Outputs are tailored for an exact kernel")
-            return pi, beta, spectral_means, bw
+        
+        print("Outputs are tailored for an exact kernel")
+        return pi, beta, spectral_means, bw_base
