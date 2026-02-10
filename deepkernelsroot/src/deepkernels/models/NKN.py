@@ -11,11 +11,12 @@ class NeuralKernelNetwork(nn.Module):
     It takes the stable, flat latent code 'z' and explodes it into 
     structural primitives (Linear, Periodic, Multiplicative) for the GP.
     """
-    def __init__(self, input_dim, output_dim, hidden_dim=32):
+    def __init__(self, input_dim, n_experts, features_per_expert, hidden_dim=32):
         super().__init__()
         self.input_dim = input_dim
         self.H = hidden_dim if hidden_dim else 32
-        self.output_dim = output_dim if output_dim else 128 #-gp feature dim-#
+        self.n_experts = n_experts
+        self.output_dim = features_per_expert #-gp feature dim-#
         
         #-Linear Primitive-=global trends-#
         #kernel: linear
@@ -45,12 +46,13 @@ class NeuralKernelNetwork(nn.Module):
         # Mixer: 5 (Bases) + 4 (Interactions) = 9
         self.mixer = nn.Sequential(
             sn(nn.Linear(self.H * 9, self.H * 12)),
-            nn.LayerNorm(self.H * 12),
             nn.SiLU(),
-            sn(nn.Linear(self.H * 12, self.output_dim))
+            nn.LayerNorm(self.H * 12),
         )
         
         self._init_weights()
+
+        self.dense_multitask_proj = sn(nn.Linear(self.H * 12, self.output_dim * self.n_experts))
     
     def _init_weights(self):
         # 1. Linear Primitive (Identity)
@@ -71,6 +73,8 @@ class NeuralKernelNetwork(nn.Module):
         for module in self.mixer.modules():
             if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight, gain=nn.init.calculate_gain('silu'))
+
+        nn.init.orthogonal_(self.dense_multitask_proj.weight, gain=1.0)
         
     def forward(self, z):
         #-primitive kernels-#
@@ -90,4 +94,10 @@ class NeuralKernelNetwork(nn.Module):
 
         combined = self.primitive_norm(combined)
 
-        return self.mixer(combined)
+        mixed = self.mixer(combined)
+
+        #-flatten [batch, K *output dim]-#
+        flat = self.dense_multitask_proj(mixed)
+
+        #-shape out: [Batch, K, output_dim]
+        return flat.view(-1, self.n_experts, self.output_dim)
