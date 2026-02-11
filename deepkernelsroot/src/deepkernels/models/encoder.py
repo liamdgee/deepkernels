@@ -6,6 +6,7 @@ from pydantic import Field, BaseModel, PositiveInt, PositiveFloat, validator
 import math
 from typing import Optional, Annotated
 import torch.nn.utils.spectral_norm as sn
+from typing import Tuple, Optional, TypeAlias, Tuple, Union
 
 class VAEConfig(BaseModel):
     """
@@ -13,23 +14,18 @@ class VAEConfig(BaseModel):
     """
     # --- Input Dimensions ---
     input_dim: PositiveInt = Field(
-        default=128, 
+        default=44, 
         description="Dimension of input features (D)"
     )
     
     # --- VAE Architecture ---
     latent_dim: PositiveInt = Field(
-        default=64, 
+        default=16,
+        le=64,
+        ge=8, 
         description="Size of the VAE bottleneck (z)"
     )
-    hidden_dim: PositiveInt = Field(
-        default=128, 
-        description="Width of hidden layers in encoder/decoder"
-    )
-    depth: PositiveInt = Field(
-        default=4, 
-        description="Number of layers in the deep spectral networks"
-    )
+    hidden_dim: Union[int, list[int]] = [128, 64, 32]
     
     # --- Mixture & Spectral Params ---
     k_atoms: PositiveInt = Field(
@@ -37,18 +33,24 @@ class VAEConfig(BaseModel):
         description="Number of Dirichlet components / Experts (K)"
     )
     M: PositiveInt = Field(
-        default=256, 
+        default=128,
+        ge=32,
+        le=512,
         description="Number of RFF spectral samples (Frequency modes)"
     )
     
     target_rff: PositiveInt = Field(
-        default=512, 
+        default=256,
+        le=1024,
+        ge=64,
         description="Number of RFF targets (2M)"
     )
 
     # --- Regularization & Stability ---
-    beta: PositiveFloat = Field(
-        default=3.0, 
+    kl_beta: PositiveFloat = Field(
+        default=0.5,
+        le=1.5,
+        ge=0.005, 
         description="Beta-VAE disentanglement factor"
     )
     jitter: float = Field(
@@ -71,23 +73,30 @@ class VAEConfig(BaseModel):
 class RecurrentEncoder(nn.Module):
     def __init__(self,
                  config: Optional[VAEConfig]=None, 
-                 input_dim: Optional[int] = 44,
+                 input_dim: Optional[Union[int, list[int]]] = None,
                  hidden_dims: Optional[list[int]] = None, #-hidden depth dims-#
                  latent_dim: Optional[int] = 16,
                  dropout: Optional[float] = 0.07,
-                 k_atoms: Optional[int]=20
+                 k_atoms: Optional[int]=30,
+                 M: Optional[int]=None #-for dirichlet input size-#
         ):
         super().__init__()
         self.config = config or VAEConfig()
-        self.input_dim = input_dim or 44
+        self.input_dim = input_dim if input_dim is not None else 44
         self.hidden_dims = hidden_dims if hidden_dims is not None else [128, 64, 32]
-        self.latent_dim = latent_dim or self.config.latent_dim
-        self.k_atoms = self.config.k_atoms
+        self.latent_dim = latent_dim or self.config.latent_dim or 16
+        self.k_atoms = k_atoms or self.config.k_atoms or 30
+        self.M = M or self.config.M
         self.jitter = self.config.jitter or 1e-6
+
+        self.spectral_input_dim = self.k_atoms * self.M * 2
+        self.spectral_emb_dim = int(self.input_dim * 11/4)
+        self.spectral_compressor = sn(nn.Linear(self.spectral_input_dim, self.spectral_emb_dim))
 
         # --- Deep Encoder Network (x -> h) ---
         layers = []
-        current_dim = self.input_dim + self.k_atoms
+        #-- current_dim = Data(D) + LogPi(K) + SpectralEmbedding(D) -#
+        current_dim = self.input_dim + self.k_atoms + self.spectral_emb_dim #--195 = 44 + 30 + 121 (spectral emb_dim)
         
         for hdim in hidden_dims:
             layers.append(sn(nn.Linear(current_dim, hdim)))
@@ -116,26 +125,42 @@ class RecurrentEncoder(nn.Module):
             return mu + eps * std
         return mu
 
-    def forward(self, real_x: torch.Tensor, pi: Optional[torch.Tensor] = None, pi_init_scale_factor: float = 2.1):
+    def forward(self, real_x: torch.Tensor, pi: Optional[torch.Tensor] = None, spectral_features: Optional[torch.Tensor]=None, pi_init_scale_factor: float = 2.1):
         """
         Args:
             real_x: Input features [Batch, Input_Dim]
             pi: Dirichlet mixture weights [Batch, K_Atoms]. 
-                If None (1st iteration), it is initialized to zeros.
+            spectral_features: [Batch, K * M * 2]
         """
-        #-for first iter-#
+        batch_size = real_x.size(0)
+        #-for first iter: Handle missing args-#
         if pi is None:
             p_uniform = 1.0 / self.k_atoms
             pi_init = p_uniform * pi_init_scale_factor #-flexible scale for first cluster assignment-#
             pi = torch.full((real_x.size(0), self.k_atoms), pi_init, device=real_x.device)
+            pi = pi + (torch.randn_like(pi) * 0.0275)
+        if spectral_features is None:
+            spectral_features = torch.zeros(
+                batch_size, 
+                self.spectral_input_dim, 
+                device=real_x.device, 
+                dtype=real_x.dtype
+            )
         
+        #-processing steps:-#
         #-log transform-#
         log_pi = torch.log(pi + self.jitter)
-        
-        #-concat data input and probabilistic weights in log space-#
-        x = torch.cat([real_x, log_pi], dim=-1)
 
-        h = self.encoder_network(x)
+        #-compression of spectral features--tanh activation complements harmonic features-#
+        # [Batch, K*M*2] -> [Batch, Emb_Dim]
+        spectral_emb = self.spectral_compressor(spectral_features)
+        spectral_emb = F.tanh(spectral_emb)
+
+        #-concat data input and probabilistic weights in log space-#
+        weights = torch.cat([real_x, log_pi, spectral_emb], dim=-1)
+
+        #-network forward passes-#
+        h = self.encoder_network(weights)
         
         mu = self.fc_mu(h)
         logvar = self.fc_var(h)
