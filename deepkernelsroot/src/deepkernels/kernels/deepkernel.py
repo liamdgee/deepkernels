@@ -8,9 +8,7 @@ import torch
 import math
 import gpytorch
 from gpytorch.kernels import Kernel
-from linear_operator.operators import LowRankRootLinearOperator
-
-from src.deepkernels.models.Spectral_VAE import SpectralVAE
+from linear_operator.operators import LowRankRootLinearOperator, RootLinearOperator, MatmulLinearOperator
 
 
 class DeepKernel(Kernel):
@@ -42,14 +40,13 @@ class DeepKernel(Kernel):
         self.constant = nn.Parameter(torch.randn(1, self.H) * 0.13)
         self.primitive_norm = nn.LayerNorm(self.H * 9)
 
-        # 2. The Mixer
         self.mixer = nn.Sequential(
             sn(nn.Linear(self.H * 9, self.H * 12)),
             nn.SiLU(),
             nn.LayerNorm(self.H * 12),
         )
 
-        # 3. Parallel Task Heads (Deep Feature Extractors)
+        #-Parallel Task Heads-#
         self.parallel_task_layers = nn.ModuleList()
         for _ in range(self.n_experts):
             expert_layer = sn(nn.Linear(self.H * 12, self.output_dim_per_cluster))
@@ -63,21 +60,6 @@ class DeepKernel(Kernel):
     @property
     def outputscale(self):
         return self.raw_outputscale_constraint.transform(self.raw_outputscale)
-    
-    def forward(self, x1, x2, diag=False, **params):
-        features_x1 = self._compute_primitives_and_interactions(x1)
-        if x2 is not None and not torch.equal(x1, x2):
-            features_x2 = self._compute_primitives_and_interactions(x2)
-        else:
-            features_x2 = features_x1
-            
-        scale = self.outputscale.sqrt()
-        features_x1 = features_x1 * scale
-        if x2 is not features_x1:
-            features_x2 = features_x2 * scale
-        if diag:
-            return (features_x1 * features_x2).sum(-1)
-        return LowRankRootLinearOperator(features_x1, features_x2)
 
     def _init_weights(self):
         nn.init.orthogonal_(self.linear.weight, gain=1.0)
@@ -133,3 +115,31 @@ class DeepKernel(Kernel):
         flat_features = stacked.view(x.size(0), -1)
         
         return flat_features
+    
+    def forward(self, x1, x2, diag=False, **params):
+        features_x1 = self._compute_primitives_and_interactions(x1)
+        if x2 is None:
+            features_x2 = features_x1
+            symmetric = True
+        else:
+            if torch.equal(x1, x2):
+                features_x2 = features_x1
+                symmetric = True
+            else:
+                features_x2 = self._compute_primitives_and_interactions(x2)
+                symmetric = False
+        if self.outputscale is not None:
+            scale = self.outputscale.sqrt()
+            features_x1 = features_x1 * scale
+            if symmetric:
+                features_x2 = features_x1
+            else:
+                features_x2 = features_x2 * scale
+        if diag:
+            return (features_x1 * features_x2).sum(-1)
+        if symmetric:
+            #--Returns [Batch, N, N] as V @ V.T--#
+            return RootLinearOperator(features_x1)
+        else:
+            #--Returns [Batch, N, M] as A @ B.T --#
+            return MatmulLinearOperator(features_x1, features_x2.transpose(-1, -2))

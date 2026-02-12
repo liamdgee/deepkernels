@@ -1,6 +1,7 @@
 import torch
 import gpytorch
-from torch.distributions import Normal, TransformedDistribution, kl_divergence, Dirichlet
+from torch.distributions import Normal, TransformedDistribution, kl_divergence
+import torch.distributions.Dirichlet as Dir
 from torch.distributions.transforms import StickBreakingTransform
 import math
 
@@ -11,7 +12,9 @@ from typing import Tuple, Optional, TypeAlias, Tuple, Union
 from gpytorch.priors import NormalPrior, GammaPrior
 
 from src.deepkernels.losses.kl_divergence import KLDivergence
-from src.deepkernels.models.beta_vae import SpectralVAE
+from src.deepkernels.models.spectral_VAE import SpectralVAE
+from src.deepkernels.models.encoder import RecurrentEncoder
+from src.deepkernels.models.NKN import NeuralKernelNetwork
 from gpytorch.mlls import AddedLossTerm
 import logging
 
@@ -31,14 +34,13 @@ class GlobalKLLoss(AddedLossTerm):
 
 class HDPConfig(BaseModel):
     n_data: 38003
-    K: int = 20
-    M: int = 256
-    D: int = 128
+    K: int = 30
+    M: int = 128
+    D: int = 16
     eps: float = 1e-3
     gamma_init: float = 1.75
     mu_init: float = 0.0
     sigma_init: float = 1.0
-    n_tasks: int = 128
     num_inducing: int = 1024
     sigma_q_init: float = 1.5
     sigma_h_init: float = 1.0
@@ -46,25 +48,24 @@ class HDPConfig(BaseModel):
 
 
 class AmortisedDirichlet(gpytorch.Module):
-    def __init__(self, config:HDPConfig, vae=SpectralVAE):
+    def __init__(self, config=None, n_data=38003, k_atoms=30, fourier_dim=128, latent_dim=16):
         super().__init__()
         self.config = config or HDPConfig()
-        self.n_data = config.n_data
-        self.K = self.config.K
-        self.M = self.config.M #-rff samples per mixture-#
-        self.D = self.config.D #-input dim-#
-        self.eps = self.config.eps
-    
+        self.n_data = n_data or config.n_data
+        self.K = k_atoms or self.config.K
+        self.M = fourier_dim or self.config.M #-rff samples per mixture-#
+        self.D = latent_dim or self.config.D #-input dim-#
+        self.eps = 1e-3
 
         #--init constraints--#
-        self.mu_init = self.config.mu_init
-        self.sigma_init = self.config.sigma_init
+        self.mu_init = self.config.mu_init or 0.0
+        self.sigma_init = self.config.sigma_init or 1.0
         self.log_sigma_init = math.log(self.sigma_init)
-        self.sigma_q_init = self.config.sigma_q_init
+        self.sigma_q_init = self.config.sigma_q_init or 1.5
         self.qsig = (math.log(self.sigma_q_init)) * -1
-        self.sigma_h_init = self.config.sigma_h_init
+        self.sigma_h_init = self.config.sigma_h_init or 1.0
         self.hsig = (math.log(self.sigma_h_init)) * -1
-        self.atom_factor = self.config.atom_factor
+        self.atom_factor = self.config.atom_factor or 0.0075
 
         # ---------------------------------------------------------
         # Structure: GEM Global Mixing Weights (Beta)
@@ -74,11 +75,11 @@ class AmortisedDirichlet(gpytorch.Module):
         self.q_log_sigma = nn.Parameter(torch.full((self.K - 1,), self.qsig)) #-cluster stability-#
 
         #-priors-#
-        self.register_prior("global_lengthscale_prior", GammaPrior(concentration=2.5, rate=3.5), lambda m: m.h_log_sigma.exp(), lambda m, v: None)
+        self.register_prior("global_lengthscale_prior", GammaPrior(concentration=2.5, rate=3.0), lambda m: m.h_log_sigma.exp(), lambda m, v: None)
 
         self.register_prior("local_lengthscale_prior", GammaPrior(concentration=3.0, rate=5.0), lambda m: m.atom_log_sigma.exp(), lambda m,v: None)
         
-        self.register_prior("gamma_prior", GammaPrior(2.25, 1.25), lambda m: F.softplus(m.gamma), lambda m, v: None)
+        self.register_prior("gamma_prior", GammaPrior(2.5, 1.0), lambda m: F.softplus(m.gamma), lambda m, v: None)
 
         # ---------------------------------------------------------
         # Content: Spectral Frequencies (Omega)
@@ -98,24 +99,17 @@ class AmortisedDirichlet(gpytorch.Module):
         self.register_buffer("noise_weights", torch.randn(self.K, self.M, self.D)) #-Shape: [K, M, D]-#
         self.register_buffer("noise_bias", torch.rand(self.K, self.M) * 2 * math.pi)
 
-
         # ---------------------------------------------------------
-        # C) Amortized Inference (pi_encoder)
-        # ---------------------------------------------------------
-        #--Data Encoder for local mixing weights-#
-        self.pi_encoder = vae(input_dim=self.D, k_atoms=self.K, M=self.M, latent_dim=16, hidden_dim=128)
-
-        # ---------------------------------------------------------
-        # D) Concentration (Gamma)
+        # C) Concentration (Gamma)
         # ---------------------------------------------------------
         #-- Learnable scalar for dirichlet process concentration (gamma)-#
-        self.gamma_init = getattr(self.config, 'gamma_init', 2.0)
+        self.gamma_init = 2.0
         self.gamma = nn.Parameter(torch.tensor(float(self.gamma_init)))
 
         #--Define torch stickbreak module-#
         self.stick_break_transform = StickBreakingTransform()
     
-    def dynamic_random_fourier_features(self, z, omega, pi):
+    def dynamic_random_fourier_features(self, z: torch.Tensor, omega: torch.Tensor, pi: Optional[torch.Tensor]=None, raw_transforms: bool=False):
         """
         Args:
             z: [Batch, D]
@@ -126,6 +120,7 @@ class AmortisedDirichlet(gpytorch.Module):
 
         #-determine if omega is dynamic-#
         if omega.dim() == 4:
+            #-Dynamic: [B, K, M, D] * [B, 1, 1, D] -> Sum over D -#
             proj = (z.view(B, 1, 1, D) * omega).sum(dim=-1) #-dynamic-#
         else:
             W = omega.view(-1, D)
@@ -133,30 +128,53 @@ class AmortisedDirichlet(gpytorch.Module):
             proj = proj.view(B, self.K, self.M)
         
         #-phase shift-#
-        proj = proj + self.noise_bias.unsqueeze(0)
-
+        proj = proj + self.noise_bias.unsqueeze(0) #- [K, M] -> [1, K, M]
+        
+        #-scale for vae-#
+        scale = 1.0 / math.sqrt(self.M)
+        
         #-harmonics-#
-        cos_proj = torch.cos(proj)
-        sin_proj = torch.sin(proj)
+        cos_proj = torch.cos(proj) * scale
+        sin_proj = torch.sin(proj) * scale
+
+        if raw_transforms or pi is None:
+            logger.info("returned individual harmonic transforms (no concat) --  these are not scaled by pi Shape [B, K, M]")
+            return cos_proj, sin_proj
 
         #-Mixing weights (amortised)-#
         #-unsqueeze [B, K] -> [B, K, 1]
         pi_scl = torch.sqrt(pi).unsqueeze(-1)
         cos_proj = cos_proj * pi_scl
         sin_proj = sin_proj * pi_scl
+        feats = torch.stack([cos_proj, sin_proj], dim=-1) #- [B, K, M] -> [B, K, M, 2]
+        return feats.flatten(1) #-[B, (K * M * 2)]
+    
+    def get_omega(self, bw):
+        """
+        Stateless helper: inputs -> outputs. Safe for any batch.
+        # bw shape: [K, M, D] or [Batch, K, M, D]
+        # h_mu: [1, 1, D]
+        # atom_mu: [K, 1, D]
+        """
+        omega = self.h_mu + self.atom_mu + (self.noise_weights * bw)
+        return torch.clamp(omega, -100.0, 100.0)
 
-        #-normalisation-#
-        scale = 1.0 / math.sqrt(self.M)
-        cos_proj = cos_proj.flatten(1) * scale
-        sin_proj = sin_proj.flatten(1) * scale
-
-        #-concat/flatten-#
-        #-[B, K, M, 2] -> [B, K*M*2]
-        feats = torch.cat([cos_proj, sin_proj], dim=-1)
-
-        return feats #-[B, (K * M * 2)]
-
-    def forward(self, z: Optional[torch.Tensor]=None, batch_shape=torch.Size([]), rff_kernel=True) -> DualDirichletOutput:
+    def forward(self, 
+            z: Optional[torch.Tensor]=None, 
+            batch_shape=torch.Size([]), 
+            rff_kernel=True, 
+            ls: Optional[torch.Tensor]=None, 
+            alpha: Optional[torch.Tensor]=None) -> DualDirichletOutput:
+        """
+        Args:
+            z: [Batch, D] - Latent (Required for features)
+            alpha_amortised: [Batch, K] - Dirichlet Concentration (from Encoder)
+            ls_amortised: [Batch, K, D] - Lengthscales (from Encoder or Override)
+        """
+        
+        # ---------------------------------------------------------
+        # 1. Global Variational Inference (Stick Breaking)
+        # ---------------------------------------------------------
         #--A) define variational posterior - q(v)-#
         q_sig = F.softplus(self.q_log_sigma)
         q_dist = Normal(self.q_mu, q_sig)
@@ -183,75 +201,60 @@ class AmortisedDirichlet(gpytorch.Module):
         kl_div = (log_qv - log_pv).sum()
         self.update_added_loss_term("global_stick_breaking_kl", GlobalKLLoss(kl_div))
 
-        # -- C) Compute Mixture Weights (beta) for downstream use --
+        # -- Compute Mixture Weights (beta) for downstream use --
         # Transform z -> v -> beta (stick breaking)
         qv_global = torch.sigmoid(qz_global)
         one_minus_v = 1 - qv_global
         cumprod_one_minus_v = torch.cumprod(one_minus_v, dim=-1)
-        
-        # 2. Shift cumprod to get the "previous" remaining stick
         previous_remaining = torch.roll(cumprod_one_minus_v, 1, dims=-1)
-        previous_remaining[..., 0] = 1.0 
-
-        #-Stick-Breaking Construction-#
-        # beta_k = v_k * prod_{j<k} (1 - v_j)
-        # 3. Calculate first K-1 weights
+        previous_remaining[..., 0] = 1.0
         beta_k = qv_global * previous_remaining
-        
-        # 4. Calculate the final Kth weight (the leftover)
-        # The last element is whatever is left after the (K-1)th cut
         beta_last = cumprod_one_minus_v[..., -1:]
-        
-        # 5. Concatenate to get full [K] simplex
         beta = torch.cat([beta_k, beta_last], dim=-1)
 
-        #--D) Dynamic local weights (pi)--#
+        # ---------------------------------------------------------
+        # 2. Local Concentration (Prior vs Posterior)
+        # ---------------------------------------------------------
         prior_conc = (gamma * beta) + self.eps
         prior_conc = torch.clamp(prior_conc, min=1e-2, max=100.0)
-
-        #--E) amortised inference--#
         ls_pred = None
-        
+        #--E) amortised inference--#
         if z is not None:
             batch_size = z.size(0)
-            prior_conc_expanded = prior_conc.unsqueeze(0).expand(batch_size, -1)
+            prior_conc_expanded = prior_conc.unsqueeze(0).expand(batch_size, -1) #-[K] -> [1, K] -> [B, K]-#
         else:
             if len(batch_shape) > 0:
-                batch_size = batch_shape[0]
-                prior_conc_expanded = prior_conc.expand(*batch_shape, -1)
+                view_shape = [1] * len(batch_shape) + [-1] 
+                prior_reshaped = prior_conc.view(*view_shape)
+                prior_conc_expanded = prior_reshaped.expand(*batch_shape, -1)
             else:
-                batch_size = 1
                 prior_conc_expanded = prior_conc.unsqueeze(0)
         
-        if z is None:
-            #-generative fallback-#
-            post_conc = prior_conc_expanded
-            #-0 analytical kl-#
-            self.update_added_loss_term("gen_0_div", KLDivergence(post_conc, post_conc))
-        else:
+        if alpha is not None:
             #--amortised inference in training-#
             #-Data evidence from neural net (pi_encoder)-#
             #- z: [B, D] -> data_conc: [B, K]-#
-            vae_out = self.pi_encoder(z)
-            local_conc = vae_out['alpha'] #-[B, K]-#
-            amortised_ls = vae_out['ls']
-            ls_pred = torch.clamp(amortised_ls, min=self.eps, max=5.0)
             
-            #-Posterior Concentration (global belief + local evidence)-
-            local_conc = torch.clamp(local_conc, min=self.eps, max=100.0)
-
-            post_conc = prior_conc.unsqueeze(0) + local_conc
+            #-posterior = prior + local evidence-#
+            local_conc = torch.clamp(alpha, min=self.eps, max=100.0)
+            post_conc = prior_conc_expanded + local_conc
             post_conc = torch.clamp(post_conc, min=self.eps, max=100.0)
-            #--kl loss for only when data is present-#
-            #-Create Distribution objects for kl loss updates-#
-            pr_dist_pi = Dirichlet(prior_conc) #-[B, K]
-            post_dist_pi = Dirichlet(post_conc) #-- [B, K]
             
-            #-analytical kl for training & inference-#
+            #-KL Posterior-#
+            #-Create Distribution objects for kl loss updates-#
+            pr_dist_pi = Dir(prior_conc_expanded) #-[B, K]
+            post_dist_pi = Dir(post_conc) #-- [B, K]
             self.update_added_loss_term("pi_kl", KLDivergence(post_dist_pi, pr_dist_pi))
-        
+            if ls is not None:
+                ls_pred = torch.clamp(ls, min=self.eps, max=5.0)
+        else:
+            # --- GENERATIVE MODE ---
+            # No evidence provided. We sample from the Prior.
+            post_conc = prior_conc_expanded
+            self.update_added_loss_term("gen_0_div", KLDivergence(post_conc, post_conc))
+
         #--Sample from pi (dynamic)-#
-        pi = Dirichlet(post_conc).rsample() #--[B, K]-#
+        pi = Dir(post_conc).rsample() #--[B, K]-#
 
         #--F) Construct Spectal frequencies with H regularisation-#
         #--centres: global center + local frequency/position-#
@@ -267,27 +270,17 @@ class AmortisedDirichlet(gpytorch.Module):
         else:
             bw = bw_base 
        
+        omega = self.get_omega(bw) #- omega shape: - [K, M, D]-#
+        
+        if z is not None:
+            cos_transform, sin_transform = self.dynamic_random_fourier_features(z, omega, raw_transforms=True)
 
-        #-omega ~ N(spectral_means, bandwidth)
-        #- omega shape: - [K, M, D]-#
-        omega = spectral_means + (self.noise_weights * bw)
-        omega = torch.clamp(omega, -100.0, 100.0)
-
-        if z is not None and vae_out is not None:
-            target_rff = self.dynamic_random_fourier_features(z, omega, pi=torch.ones_like(pi)) #-dummy for kernel learning-#
-            vae_loss = self.pi_encoder.loss(vae_out, target_rff.detach())
-            self.update_added_loss_term("vae_loss", vae_loss)
-        #--Returns:
-        #pi: [B, K] -> local mixing weights
-        #beta: [K] -> global prevalence
-        #omega: [K, M, D] -> spectral frequencies
-        #bias: [K, M] -> spectral phases (fixed)
-        if rff_kernel:
-            fourier_features = self.dynamic_random_fourier_features(z, omega, pi)
-            logger.info("Outputs are tailored for RFF kernel: Shape: [Batch, K * M * 2]")
-            return fourier_features
+            if rff_kernel and alpha is not None:
+                pi_scl = torch.sqrt(pi).unsqueeze(-1)
+                features = torch.stack([cos_transform * pi_scl, sin_transform * pi_scl], dim=-1).flatten(1)
+                return features, omega
         
         if bw.dim() == 4 and bw.shape[2] == 1:
             bw = bw.squeeze(2)
-        print("Debugging / Exact Mode: Outputs are tailored for an exact kernel")
-        return pi, beta, spectral_means, bw
+        
+        return pi, beta, spectral_means, bw, features, omega

@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.nn.utils.parametrizations as P
 from pydantic import Field, BaseModel, PositiveInt, PositiveFloat, validator
 import math
+import torch.nn.utils.spectral_norm as sn
 
 class VAEConfig(BaseModel):
     """
@@ -73,7 +74,7 @@ class VAEConfig(BaseModel):
             raise ValueError(f"M (spectral samples) must be even, got {v}")
         return v
 
-class SpectralVAE(nn.Module):
+class VAE(nn.Module):
     def __init__(self, config: VAEConfig):
         """
         Args:
@@ -104,8 +105,7 @@ class SpectralVAE(nn.Module):
         dims = [self.input_dim] + [self.H] * (self.D - 1)
         
         for i in range(len(dims) - 1):
-            linear = P.spectral_norm(nn.Linear(dims[i], dims[i+1]))
-            enc_layers.append(linear)
+            enc_layers.append(sn(nn.Linear(dims[i], dims[i+1])))
             enc_layers.append(nn.SiLU())
             enc_layers.append(nn.LayerNorm(dims[i+1]))
         

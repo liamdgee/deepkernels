@@ -1,7 +1,7 @@
 #filename: deepkernels.py
 import torch
 import gpytorch
-from gpytorch.means import MultitaskMean, ConstantMean
+from gpytorch.means import MultitaskMean, LinearMean
 import math
 from gpytorch.models import ApproximateGP
 import torch.nn.functional as F
@@ -13,33 +13,44 @@ from gpytorch.variational import (
     LMCVariationalStrategy
 )
 import torch.nn as nn
-from gpytorch.distributions import MultitaskMultivariateNormal
+from gpytorch.distributions import MultitaskMultivariateNormal, MultivariateNormal
 from gpytorch.models import ApproximateGP
 
-from src.deepkernels.models.dirichlet import AmortisedDirichlet, HDPConfig
-from src.deepkernels.kernels.lmckernel import DeepStatelessEigenKernel
-from src.deepkernels.models.beta_vae import SpectralVAE, VAEConfig
-from src.deepkernels.models.encoder import RecurrentEncoder
-from src.deepkernels.models.linear_decoder import BayesDecoder
-from src.deepkernels.models.NKN import NeuralKernelNetwork
 
+from src.deepkernels.models.model import GenerativeKernelProcess
 from src.deepkernels.kernels.deepkernel import DeepKernel
 
 class DeepKernelProcess(gpytorch.models.ApproximateGP):
-    def __init__(self, config, y_target: torch.Tensor=None, n_tasks: int=30, rank: int = 2, n_inducing: int=1024, feature_dim: int=7680, n_latents: int=None):
+    def __init__(
+            self, 
+            orchestrator_module,
+            config=None, 
+            y_target: torch.Tensor=None, 
+            n_tasks: int=30, 
+            rank: int = 4, 
+            n_inducing: int=1024,
+            feature_dim: int=7680, 
+            encoder_input_dim: int = 44, 
+            fourier_dim=256
+        ):
         """
         Args:
             num_inducing: Number of variational inducing points (SVGP).
             feature_dim: The flattened size of the spectral features (K * M * 2).
             num_tasks: Number of Dirichlet clusters (K).
             rank: Rank of the low-rank task covariance matrix (coregionalization).
-            n_latents = latent dims in LMC -- often set proportional to K clusters 
+            n_latents = latent dims in LMC -- often set proportional to K clusters
+
+            Linear Model of Coregionalisation Structure:
+            - Base: Deep Linear Kernel (Shared features across tasks)
+            - Coregionalization: MultitaskKernel (Learns task correlation B)
         """
-        self.config = config
-        self.n_tasks = n_tasks or self.config.n_tasks
-        self.n_latents = n_latents if n_latents else self.n_tasks
-        self.rank = rank if rank else 2
-        self.M = self.config.M or 256
+        self.n_tasks = n_tasks
+        self.rank = rank
+        self.M = fourier_dim
+        self.encoder_input_dim = encoder_input_dim
+        self.orchestrator = GenerativeKernelProcess()
+        
         target = None
         if isinstance(y_target, torch.Tensor):
             target = y_target.mean(dim=-1) if y_target.dim() > 1 else y_target
@@ -51,19 +62,22 @@ class DeepKernelProcess(gpytorch.models.ApproximateGP):
 
         #-Variational dist-#
         #-batch: torch.Size([num_tasks]) so we have distinct variational parameters (m, S) for the latent functions of each task
-        dist = CholeskyVariationalDistribution(n_inducing, batch_shape=torch.Size([self.n_tasks]))
+        dist = CholeskyVariationalDistribution(n_inducing, batch_shape=torch.Size([]))
         
         #-Linear Model of Coregionalisation variational strategy-#
-        inner_strategy = VariationalStrategy(self, inducing, dist, learn_inducing_locations=True)
-        strategy = LMCVariationalStrategy(inner_strategy, n_tasks=self.n_tasks, num_latent=self.n_latents, latent_dim=-1)
+        strategy = VariationalStrategy(self, inducing, dist, learn_inducing_locations=True)
         
         super().__init__(strategy)
-        
-        self.base_mean = ConstantMean()
-        self.mean_module = MultitaskMean(self.base_mean, num_tasks=self.n_tasks)
-        
-        self.deepkernel = DeepKernel(input_dim=self.n_latents, n_experts=self.n_tasks, features_per_expert=self.M)
-        self.covar_module = MultitaskKernel(self.deepkernel, num_tasks=self.n_tasks, rank=2)
+   
+        self.mean_module = MultitaskMean( torch.nn.ModuleList(
+            [LinearMean(input_size = encoder_input_dim) for _ in range(n_tasks)],
+            input_size=self.encoder_input_dim, num_tasks=self.n_tasks
+        ))
+    
+        self.covar_module = MultitaskKernel(nn.ModuleList(
+            DeepKernel(input_dim=feature_dim, n_experts=self.n_tasks,
+                        features_per_expert=self.M)
+        ))
 
         #-Expected shape of y_target: [N, num_tasks]-#
         if target is not None: 
@@ -73,16 +87,21 @@ class DeepKernelProcess(gpytorch.models.ApproximateGP):
             else:
                 self.mean_module.base_means[0].constant.data.fill_(target.mean().item())
 
-    def forward(self, spectral_features):
+    def forward(self, x, z):
         """
         Args:
             spectral_features: [Batch, K * M * 2] output from SpectralVAE
         """
         # The GP simply weighs the spectral features to predict y
-        mean_x = self.mean_module(spectral_features)
-        covar_x = self.covar_module(spectral_features)
+        feats, covar = self.orchestrator(x)
+
+        feats_batch = self.make_expert_tensor(feats)
+
+        x_hat = self.mean_module(feats)
+
+        y_hat = self.covar_module(covar)
         
-        return MultitaskMultivariateNormal(mean_x, covar_x)
+        return MultitaskMultivariateNormal.from_batch_mvn(MultivariateNormal(x_hat, y_hat))
     
     @staticmethod
     def init_inducing_with_fft(y_target: torch.Tensor = None, n_inducing: int = 1024, feature_dim: int = 7680):
@@ -141,3 +160,10 @@ class DeepKernelProcess(gpytorch.models.ApproximateGP):
         
         return inducing
     
+    def make_expert_tensor(flat_features, num_clusters=30):
+        
+        batch_size = flat_features.size(0)
+        unflattened = flat_features.view(batch_size, num_clusters, -1)
+        expert_tensor = unflattened.permute(1, 0, 2)
+        
+        return expert_tensor
