@@ -25,7 +25,6 @@ class SpectralVAE(nn.Module):
         super().__init__()
         self.dirichlet = AmortisedDirichlet()
         self.decoder = SpectralDecoder()
-        self.kernel = DeepKernel()
         self.encoder = RecurrentEncoder(input_dim=44, hidden_dims=[128, 64, 32], latent_dim=16, dropout=0.1, k_atoms=30, M=128)
         self.eps = 1e-4
 
@@ -64,7 +63,8 @@ class SpectralVAE(nn.Module):
             'z_out': z,
             'alpha_concentration_out': alpha,
             'lengthscales_out': ls,
-            'empirical_latent_kl_per_step': all_latents
+            'empirical_latent_kl_per_step': all_latents,
+            'simplex_sample_out': pi_current
         }
     
     def compute_loss(self, vae_out, y_target, input_dim=None, dirichlet_local_beta=1.0, dirichlet_global_beta=1.0, latent_kl_beta=0.5):

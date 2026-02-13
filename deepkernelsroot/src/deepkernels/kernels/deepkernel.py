@@ -12,39 +12,21 @@ from linear_operator.operators import LowRankRootLinearOperator, RootLinearOpera
 from src.deepkernels.models.encoder import RecurrentEncoder
 
 class DynamicMixtureMean(gpytorch.means.Mean):
-    def __init__(self, covar_access, base_means=None, jitter=1e-6):
+    def __init__(self, k_atoms=30):
+        super().__init__()
+        self.k_atoms = k_atoms
+        self.register_parameter(name="cluster_constants", parameter=torch.nn.Parameter(torch.zeros(k_atoms)))
+
+    def forward(self, x, pi=None):
         """
         Args:
-            base_means (list): A list of K gpytorch.means.Mean modules.
-            hypernet (nn.Module): The same hypernetwork used in your kernel.
+            x: Raw input [Batch, D]
+            pi: Mixture weights [Batch, K] from the VAE/Encoder
         """
-        super().__init__()
-        self.base_means = nn.ModuleList(base_means)
-        self.covar_access = covar_access
-        self.hypernet = DeepKernel(mean_access=self.covar_access)
-        self.jitter = jitter
-
-    def forward(self, x):
-        # 1. Get Mixture Weights from Hypernetwork (reuse kernel logic)
-        # Note: We only need w1 (weights) here, not lengthscales
-        w, _ = self.hypernet(x)  # w shape: [..., N, K]
+        if pi is None:
+            return torch.zeros(x.size(0), device=x.device)
         
-        # Normalize to probability space (pi)
-        S = w.sum(dim=-1, keepdim=True)
-        pi = torch.clamp(w / (S + self.jitter), min=self.jitter) # [..., N, K]
-
-        # 2. Compute the K individual means
-        # Stack them to get shape [..., N, K]
-        # We iterate through the list of means you provided
-        mean_outputs = [mean_module(x).unsqueeze(-1) for mean_module in self.base_means]
-        mean_stack = torch.cat(mean_outputs, dim=-1) # [..., N, K]
-        
-        # 3. Weighted Sum (Gating)
-        # Sum_k ( pi_k(x) * mu_k(x) )
-        final_mean = (pi * mean_stack).sum(dim=-1) # [..., N]
-        
-        return final_mean
-
+        return (pi * self.cluster_constants).sum(dim=-1)
 
 class DeepKernel(Kernel):
     """
@@ -52,11 +34,11 @@ class DeepKernel(Kernel):
     1. Neural Phase: Transforms latent 'z' into high-dimensional task features.
     2   . Kernel Phase: Maps task features into an approximate RBF kernel using Orthogonal Random Features.
     """
-    def __init__(self, mean_access, **kwargs):
+    def __init__(self, num_latents=6, **kwargs):
         super().__init__(**kwargs)
         
         # --- Config ---
-        self.mean_access = mean_access
+        self.num_latents = num_latents
         self.input_dim = 7680
         self.H = 16
         self.n_experts = 30
@@ -82,10 +64,11 @@ class DeepKernel(Kernel):
         )
 
         #-Parallel Task Heads-#
-        self.parallel_task_layers = nn.ModuleList()
-        for _ in range(self.n_experts):
-            expert_layer = sn(nn.Linear(self.H * 12, self.output_dim_per_cluster))
-            self.mean_access.parallel_task_layers.append(expert_layer)
+
+        self.parallel_task_layers = nn.ModuleList([
+            sn(nn.Linear(self.H * 12, self.output_dim_per_latent)) 
+            for _ in range(num_latents)
+        ])
 
         self.register_parameter(name="raw_outputscale", parameter=torch.nn.Parameter(torch.zeros(1)))
         self.register_constraint("raw_outputscale", gpytorch.constraints.Positive())
@@ -139,49 +122,29 @@ class DeepKernel(Kernel):
         mixed = self.mixer(self.primitive_norm(combined))
 
         #-heads-#
-        task_outputs = []
-        for layer in self.parallel_task_layers:
-            task_outputs.append(layer(mixed))
-        
-        #-Stack [Batch, K, D_per_k]
-        stacked = torch.stack(task_outputs, dim=1)
-        
-        return stacked
+        latent_features = torch.stack([head(mixed) for head in self.parallel_task_layers], dim=0)
+        return latent_features / math.sqrt(self.output_dim_per_cluster) #-in this iteration, cluster means latent in kernel logic-#
     
-    def forward(self, x1, x2, diag=False, **params):
-
-        features_x1 = self._compute_primitives_and_interactions(x1)
-        
-        # 2. Permute to [K, Batch, D] 
-        features_x1 = features_x1.permute(1, 0, 2) # [30, B, 256]
-        
+    def forward(self, x1, x2, pi=None, diag=False, **params):
+        # 1. Get Latent Features: [num_latents, Batch, 256]
+        z1 = self._compute_primitives_and_interactions(x1)
         if x2 is None or torch.equal(x1, x2):
-            features_x2 = features_x1
+            z2 = z1
             symmetric = True
         else:
-            features_x2 = self._compute_primitives_and_interactions(x2)
-            features_x2 = features_x2.permute(1, 0, 2)
+            z2 = self._compute_primitives_and_interactions(x2)
             symmetric = False
+        
+        amp = self.n_experts / self.num_latents
 
-        # We use the log_amplitude vector (size 30)
-        amplitude = self.log_amplitude.exp().view(-1, 1, 1) # [30, 1, 1]
-        
-        # Scale by amplitude and normalize by sqrt(D) for RFF stability
-        scale_factor = amplitude / math.sqrt(self.output_dim_per_cluster)
-        
-        features_x1 = features_x1 * scale_factor
+        z1 = z1 * amp
         if not symmetric:
-            features_x2 = features_x2 * scale_factor
-        else:
-            features_x2 = features_x1
-        #input is 3D [K, B, D], RootLinearOperator automatically 
+            z2 = z2 * amp
         if diag:
-            # Returns [K, Batch]
-            return (features_x1 * features_x2).sum(-1)
+            return (z1 * z2).sum(-1) # [6, Batch]
             
         if symmetric:
-            # Returns Batched LinearOperator representing [K, Batch, Batch]
-            return RootLinearOperator(features_x1)
+            return RootLinearOperator(z1)
         else:
-             # Returns Batched LinearOperator representing [K, Batch_1, Batch_2]
-            return MatmulLinearOperator(features_x1, features_x2.transpose(-1, -2))
+            # Result: MatmulLinearOperator of shape [6, Batch1, Batch2]
+            return MatmulLinearOperator(z1, z2.transpose(-1, -2))

@@ -2,7 +2,7 @@ from src.deepkernels.models.dirichlet import AmortisedDirichlet, HDPConfig
 from src.deepkernels.models.spectral_VAE import SpectralVAE
 from src.deepkernels.models.encoder import RecurrentEncoder
 from src.deepkernels.models.linear_decoder import BayesDecoder
-from src.deepkernels.kernels.deepkernel import DeepKernel
+from src.deepkernels.kernels.deepkernel import DeepKernel, DynamicMixtureMean
 from src.deepkernels.models.deepkernels import DeepKernelProcess
 from typing import Tuple, Optional, TypeAlias, Tuple, Union
 import torch
@@ -31,8 +31,8 @@ from gpytorch.models import ApproximateGP
 
 class GenerativeKernelProcess(ApproximateGP):
     """
-    Data Flow:
-    1. real_x -> *skip* -> gp output layer (all means are interprettable as mean module never enters latent space.)
+    Data Flow: 
+    1. real_x in
     2. Input (real_x) -> 'RecurrentEncoder' -> Latent (z)
     3. Latent (z) -> 'AmortisedDirichlet' Module for nonparametric clustering -> gradients flow back to 'Recurrent Encoder' via amortised inference
     3. Latent (z) -> VAE Decoder -> Reconstruction (x_hat) [Regularization 2]
@@ -43,60 +43,75 @@ class GenerativeKernelProcess(ApproximateGP):
     
     where mu_real_{i} is deterministic per cluster
     """
-    def __init__(self, steps, y_target, n_inducing=1024, k_atoms=30, feature_dim=7680):
-        super().__init__()
+    def __init__(
+            self, 
+            steps, 
+            y_target, 
+            num_latents=6, 
+            n_inducing=1024, 
+            k_atoms=30, 
+            feature_dim=7680
+        ):
 
         self.vae = SpectralVAE()
-        steps = steps or 3
+        self.steps = steps or 3
         self.y_target = y_target
-        self.n_tasks = k_atoms or 30
-        self.k_atoms = k_atoms or 30
-        self.feature_dim = feature_dim or 7680
-        self.num_latents = 3
+        self.k_atoms = k_atoms
+        self.num_latents = num_latents
         
         init_inducing = self.init_inducing_with_fft(y_target=y_target, n_inducing=n_inducing, feature_dim=feature_dim)
 
         #-Variational dist-#
         #-batch: torch.Size([num_tasks]) so we have distinct variational parameters (m, S) for the latent functions of each task
         
-        dist = CholeskyVariationalDistribution(
+        self.variational_distribution = CholeskyVariationalDistribution(
             n_inducing, 
             batch_shape=torch.Size([self.num_latents])
         )
         
         #-Linear Model of Coregionalisation variational strategy-#
-        strategy = LMCVariationalStrategy(
+        self.variational_strategy = LMCVariationalStrategy(
             VariationalStrategy(
                 init_inducing, 
-                dist, 
-                learn_inducing_locations=True,), 
-                num_tasks=self.k_atoms, 
-                num_latents=self.num_latents, 
-                latent_dim=-1)
+                self.variational_distribution, 
+                learn_inducing_locations=True,
+            ), 
+            num_tasks=self.k_atoms, 
+            num_latents=self.num_latents, 
+            latent_dim=-1
+        )
 
-        super().__init__(strategy)
+        super().__init__(self.variational_strategy)
 
-        self.mean_module = ConstantMean()
-
-        self.covar_module = LinearKernel()
-
-        if y_target.dim() > 1 and y_target.shape[-1] == self.n_tasks:
-            task_means = y_target.mean(dim=0) #-[num_tasks]-#
-            self.mean_module.base_means[0].constant.data.copy_(task_means)
-        else:
-            self.mean_module.base_means[0].constant.data.fill_(y_target.mean().item())
-    
+        #-mean module (custom dynamic)
+        self.mean_module = DynamicMixtureMean(k_atoms=self.k_atoms)
         
-    
-    def forward(self, x, steps):
-        loop_results = self.vae(x, steps=steps)
-        phi = loop_results['spectral_features_per_step'][-1]
-        x_hat = self.mean_module(x)
-        y_hat = self.covar_module(phi)
+        #-covar module (custom dynamic with deep feature extraction 
+        # and kernel decomposition using similar methods to the 
+        # automatic statistician)
 
-        return MultitaskMultivariateNormal.from_batch_mvn(MultivariateNormal(x_hat, y_hat))
+        self.covar_module = DeepKernel(num_latents=self.num_latents)
     
-    def init_inducing_with_fft(y_target: torch.Tensor = None, n_inducing: int = 1024, feature_dim: int = 7680):
+    
+    
+    def forward(self, x):
+        """beware that steps is encoded in init for the vae call"""
+        loop_results = self.vae(x, steps=self.steps)
+        phi = loop_results['spectral_features_per_step'][-1]
+        pi = loop_results['simplex_sample_out']
+        pred = self.variational_strategy(phi, pi=pi)
+        return pred
+    
+    
+    
+    
+    
+    @staticmethod
+    def init_inducing_with_fft(
+        y_target: torch.Tensor = None, 
+        n_inducing: int = 1024, 
+        feature_dim: int = 7680
+    ):
         """
         Initializes inducing point values based on the FFT of the target signal.
         
