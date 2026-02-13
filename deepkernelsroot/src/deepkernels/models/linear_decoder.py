@@ -5,16 +5,14 @@ import torch.nn.utils.spectral_norm as sn
 
 #-where decoder_input_dim = k_atoms * M_inducing_points * 2
 class BayesDecoder(nn.Module):
-    def __init__(self, latent_dim=64, original_dim=256, sigma_min=1e-5):
+    def __init__(self, latent_dim, batch_dim, sigma_min=1e-5):
         """
-        inputs pi
         Reconstructs the original input space from the latent code z.
         latent_dim: dim of z
-        original_dim: dim of your input data x
         """
         super().__init__()
-        self.mu_fn = nn.Linear(latent_dim, original_dim)
-        self.logvar_fn = nn.Linear(latent_dim, original_dim)
+        self.mu_fn = nn.Linear(latent_dim, batch_dim)
+        self.logvar_fn = nn.Linear(latent_dim, batch_dim)
         self.sigma_min = sigma_min
 
         # --- 1. Orthogonal Init for the Mean (Structure) ---

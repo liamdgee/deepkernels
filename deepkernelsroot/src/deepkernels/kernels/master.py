@@ -6,8 +6,9 @@ from gpytorch.kernels import Kernel, LinearKernel, ScaleKernel
 from src.deepkernels.models.NKN import NeuralKernelNetwork
 from src.deepkernels.models.dirichlet import AmortisedDirichlet
 
+#-moving this logic to a nn module-#
 
-class MasterKernel(Kernel):
+class MasterKernel(Kernel): 
     def __init__(self, nkn, dirichlet, **kwargs):
         super().__init__(**kwargs)
         self.nkn = nkn

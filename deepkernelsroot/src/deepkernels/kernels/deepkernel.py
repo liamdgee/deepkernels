@@ -9,6 +9,41 @@ import math
 import gpytorch
 from gpytorch.kernels import Kernel
 from linear_operator.operators import LowRankRootLinearOperator, RootLinearOperator, MatmulLinearOperator
+from src.deepkernels.models.encoder import RecurrentEncoder
+
+class DynamicMixtureMean(gpytorch.means.Mean):
+    def __init__(self, covar_access, base_means=None, jitter=1e-6):
+        """
+        Args:
+            base_means (list): A list of K gpytorch.means.Mean modules.
+            hypernet (nn.Module): The same hypernetwork used in your kernel.
+        """
+        super().__init__()
+        self.base_means = nn.ModuleList(base_means)
+        self.covar_access = covar_access
+        self.hypernet = DeepKernel(mean_access=self.covar_access)
+        self.jitter = jitter
+
+    def forward(self, x):
+        # 1. Get Mixture Weights from Hypernetwork (reuse kernel logic)
+        # Note: We only need w1 (weights) here, not lengthscales
+        w, _ = self.hypernet(x)  # w shape: [..., N, K]
+        
+        # Normalize to probability space (pi)
+        S = w.sum(dim=-1, keepdim=True)
+        pi = torch.clamp(w / (S + self.jitter), min=self.jitter) # [..., N, K]
+
+        # 2. Compute the K individual means
+        # Stack them to get shape [..., N, K]
+        # We iterate through the list of means you provided
+        mean_outputs = [mean_module(x).unsqueeze(-1) for mean_module in self.base_means]
+        mean_stack = torch.cat(mean_outputs, dim=-1) # [..., N, K]
+        
+        # 3. Weighted Sum (Gating)
+        # Sum_k ( pi_k(x) * mu_k(x) )
+        final_mean = (pi * mean_stack).sum(dim=-1) # [..., N]
+        
+        return final_mean
 
 
 class DeepKernel(Kernel):
@@ -17,17 +52,17 @@ class DeepKernel(Kernel):
     1. Neural Phase: Transforms latent 'z' into high-dimensional task features.
     2   . Kernel Phase: Maps task features into an approximate RBF kernel using Orthogonal Random Features.
     """
-    def __init__(self, input_dim=7680, n_experts=30, features_per_expert=256, 
-                 hidden_dim=16, orf_num_samples=512, **kwargs):
+    def __init__(self, mean_access, **kwargs):
         super().__init__(**kwargs)
         
         # --- Config ---
-        self.input_dim = input_dim
-        self.H = hidden_dim
-        self.n_experts = n_experts
-        self.output_dim_per_cluster = features_per_expert
-        self.deep_feat_dim = self.n_experts * self.output_dim_per_cluster
-        self.n_samples = orf_num_samples
+        self.mean_access = mean_access
+        self.input_dim = 7680
+        self.H = 16
+        self.n_experts = 30
+        self.output_dim_per_cluster = 256
+        self.deep_feat_dim = 30 * 256
+        self.n_samples = 512
 
         # ==========================================
         # Neural Network Architecture
@@ -50,11 +85,11 @@ class DeepKernel(Kernel):
         self.parallel_task_layers = nn.ModuleList()
         for _ in range(self.n_experts):
             expert_layer = sn(nn.Linear(self.H * 12, self.output_dim_per_cluster))
-            self.parallel_task_layers.append(expert_layer)
+            self.mean_access.parallel_task_layers.append(expert_layer)
 
         self.register_parameter(name="raw_outputscale", parameter=torch.nn.Parameter(torch.zeros(1)))
         self.register_constraint("raw_outputscale", gpytorch.constraints.Positive())
-        
+        self.log_amplitude = nn.Parameter(torch.zeros(self.n_experts))
         self._init_weights()
 
     @property
@@ -111,35 +146,42 @@ class DeepKernel(Kernel):
         #-Stack [Batch, K, D_per_k]
         stacked = torch.stack(task_outputs, dim=1)
         
-        #-Flatten [Batch, K * D_per_k] --> feature vector
-        flat_features = stacked.view(x.size(0), -1)
-        
-        return flat_features
+        return stacked
     
     def forward(self, x1, x2, diag=False, **params):
+
         features_x1 = self._compute_primitives_and_interactions(x1)
-        if x2 is None:
+        
+        # 2. Permute to [K, Batch, D] 
+        features_x1 = features_x1.permute(1, 0, 2) # [30, B, 256]
+        
+        if x2 is None or torch.equal(x1, x2):
             features_x2 = features_x1
             symmetric = True
         else:
-            if torch.equal(x1, x2):
-                features_x2 = features_x1
-                symmetric = True
-            else:
-                features_x2 = self._compute_primitives_and_interactions(x2)
-                symmetric = False
-        if self.outputscale is not None:
-            scale = self.outputscale.sqrt()
-            features_x1 = features_x1 * scale
-            if symmetric:
-                features_x2 = features_x1
-            else:
-                features_x2 = features_x2 * scale
+            features_x2 = self._compute_primitives_and_interactions(x2)
+            features_x2 = features_x2.permute(1, 0, 2)
+            symmetric = False
+
+        # We use the log_amplitude vector (size 30)
+        amplitude = self.log_amplitude.exp().view(-1, 1, 1) # [30, 1, 1]
+        
+        # Scale by amplitude and normalize by sqrt(D) for RFF stability
+        scale_factor = amplitude / math.sqrt(self.output_dim_per_cluster)
+        
+        features_x1 = features_x1 * scale_factor
+        if not symmetric:
+            features_x2 = features_x2 * scale_factor
+        else:
+            features_x2 = features_x1
+        #input is 3D [K, B, D], RootLinearOperator automatically 
         if diag:
+            # Returns [K, Batch]
             return (features_x1 * features_x2).sum(-1)
+            
         if symmetric:
-            #--Returns [Batch, N, N] as V @ V.T--#
+            # Returns Batched LinearOperator representing [K, Batch, Batch]
             return RootLinearOperator(features_x1)
         else:
-            #--Returns [Batch, N, M] as A @ B.T --#
+             # Returns Batched LinearOperator representing [K, Batch_1, Batch_2]
             return MatmulLinearOperator(features_x1, features_x2.transpose(-1, -2))

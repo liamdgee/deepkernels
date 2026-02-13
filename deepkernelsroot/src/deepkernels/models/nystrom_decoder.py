@@ -68,16 +68,16 @@ class NystromDecoder(nn.Module):
         recon_rff = self.rkhs_head(h_geo)
       
         alpha_logits = self.alpha_head(h_geo)
-        alpha = F.softmax(alpha_logits, dim=-1) # Ensure sums to 1
+        alpha = F.softmax(alpha_logits, dim=-1) #-sums to 1-#
         
         ls = F.softplus(self.ls_head(h_geo)) + 1e-5
         ls = ls.view(-1, self.num_kernels, self.output_dim)
 
         return {
-            "recon_rff": recon_rff, # The decoder's "dream" of the spectral features
+            "recon_rff": recon_rff, #-decoder dream of rff kernel-#
             "alpha": alpha,
             "ls": ls,
-            "z_ctx": h_geo # Return context if needed
+            "z_ctx": h_geo 
         }
 
     def compute_loss(self, vae_outputs, x_true):

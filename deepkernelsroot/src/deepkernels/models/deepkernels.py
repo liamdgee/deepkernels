@@ -1,7 +1,7 @@
 #filename: deepkernels.py
 import torch
 import gpytorch
-from gpytorch.means import MultitaskMean, LinearMean
+from gpytorch.means import MultitaskMean, LinearMean, ConstantMean
 import math
 from gpytorch.models import ApproximateGP
 import torch.nn.functional as F
@@ -10,7 +10,7 @@ from gpytorch.kernels import LinearKernel, ScaleKernel, MultitaskKernel
 from gpytorch.variational import (
     CholeskyVariationalDistribution, 
     VariationalStrategy, 
-    LMCVariationalStrategy
+    IndependentMultitaskVariationalStrategy
 )
 import torch.nn as nn
 from gpytorch.distributions import MultitaskMultivariateNormal, MultivariateNormal
@@ -62,22 +62,33 @@ class DeepKernelProcess(gpytorch.models.ApproximateGP):
 
         #-Variational dist-#
         #-batch: torch.Size([num_tasks]) so we have distinct variational parameters (m, S) for the latent functions of each task
-        dist = CholeskyVariationalDistribution(n_inducing, batch_shape=torch.Size([]))
+        dist = CholeskyVariationalDistribution(
+            n_inducing, 
+            batch_shape=torch.Size([n_tasks])
+        )
         
         #-Linear Model of Coregionalisation variational strategy-#
-        strategy = VariationalStrategy(self, inducing, dist, learn_inducing_locations=True)
+        strategy = VariationalStrategy(
+            self, 
+            inducing, 
+            dist, 
+            learn_inducing_locations=True
+        )
+
+        multitask_strategy = IndependentMultitaskVariationalStrategy(
+            strategy, 
+            num_tasks=n_tasks, 
+            task_dim=-1
+        )
         
-        super().__init__(strategy)
-   
-        self.mean_module = MultitaskMean( torch.nn.ModuleList(
-            [LinearMean(input_size = encoder_input_dim) for _ in range(n_tasks)],
-            input_size=self.encoder_input_dim, num_tasks=self.n_tasks
-        ))
+        super().__init__(multitask_strategy)
+
+        self.mean_module = ConstantMean(batch_shape=torch.Size([n_tasks]))
     
-        self.covar_module = MultitaskKernel(nn.ModuleList(
-            DeepKernel(input_dim=feature_dim, n_experts=self.n_tasks,
-                        features_per_expert=self.M)
-        ))
+        self.covar_module = DeepKernel(
+            input_dim=feature_dim, 
+            n_experts=n_tasks
+        )
 
         #-Expected shape of y_target: [N, num_tasks]-#
         if target is not None: 
@@ -87,19 +98,14 @@ class DeepKernelProcess(gpytorch.models.ApproximateGP):
             else:
                 self.mean_module.base_means[0].constant.data.fill_(target.mean().item())
 
-    def forward(self, x, z):
+    def forward(self, x):
         """
         Args:
             spectral_features: [Batch, K * M * 2] output from SpectralVAE
         """
-        # The GP simply weighs the spectral features to predict y
-        feats, covar = self.orchestrator(x)
+        x_hat = self.mean_module(x)
 
-        feats_batch = self.make_expert_tensor(feats)
-
-        x_hat = self.mean_module(feats)
-
-        y_hat = self.covar_module(covar)
+        y_hat = self.covar_module(x)
         
         return MultitaskMultivariateNormal.from_batch_mvn(MultivariateNormal(x_hat, y_hat))
     
@@ -159,11 +165,3 @@ class DeepKernelProcess(gpytorch.models.ApproximateGP):
         inducing = inducing + inducing_jitter
         
         return inducing
-    
-    def make_expert_tensor(flat_features, num_clusters=30):
-        
-        batch_size = flat_features.size(0)
-        unflattened = flat_features.view(batch_size, num_clusters, -1)
-        expert_tensor = unflattened.permute(1, 0, 2)
-        
-        return expert_tensor

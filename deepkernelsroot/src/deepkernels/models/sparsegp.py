@@ -1,21 +1,21 @@
 import torch
 import gpytorch
-from gpytorch.means import ConstantMean
+from gpytorch.means import ConstantMean, LinearMean
 import math
 
 from src.deepkernels.models.dirichlet import AmortisedDirichlet, HDPConfig
 from src.deepkernels.kernels.lmckernel import DeepStatelessEigenKernel
 from src.deepkernels.models.beta_vae import SpectralVAE, VAEConfig
 from src.deepkernels.models.encoder import Encoder
-from src.deepkernels.models.decoder import NystromDecoder
-from src.deepkernels.kernels.deepkernel import DeepKernel
+from deepkernelsroot.src.deepkernels.models.nystrom_decoder import NystromDecoder
+from deepkernelsroot.src.deepkernels.kernels.nearly_deepkernel import DeepKernel
 
 #-custom mean class-#
 class SlicedMean(gpytorch.means.Mean):
-    def __init__(self,input_dim, base_mean=None):
+    def __init__(self, k_atoms):
         super().__init__()
-        self.base_mean = base_mean if base_mean is not None else ConstantMean()
-        self.input_dim = input_dim
+        self.base_mean = LinearMean()
+        self.k_atoms = k_atoms
 
     def forward(self, x):
         real_x = x[..., :self.input_dim]

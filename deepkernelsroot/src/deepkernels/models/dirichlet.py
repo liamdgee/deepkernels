@@ -1,7 +1,6 @@
 import torch
 import gpytorch
-from torch.distributions import Normal, TransformedDistribution, kl_divergence
-import torch.distributions.Dirichlet as Dir
+from torch.distributions import Normal, TransformedDistribution, kl_divergence, Dirichlet
 from torch.distributions.transforms import StickBreakingTransform
 import math
 
@@ -18,8 +17,6 @@ from src.deepkernels.models.NKN import NeuralKernelNetwork
 from gpytorch.mlls import AddedLossTerm
 import logging
 
-DualDirichletOutput: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
-
 #---Init logger---#
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -31,6 +28,14 @@ class GlobalKLLoss(AddedLossTerm):
     
     def loss(self):
         return self.kl_val
+    
+class KLDivergence(AddedLossTerm):
+    """loss term for hierarchical dirichlet process -- KL(q(rho)|p(rho))"""
+    def __init__(self, qdist, pdist):
+        self.qdist = qdist
+        self.pdist = pdist
+    def loss(self):
+        return kl(self.qdist, self.pdist).sum()
 
 class HDPConfig(BaseModel):
     n_data: 38003
@@ -148,23 +153,15 @@ class AmortisedDirichlet(gpytorch.Module):
         sin_proj = sin_proj * pi_scl
         feats = torch.stack([cos_proj, sin_proj], dim=-1) #- [B, K, M] -> [B, K, M, 2]
         return feats.flatten(1) #-[B, (K * M * 2)]
-    
-    def get_omega(self, bw):
-        """
-        Stateless helper: inputs -> outputs. Safe for any batch.
-        # bw shape: [K, M, D] or [Batch, K, M, D]
-        # h_mu: [1, 1, D]
-        # atom_mu: [K, 1, D]
-        """
-        omega = self.h_mu + self.atom_mu + (self.noise_weights * bw)
-        return torch.clamp(omega, -100.0, 100.0)
 
-    def forward(self, 
+    def forward(
+            self, 
             z: Optional[torch.Tensor]=None, 
             batch_shape=torch.Size([]), 
-            rff_kernel=True, 
             ls: Optional[torch.Tensor]=None, 
-            alpha: Optional[torch.Tensor]=None) -> DualDirichletOutput:
+            alpha: Optional[torch.Tensor]=None,
+            features_only=False
+        ):
         """
         Args:
             z: [Batch, D] - Latent (Required for features)
@@ -242,45 +239,60 @@ class AmortisedDirichlet(gpytorch.Module):
             
             #-KL Posterior-#
             #-Create Distribution objects for kl loss updates-#
-            pr_dist_pi = Dir(prior_conc_expanded) #-[B, K]
-            post_dist_pi = Dir(post_conc) #-- [B, K]
+            pr_dist_pi = Dirichlet(prior_conc_expanded) #-[B, K]
+            post_dist_pi = Dirichlet(post_conc) #-- [B, K]
             self.update_added_loss_term("pi_kl", KLDivergence(post_dist_pi, pr_dist_pi))
             if ls is not None:
-                ls_pred = torch.clamp(ls, min=self.eps, max=5.0)
+                ls_pred = torch.clamp(ls, min=self.eps, max=50.0) #- [B, K, D]
         else:
             # --- GENERATIVE MODE ---
             # No evidence provided. We sample from the Prior.
-            post_conc = prior_conc_expanded
-            self.update_added_loss_term("gen_0_div", KLDivergence(post_conc, post_conc))
+            post_conc = prior_conc_expanded #-kl will be 0-#
 
         #--Sample from pi (dynamic)-#
-        pi = Dir(post_conc).rsample() #--[B, K]-#
+        pi = Dirichlet(post_conc).rsample() #--[B, K]-#
 
         #--F) Construct Spectal frequencies with H regularisation-#
         #--centres: global center + local frequency/position-#
-        spectral_means = self.h_mu + self.atom_mu
-        log_scale = self.h_log_sigma + self.atom_log_sigma
-        log_scale = torch.clamp(log_scale, max=10.0)
-        bw_base = log_scale.exp()
-
-        if ls_pred is not None:
-            jitter = 1e-6
-            bw_dyn = 1.0 / (ls_pred + jitter) #-inv ls-#
-            bw = bw_base * bw_dyn.unsqueeze(2)
-        else:
-            bw = bw_base 
-       
-        omega = self.get_omega(bw) #- omega shape: - [K, M, D]-#
+        spectral_means = self.h_mu + self.atom_mu #- [1, 1, D]
+        log_scale = F.softplus(self.h_log_sigma + self.atom_log_sigma)
+        bw_implied = log_scale.exp() #-[1, 1, D]-#
         
+        if ls_pred is not None:
+            # ls_pred: [B, K, D] -> [B, K, 1, D]
+            bw_learned = bw_implied * (1.0 / (ls_pred.unsqueeze(2) + 1e-6))
+            ls_prior = 1.0 
+            ls_mse = torch.pow(ls_pred - ls_prior, 2).mean() 
+  
+            self.update_added_loss_term(
+                "lengthscale_prior_reg", 
+                GlobalKLLoss(ls_mse) 
+            )
+        else:
+            bw_learned = bw_implied
+        
+        #-reparameterisation trick-# #- noise weights buffer: [K, M, D] and ls_pred unsqueeze is [B, K, 1, D]--#
+        omega = torch.clamp((spectral_means + (self.noise_weights * bw_learned)), -100.0, 100.0)
+        
+        #result - omega is [B, K, M, D] -- creates a frequency matrix for each data point
+
         if z is not None:
             cos_transform, sin_transform = self.dynamic_random_fourier_features(z, omega, raw_transforms=True)
 
-            if rff_kernel and alpha is not None:
+            if features_only and alpha is not None:
                 pi_scl = torch.sqrt(pi).unsqueeze(-1)
                 features = torch.stack([cos_transform * pi_scl, sin_transform * pi_scl], dim=-1).flatten(1)
-                return features, omega
+                return features
         
-        if bw.dim() == 4 and bw.shape[2] == 1:
-            bw = bw.squeeze(2)
+        dirichlet_out = {
+            'spectral_features': features, 
+            'omega': omega, 
+            'bw_learned': bw_learned, 
+            'bw_implied': bw_implied, 
+            'spectral_means': spectral_means, 
+            'mixing_weights': beta, 
+            'simplex_posterior': pi
+        }
+
+        return dirichlet_out
         
-        return pi, beta, spectral_means, bw, features, omega

@@ -32,7 +32,7 @@ def tracker(kernel_experiment):
 
 #---Class Definition: Stochastic Gradient Optimiser with Adaptive Langevin Dynamics--#
 @tracker(kernel_experiment="Dirichlet_Mixture_Proj")
-class LangevinTrainer:
+class HybridLangevinTrainer:
     def __init__(self, model, **kwargs):
         self.model = model
         self.device = kwargs.get('device', 'mps')

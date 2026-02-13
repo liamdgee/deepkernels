@@ -108,10 +108,12 @@ class RecurrentEncoder(nn.Module):
             current_dim = hdim
         
         self.encoder_network = nn.Sequential(*layers)
+        
+        self.input_heads = current_dim
 
         # --- Latent Projections (h -> mu, logvar) # 32 -> 16---
-        self.mu_latent_z = nn.Linear(current_dim, self.latent_dim)
-        self.var_latent_z = nn.Linear(current_dim, self.latent_dim)
+        self.mu_latent_z = nn.Linear(self.input_heads, self.latent_dim)
+        self.var_latent_z = nn.Linear(self.input_heads, self.latent_dim)
 
         #-kernel reconstruction in real time-#
         #- we want chol.chol.t() + diag for positive definite kernel outputs
@@ -126,60 +128,9 @@ class RecurrentEncoder(nn.Module):
         if self.training:
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
-            return mu + eps * std
+            z = mu + eps * std
+            return z, torch.distributions.Normal(mu, std)
         return mu
-
-    def forward(self, real_x, pi: Optional[torch.Tensor] = None, spectral_features: Optional[torch.Tensor]=None):
-        """
-        Args:
-            real_x: Input features [Batch, Input_Dim]
-            pi: Dirichlet mixture weights [Batch, K_Atoms]. 
-            spectral_features: [Batch, K * M * 2]
-        """
-        batch_size = real_x.size(0)
-        #-for first iter: Handle missing args and scale by 2.1x-#
-        if pi is None:
-            pi = torch.full((batch_size, self.k_atoms), 1.0/self.k_atoms, device=real_x.device)
-            pi = pi + (torch.randn_like(pi) * 0.01)
-            pi = F.softmax(pi, dim=-1)
-        
-        if spectral_features is None:
-            spectral_features = torch.zeros(
-                batch_size, 
-                self.spectral_input_dim, 
-                device=real_x.device, 
-                dtype=real_x.dtype
-            )
-        
-        #-processing steps:-#
-        log_pi = torch.log(pi + self.jitter)
-
-        #-compression of spectral features--tanh activation -> [256, 7680] -> [256, 121]
-        spectral_emb = self.spectral_compressor(spectral_features)
-        spectral_emb = F.tanh(spectral_emb) #-[256, 121]
-
-        #-concat [Data, logpi, spectral_emb] 
-        weights = torch.cat([real_x, log_pi, spectral_emb], dim=-1)
-
-        #-network forward passes-#
-        h = self.encoder_network(weights)
-        mu = self.mu_latent_z(h)
-        logvar = self.var_latent_z(h)
-        z = self.reparameterize(mu, logvar) #-latent reparameterisation-> [Batch, 16]
-        
-        mu_alpha_out = self.mu_alpha(z)
-        chol = self.chol_alpha(z)
-        V_mat = chol.view(self.latent_dim, self.k_atoms, self.rank)
-        diag = F.softplus(self.diag_alpha(z)) + self.jitter
-
-        #-sample from mvn-#
-        alpha, mvn = self.multivariate_projection(mu_alpha_out, V_mat, diag)
-        
-        #-Kernel parameters- [256, 30 * 44] -> [256, 30, 44]-#
-        ls_flat = F.softplus(self.ls_head(z)) + self.jitter
-        ls = ls_flat.view(-1, self.k_atoms, self.input_dim)
-
-        return z, alpha, ls, mvn
     
     def multivariate_projection(self, mu, factor, diag):
         """for alpha params: input projections from three alpha heads"""
@@ -192,3 +143,55 @@ class RecurrentEncoder(nn.Module):
         alpha = F.softplus(logits) + self.jitter
         
         return alpha, mvn
+
+    def forward(self, real_x, step=3, pi: Optional[torch.Tensor] = None, spectral_features: Optional[torch.Tensor]=None):
+        """
+        Args:
+            real_x: Input features [Batch, Input_Dim]
+            pi: Dirichlet mixture weights [Batch, K_Atoms]. 
+            spectral_features: [Batch, K * M * 2] --> unflatten with ' .view(B, K, -1). '
+        """
+        #-for first iter: Handle missing args and scale by 2.1x-#
+
+        if pi is None:
+            pi = torch.full((real_x.size(0), self.k_atoms), 1.0/self.k_atoms, device=real_x.device)
+            pi = pi + (torch.randn_like(pi) * 0.01)
+            pi = F.softmax(pi, dim=-1)
+        
+        if spectral_features is None:
+            spectral_features = torch.zeros(
+                real_x.size(0), 
+                self.spectral_input_dim, 
+                device=real_x.device, 
+                dtype=real_x.dtype
+            )
+            
+        #-processing steps:-#
+        log_pi = torch.log(pi + self.jitter)
+
+        #-compression of spectral features--tanh activation -> [256, 7680] -> [256, 121]
+        spectral_emb = self.spectral_compressor(spectral_features)
+        spectral_emb = torch.tanh(spectral_emb) #-[256, 121]
+
+        #-concat [Data, logpi, spectral_emb] 
+        weights = torch.cat([real_x, log_pi, spectral_emb], dim=-1)
+
+        #-network forward passes-#
+        h = self.encoder_network(weights)
+        mu = self.mu_latent_z(h)
+        logvar = self.var_latent_z(h)
+        z, qz_dist = self.reparameterize(mu, logvar) #-latent reparameterisation-> [Batch, 16]
+        
+        mu_alpha_out = self.mu_alpha(z)
+        chol = self.chol_alpha(z)
+        V_mat = chol.view(real_x.size(0), self.k_atoms, self.rank)
+        diag = F.softplus(self.diag_alpha(z)) + self.jitter
+
+        #-sample from mvn-#
+        alpha, mvn = self.multivariate_projection(mu_alpha_out, V_mat, diag)
+        
+        #-Kernel parameters- [256, 30 * 44] -> [256, 30, 44]-#
+        ls_flat = F.softplus(self.ls_head(z)) + self.jitter
+        ls = ls_flat.view(-1, self.k_atoms, self.input_dim)
+
+        return z, alpha, ls, mvn, qz_dist

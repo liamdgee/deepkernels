@@ -52,4 +52,5 @@ class GenerativeKernelProcess(nn.Module):
         sin_features = torch.sin(projection)
         phi = torch.cat([cos_features, sin_features], dim=-1)
         phi_for_batch_gp = phi.permute(1, 0, 2)
-        return torch.bmm(phi_for_batch_gp, phi_for_batch_gp.transpose(1, 2))
+        covar = torch.bmm(phi_for_batch_gp, phi_for_batch_gp.transpose(1, 2))
+        return covar / 256

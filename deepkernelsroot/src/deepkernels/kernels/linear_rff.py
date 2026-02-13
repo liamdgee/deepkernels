@@ -33,6 +33,10 @@ class OrthogonalFourierKernel(Kernel):
         self.register_constraint("raw_lengthscale", gpytorch.constraints.Positive())
         self.lengthscale_initialised = False
     
+    @property
+    def get_lengthscale(self):
+        return self.raw_lengthscale_constraint.transform(self.raw_lengthscale)
+
     def _generate_orthogonal_weights(self, rank, dim):
         assert rank >= dim, "Orthogonal Random Features require rank to be greater than input dimension (Yu et al., 2016)"
         nblocks = int(rank/dim) #-where nblocks = number of full orthogonal blocks-#
@@ -107,21 +111,22 @@ class OrthogonalFourierKernel(Kernel):
 
 
     def forward(self, x1, x2, diag=False, **params):
-        if self.training and not self.is_initialized:
+        if self.training and not self.lengthscale_initialized:
             self._init_lengthscale(x1)
             self.lengthscale_initialized = True
         
-        lengthscale = self.lengthscale
+        ls = self.lengthscale
         
-        x1_scl = x1.div(lengthscale) #-[Batch, N, D]
+        x1_scl = x1.div(ls) #-[Batch, N, D]
         
         #-fourier proj-#
         z1 = torch.matmul(x1_scl, self.weights)
         z1 = z1.add(self.bias)
         z1 = torch.cos(z1)
         z1 = z1.mul(math.sqrt(2.0 / self.n_samples))
-        if x1 is not x2:
-            x2_scl = x2.div(lengthscale)
+        
+        if x2 is not None and not torch.equal(x1, x2):
+            x2_scl = x2.div(ls)
             z2 = torch.matmul(x2_scl, self.weights)
             z2 = z2.add(self.bias)
             z2 = torch.cos(z2)

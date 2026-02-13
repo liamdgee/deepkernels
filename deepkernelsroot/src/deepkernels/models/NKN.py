@@ -11,10 +11,11 @@ class NeuralKernelNetwork(nn.Module):
     It takes the stable, flat latent code 'z' and explodes it into 
     structural primitives (Linear, Periodic, Multiplicative) for the GP.
     """
-    def __init__(self, input_dim, n_experts, features_per_expert, hidden_dim=32):
+    def __init__(self, batch_dim=256, n_experts=30, features_per_expert=64, hidden_dim=16):
         super().__init__()
-        self.input_dim = input_dim
-        self.H = hidden_dim if hidden_dim else 32
+        self.batch_dim = batch_dim or 256
+        self.input_dim = batch_dim * hidden_dim
+        self.H = hidden_dim
         self.n_experts = n_experts
         self.output_dim = features_per_expert #-gp feature dim-#
         
@@ -76,7 +77,7 @@ class NeuralKernelNetwork(nn.Module):
 
         nn.init.orthogonal_(self.dense_multitask_proj.weight, gain=1.0)
         
-    def forward(self, z):
+    def forward(self, z, omega):
         #-primitive kernels-#
         lin_out = self.linear(z) * self.linear_scale
         period_out = torch.cos(self.periodic(z))
