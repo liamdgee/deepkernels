@@ -22,8 +22,8 @@ from src.deepkernels.kernels.deepkernel import DeepKernel
 
 class DeepKernelProcess(gpytorch.models.ApproximateGP):
     def __init__(
-            self, 
-            orchestrator_module,
+            self,
+            kernel=None,
             config=None, 
             y_target: torch.Tensor=None, 
             n_tasks: int=30, 
@@ -50,6 +50,7 @@ class DeepKernelProcess(gpytorch.models.ApproximateGP):
         self.M = fourier_dim
         self.encoder_input_dim = encoder_input_dim
         self.orchestrator = GenerativeKernelProcess()
+        self.kernel = kernel if kernel is not None else DeepKernel()
         
         target = None
         if isinstance(y_target, torch.Tensor):
@@ -63,7 +64,7 @@ class DeepKernelProcess(gpytorch.models.ApproximateGP):
         #-Variational dist-#
         #-batch: torch.Size([num_tasks]) so we have distinct variational parameters (m, S) for the latent functions of each task
         dist = CholeskyVariationalDistribution(
-            n_inducing, 
+            n_inducing,
             batch_shape=torch.Size([n_tasks])
         )
         

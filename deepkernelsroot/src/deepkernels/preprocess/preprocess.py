@@ -41,7 +41,7 @@ class PreprocessConfig(BaseModel):
     ])
     task_type: Literal['regression', 'classification'] = 'regression'
     scaler: Literal['robust', 'standard'] = 'robust'
-    batch_size: Annotated[int, Field(le=4096, ge=4)] = 256
+    batch_size: Annotated[int, Field(le=4096, ge=4)] = 128
     device: str = "auto"
     random_state: int = 42
     test_pct: Annotated[float, Field(gt=0.0, lt=1.0)] = 0.2
@@ -129,7 +129,7 @@ class TorchPreprocessor(BaseEstimator, TransformerMixin):
     
     def _attempt_extract_y(self, X: pd.DataFrame, y=None):
         """Robustly separate target from X."""
-        target = y if y is not None else self.y_target
+        target = y if y is not None
         
         # Check string vs data
         if isinstance(target, str):

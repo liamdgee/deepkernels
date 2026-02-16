@@ -6,10 +6,8 @@ import torch.optim as optim
 from torch.distributions import Normal, kl_divergence
 import math
 import torch.nn as nn
-import torcn.nn.functional as F
 import functools
 import mlflow
-import xgboost as xgb
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
@@ -34,28 +32,43 @@ def tracker(kernel_experiment):
 @tracker(kernel_experiment="Dirichlet_Mixture_Proj")
 class HybridLangevinTrainer:
     def __init__(self, model, **kwargs):
+        
         self.model = model
-        self.device = kwargs.get('device', 'mps')
+        gp = self.model
+        vae = gp.vae
+        dirichlet = vae.dirichlet
+        encoder = vae.encoder
+        decoder = vae.decoder
+
+        self.device = kwargs.get('device', 'cuda')
         self.epochs = kwargs.get('total_epochs', 200)
 
-        #--Hyperparams---#
-        self.eta_a = kwargs.get('lr_atoms', 2.15e-3)
-        self.eta_w = kwargs.get('lr_weights', 1.25e-2)
-        self.temp = kwargs.get('langevin_temp', 7.5e-6)
+        #-learning rates-#
         self.lr_decoder = kwargs.get('stable_rkhs_lr', 2e-4)
         self.beta = kwargs.get('kl_div_beta', 0.2)
-        self.rkhs_w = kwargs.get('rkhs_weights', 10.0)
 
         #--Param Grouping--#
-        param_groups = [
-            {'params': [self.model.dirichlet.mu_atom], 'lr': self.eta_a},
-            {'params': [self.model.dirichlet.log_sigma_atom], 'lr': self.eta_a},
-            {'params': [self.model.dirichlet.v_k], 'lr': self.eta_w},
-            {'params': [self.model.dirichlet.v_j], 'lr': self.eta_w},
-            {'params': self.model.decoder.parameters(), 'lr': self.lr_decoder}
-        ]
+        #SGLD
+        self.fast_dir = kwargs.get('fast_dir', 1e-2)
+        self.med_dir = kwargs.get('med_dir', 2e-3)
+        self.slow_dir = kwargs.get('slow_dir', 4e-4)
+        self.gamma_lr = kwargs.get('gamma_lr', 5e-5)
+        self.temp = kwargs.get('langevin_temp', 7.5e-6)
+        self.nn_lr = kwargs.get('nn_lr')
 
-        self.optimiser = optim.Adagrad(param_groups, lr=self.eta_a)
+        dirichlet_params = optim.Adagrad([
+            {'params': [dirichlet.mu_atom], 'lr': self.med_dir},
+            {'params': [dirichlet.log_sigma_atom], 'lr': self.med_dir},
+            {'params': [dirichlet.h_mu], 'lr': self.slow_dir},
+            {'params': [dirichlet.h_log_sigma], 'lr': self.slow_dir},
+            {'params': [dirichlet.gamma], 'lr': self.gamma_lr},
+            {'params': [dirichlet.q_mu], 'lr': self.fast_dir},
+            {'params': [dirichlet.q_log_sigma], 'lr': self.fast_dir},
+        ])
+
+        self.hyperparam_lr = kwargs.get('hyperparam_lr', 1e-3)
+        self.nn_weights_lr = kwargs.get('weights_lr', 5e-3)
+
     
     def comp_kl_divergence_for_dirichlet_module(self):
         """

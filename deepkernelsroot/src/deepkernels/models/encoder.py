@@ -16,7 +16,7 @@ class VAEConfig(BaseModel):
     """
     # --- Input Dimensions ---
     input_dim: PositiveInt = Field(
-        default=44, 
+        default=30, 
         description="Dimension of input features (D)"
     )
     
@@ -74,12 +74,13 @@ class VAEConfig(BaseModel):
 
 class RecurrentEncoder(nn.Module):
     def __init__(self,
-                 config: Optional[VAEConfig]=None, 
-                 input_dim: Optional[Union[int, list[int]]]=None,
+                 config: Optional[VAEConfig]=None,
+                 input_dim=30
         ):
         super().__init__()
         self.config = config or VAEConfig()
-        self.input_dim = input_dim if input_dim is not None else 44
+        
+        self.input_dim = input_dim
         
         hidden_dims = [128, 64, 32]
         self.hidden_dims = hidden_dims
@@ -89,47 +90,45 @@ class RecurrentEncoder(nn.Module):
         self.M = 128
         self.jitter = 1e-6
         self.rank = 3
-        self.dropout = 0.07
-
-        self.spectral_input_dim = self.k_atoms * self.M * 2 #~7680
-        self.spectral_emb_dim = int(self.input_dim * 11/4) #~121
-        self.spectral_compressor = sn(nn.Linear(self.spectral_input_dim, self.spectral_emb_dim))
+        self.dropout = 0.1
+        self.total_features = 900
+        self.spectral_input_dim = 7680 #~7680
+        self.spectral_emb_dim = 128
+        self.spectral_compressor = torch.nn.utils.spectral_norm(nn.Linear(self.spectral_input_dim, self.spectral_emb_dim))
 
         # --- Deep Encoder Network (x -> h) ---
         layers = []
         #-- current_dim = Data(D) + LogPi(K) + SpectralEmbedding(D) -#
-        current_dim = self.input_dim + self.k_atoms + self.spectral_emb_dim #--195 = 44 + 30 + 121 (spectral emb_dim)
+        current_dim = 188 #--188 = 37 + 30 + 121 (spectral emb_dim)
         
         for hdim in hidden_dims:
-            layers.append(sn(nn.Linear(current_dim, hdim)))
+            layers.append(torch.nn.utils.spectral_norm(nn.Linear(current_dim, hdim)))
             layers.append(nn.BatchNorm1d(hdim))
             layers.append(nn.SiLU())
             layers.append(nn.Dropout(self.dropout))
             current_dim = hdim
         
         self.encoder_network = nn.Sequential(*layers)
-        
-        self.input_heads = current_dim
 
         # --- Latent Projections (h -> mu, logvar) # 32 -> 16---
-        self.mu_latent_z = nn.Linear(self.input_heads, self.latent_dim)
-        self.var_latent_z = nn.Linear(self.input_heads, self.latent_dim)
+        self.mu_latent_z = nn.Linear(current_dim, self.latent_dim)
+        self.var_latent_z = nn.Linear(current_dim, self.latent_dim) #-> to latent
 
         #-kernel reconstruction in real time-#
         #- we want chol.chol.t() + diag for positive definite kernel outputs
         self.mu_alpha = nn.Linear(self.latent_dim, self.k_atoms)
-        self.chol_alpha = nn.Linear(self.latent_dim, self.k_atoms * self.rank)
+        self.chol_alpha = nn.Linear(self.latent_dim, 90)
         self.diag_alpha = nn.Linear(self.latent_dim, self.k_atoms) #-diag_alpha is logvar diagonal-#
         
         #-kernel lengthscale-#
-        self.ls_head = nn.Linear(self.latent_dim, self.k_atoms * self.input_dim)
+        self.ls_head = nn.Linear(self.latent_dim, 30*30)
 
     def reparameterize(self, mu, logvar):
         if self.training:
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             z = mu + eps * std
-            return z, torch.distributions.Normal(mu, std)
+            return z
         return mu
     
     def multivariate_projection(self, mu, factor, diag):
@@ -169,29 +168,29 @@ class RecurrentEncoder(nn.Module):
         #-processing steps:-#
         log_pi = torch.log(pi + self.jitter)
 
-        #-compression of spectral features--tanh activation -> [256, 7680] -> [256, 121]
+        #-compression of spectral features--tanh activation -> [256, 7680] -> [256, 128]
         spectral_emb = self.spectral_compressor(spectral_features)
-        spectral_emb = torch.tanh(spectral_emb) #-[256, 121]
+        spectral_emb = torch.tanh(spectral_emb)
 
-        #-concat [Data, logpi, spectral_emb] 
+        #-concat [Data, logpi, spectral_emb] [30, 30, 128] i think?
         weights = torch.cat([real_x, log_pi, spectral_emb], dim=-1)
 
         #-network forward passes-#
         h = self.encoder_network(weights)
         mu = self.mu_latent_z(h)
         logvar = self.var_latent_z(h)
-        z, qz_dist = self.reparameterize(mu, logvar) #-latent reparameterisation-> [Batch, 16]
+        z = self.reparameterize(mu, logvar) #-latent reparameterisation-> [Batch, 16]
         
         mu_alpha_out = self.mu_alpha(z)
-        chol = self.chol_alpha(z)
-        V_mat = chol.view(real_x.size(0), self.k_atoms, self.rank)
+        chol = self.chol_alpha(z).view(-1, 30, 3)
         diag = F.softplus(self.diag_alpha(z)) + self.jitter
 
         #-sample from mvn-#
-        alpha, mvn = self.multivariate_projection(mu_alpha_out, V_mat, diag)
+        alpha, mvn = self.multivariate_projection(mu_alpha_out, chol, diag)
         
-        #-Kernel parameters- [256, 30 * 44] -> [256, 30, 44]-#
-        ls_flat = F.softplus(self.ls_head(z)) + self.jitter
-        ls = ls_flat.view(-1, self.k_atoms, self.input_dim)
+        #-Kernel parameters- [256, 30 * 30] -> [256, 30, 30]-#
+        ls = self.ls_head(z)
+        ls = F.softplus(ls) + self.jitter
+        ls = ls.view(-1, 30, 30) #- [B, K, D]
 
-        return z, alpha, ls, mvn, qz_dist
+        return z, alpha, ls, mu, logvar

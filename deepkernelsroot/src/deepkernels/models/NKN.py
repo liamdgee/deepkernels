@@ -7,6 +7,7 @@ import torch.nn.utils.spectral_norm as sn
 
 class NeuralKernelNetwork(nn.Module):
     """
+    #-currently nonfunctional-#
     The 'Neural Kernel' Head.
     It takes the stable, flat latent code 'z' and explodes it into 
     structural primitives (Linear, Periodic, Multiplicative) for the GP.
@@ -102,3 +103,37 @@ class NeuralKernelNetwork(nn.Module):
 
         #-shape out: [Batch, K, output_dim]
         return flat.view(-1, self.n_experts, self.output_dim)
+    
+    def _compute_primitives_and_interactions(self, x):
+        """
+        Runs the Neural Network: x -> Primitives -> Mixer -> Task Heads -> Flattened Features
+        """
+        # A. Primitives
+        lin_out = self.linear(x) * self.linear_scale
+        period_out = torch.cos(self.periodic(x))
+        rbf_out = torch.exp(-torch.pow(self.rbf(x), 2))
+        rat_out = 1.0 / (1.0 + torch.pow(self.rational(x), 2))
+        const_out = self.constant.expand(x.size(0), -1)
+        
+        # B. Interactions
+        seasonal = lin_out * period_out
+        local = lin_out * rbf_out
+        decay = period_out * rbf_out
+        tails = period_out * rat_out
+        
+        combined = torch.cat([lin_out, period_out, rbf_out, rat_out, const_out, seasonal, local, decay, tails], dim=-1)
+        mixed = self.mixer(self.primitive_norm(combined))
+        flat_features = self.all_latent_heads(mixed)
+
+        reshaped = flat_features.view(
+            x.size(0), 
+            self.num_latents, 
+            self.output_dim_per_cluster
+        )
+
+        # 3. Permute to bring latents to the front (The "GP Batch" dimension)
+        # [Batch, num_latents, 256] -> [num_latents, Batch, 256]
+        latent_features = reshaped.permute(1, 0, 2)
+        
+        # 4. Normalize for RFF stability
+        return latent_features / math.sqrt(self.output_dim_per_cluster)

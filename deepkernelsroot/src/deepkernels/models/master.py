@@ -13,7 +13,7 @@ from src.deepkernels.models.beta_vae import SpectralVAE, VAEConfig
 from src.deepkernels.models.encoder import RecurrentEncoder
 from src.deepkernels.models.linear_decoder import BayesDecoder
 from src.deepkernels.models.NKN import NeuralKernelNetwork
-from src.deepkernels.kernels.master import MasterKernel
+from src.deepkernels.kernels.deepkernel import DeepKernel
 
 #-orchestration GP class-#
 class DeepGaussianProcess(gpytorch.models.ApproximateGP):
@@ -33,7 +33,7 @@ class DeepGaussianProcess(gpytorch.models.ApproximateGP):
         The Orchestrator
         - num_experts (int): K
         - encoder: x -> q(z|x)
-        - decoder: z -> p(x|z) (Your BayesDecoder)
+        - decoder: z -> p(x|z) (BayesDecoder)
         - nkn_head: z -> GP Features (Structural Primitives)
         - dirichlet: z -> Mixture Weights & Spectral Params
         - inducing_points (Tensor): Initial inducing points [K, M, D]
@@ -70,10 +70,7 @@ class DeepGaussianProcess(gpytorch.models.ApproximateGP):
         self.mean_module = gpytorch.means.LinearMean(input_size=self.latent_dim)
         
         #-Cov module (stateless)-#
-        self.covar_module = gpytorch.kernels.ScaleKernel(
-            MasterKernel(num_experts=self.k_experts, batch_mode=True), 
-            batch_shape=torch.Size([self.k_experts])
-        )
+        self.covar_module = DeepKernel()
 
         self.auxiliary_loss = torch.tensor(0.0)
 
@@ -83,12 +80,13 @@ class DeepGaussianProcess(gpytorch.models.ApproximateGP):
 
         #-reparameterise-#
         z = z_dist.rsample()
-
-        #-vae_loss-#
-        vae_recon = self.vae_decoder(z)
+        
 
         #-spectral params and nonparametric clustering-#
         pi, beta, means, bw, omega = self.dirichlet(z, rff_kernel=False)
+
+        #-vae_loss-#
+        vae_recon = self.vae_decoder(z)
 
         #-gp features from nkn-#
         kernel_features = self.nkn(z)

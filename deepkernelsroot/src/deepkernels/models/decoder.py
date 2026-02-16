@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
-import torch.nn.utils.spectral_norm as sn
+import torch.nn.utils.spectral_norm
 
 class SpectralDecoder(nn.Module):
     def __init__(self, 
-                 input_dim=44,       # Output shape (reconstruction)
+                 input_dim=30,       # Output shape (reconstruction)
                  spectral_dim=256,   # Features per cluster (M*2)
                  num_clusters=30,    # K
                  hidden_dims=None, # Flexible hidden layers
@@ -18,7 +18,7 @@ class SpectralDecoder(nn.Module):
         layers = []
         
         for dim in hidden_dims:
-            layers.append(sn(nn.Linear(current_dim, dim)))
+            layers.append(torch.nn.utils.spectral_norm(nn.Linear(current_dim, dim)))
             layers.append(nn.LeakyReLU(0.2))
             layers.append(nn.LayerNorm(dim))
             layers.append(nn.Dropout(dropout))
@@ -42,6 +42,6 @@ class SpectralDecoder(nn.Module):
         else:
             features_flat = spectral_features
         
-        recon_x = self.net(features_flat)
+        recon_x = self.network(features_flat)
         
         return recon_x

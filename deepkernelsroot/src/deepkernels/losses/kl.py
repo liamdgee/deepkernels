@@ -1,7 +1,7 @@
 import torch
 import gpytorch
 import torch.nn as nn
-from torch.distributions import kl_divergence as kl
+from torch.distributions import kl_divergence
 from gpytorch.mlls import AddedLossTerm
 
 class KLDivergence(AddedLossTerm):
@@ -9,5 +9,5 @@ class KLDivergence(AddedLossTerm):
     def __init__(self, qdist, pdist):
         self.qdist = qdist
         self.pdist = pdist
-    def loss(self):
-        return kl(self.qdist, self.pdist).sum()
+    def register_loss(self):
+        return kl_divergence(self.qdist, self.pdist).sum()

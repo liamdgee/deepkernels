@@ -4,28 +4,29 @@ import torch.nn.functional as F
 import torch.nn.utils.parametrizations as P
 import torch.distributions
 
-from src.deepkernels.models.encoder import RecurrentEncoder
-from src.deepkernels.models.decoder import SpectralDecoder
-from src.deepkernels.models.dirichlet import AmortisedDirichlet
-from src.deepkernels.kernels.deepkernel import DeepKernel
-
+from deepkernels.models.encoder import RecurrentEncoder
+from deepkernels.models.decoder import SpectralDecoder
+from deepkernels.models.dirichlet import AmortisedDirichlet
+from deepkernels.kernels.deepkernel import DeepKernel
 from typing import Tuple, Optional, TypeAlias, Tuple, Union
-import wandb
 import numpy as np
 import logging
-
+from gpytorch.mlls import AddedLossTerm
+from torch.distributions import kl_divergence
+import gpytorch
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
 class SpectralVAE(nn.Module):
     def __init__(self):
         super().__init__()
         self.dirichlet = AmortisedDirichlet()
         self.decoder = SpectralDecoder()
-        self.encoder = RecurrentEncoder(input_dim=44, hidden_dims=[128, 64, 32], latent_dim=16, dropout=0.1, k_atoms=30, M=128)
+        self.encoder = RecurrentEncoder()
         self.eps = 1e-4
 
     def forward(self, x, steps=3, pi=None, spectral_features=None):
@@ -40,34 +41,40 @@ class SpectralVAE(nn.Module):
         features_current = spectral_features
         all_recons = []
         all_kls = []
-        all_latents = []
+        all_dirichlet = []
         evolving_features = []
 
         #-refinement loop-#
-        for _ in range(steps):
-            z, alpha, ls, mvn, qz_dist = self.encoder(x, pi=pi_current, spectral_features=features_current)
-            pi_simplex = torch.distributions.Dirichlet(torch.clamp(alpha, min=1e-3, max=100.0))
-            pi_current = pi_simplex.rsample()
-            features_current = self.dirichlet(z, alpha=alpha, ls=ls, features_only=True)
+        for step in range(steps):
+            z, alpha, ls, mu, logvar = self.encoder(x, pi=pi_current, spectral_features=features_current)
+            if alpha.dim() > 2:
+                alpha = alpha.squeeze(-1)
+            alpha = torch.clamp(alpha, min=1e-3, max=100.0)
+            q_alpha= torch.distributions.Dirichlet(alpha)
+            pi_current = q_alpha.rsample()
+
+            features_current, dirichlet_kls = self.dirichlet(z, alpha=alpha, ls=ls, features_only=True)
+            post_z_std = torch.exp(0.5 * logvar)
+            post_z_eps = torch.randn_like(post_z_std)
+            post_z = mu + post_z_eps * post_z_std #-reparameterisation trick-#
+            
             recon_step = self.decoder(features_current)
-            all_recons.append(recon_step)
-            all_kls.append(mvn)
-            all_latents.append(qz_dist)
-            evolving_features.append(features_current)
-        
+            
+        all_recons.append(recon_step)
+        all_kls.append(post_z)
+        all_dirichlet.append(dirichlet_kls)
         return {
-            'reconstruction_loss_per_step': all_recons,
-            'empirical_kl_div_per_step': all_kls,
-            'spectral_features_per_step': evolving_features,
-            'features_out': features_current,
-            'z_out': z,
-            'alpha_concentration_out': alpha,
-            'lengthscales_out': ls,
-            'empirical_latent_kl_per_step': all_latents,
-            'simplex_sample_out': pi_current
+                'spectral_features': features_current, 
+                'recon_loss': all_recons, 
+                'kls_latent': all_kls,
+                'dirichlet_losses': all_dirichlet, 
+                'z': z, 
+                'alpha': alpha, 
+                'ls':   ls, 
+                'pi':pi_current
         }
     
-    def compute_loss(self, vae_out, y_target, input_dim=None, dirichlet_local_beta=1.0, dirichlet_global_beta=1.0, latent_kl_beta=0.5):
+    def compute_loss(self, kls, dir_kl, recons, y_target, input_dim=None, dirichlet_local_beta=1.0, dirichlet_global_beta=1.0, latent_kl_beta=0.5):
         """
         Args:
             vae_out: Dict containing lists 'recons', 'kls' (from VAE forward)
@@ -76,19 +83,15 @@ class SpectralVAE(nn.Module):
         # --- 1. Setup Constants ---
         B = float(y_target.size(0))
         N = 38003.0 
-        scalar = N / B # Scaling for batch
-        input_dim = input_dim or 44
+        scalar = 1.0
+        input_dim = 30
 
         # --- 2. Iterative Loss (Reconstruction + Latent KL) ---
         # We sum the loss over all refinement steps
-        
-        recons = vae_out['reconstruction_loss_per_step']   # List of Tensors
-        kls = vae_out['empirical_kl_div_per_step']         # List of Distributions (mvn)
-        latent_kls = vae_out['empirical_latent_kl_per_step']
-        
         n_steps = len(recons)
         total_recon_loss = 0.0
         total_latent_kl = 0.0
+        total_dir_kl = 0.0
 
         device = y_target.device
         latent_dim = 16
@@ -102,44 +105,24 @@ class SpectralVAE(nn.Module):
             recon_t = recons[t]
             step_recon_sum = F.l1_loss(recon_t, y_target, reduction='sum') 
             total_recon_loss += step_recon_sum
-            p_z = kls[t]
-            q_z_t = latent_kls[t]
+            q_z_t = kls[t]
             step_kl = torch.distributions.kl_divergence(q_z_t, p_z_prior).sum()
             total_latent_kl += step_kl
-        
-        total_recon_loss = total_recon_loss / (B * input_dim)
-        avg_recon_loss = (total_recon_loss / n_steps) * scalar
-        total_latent_kl = total_latent_kl / (B * latent_dim)
-        avg_latent_kl = (total_latent_kl / n_steps) * scalar
-
-        # --- 3. Dirichlet Losses (Global/Local) ---
-        local_dirichlet_loss = 0.0
-        global_dirichlet_loss = 0.0
-
-        if hasattr(self.dirichlet, 'named_added_loss_terms'):
-            for name, added_loss in self.dirichlet.named_added_loss_terms():
-                if "stick_breaking" in name:
-                    global_dirichlet_loss += added_loss.loss()
-                else:
-                    local_dirichlet_loss += added_loss.loss()
-
-        total_local_dirichlet = (local_dirichlet_loss * scalar) * dirichlet_local_beta
-        total_global_dirichlet = (global_dirichlet_loss * 1.0) * dirichlet_global_beta
+            total_dir_kl = dir_kl[t]
+            total_dir_kl += (total_dir_kl / B)
+    
 
         # --- 4. Total Loss ---
-        total_loss = (
-            avg_recon_loss + 
-            (avg_latent_kl * latent_kl_beta) + 
-            total_local_dirichlet + 
-            total_global_dirichlet
-        )
-        
+        avg_recon = (total_recon_loss / n_steps) * scalar
+        avg_kl_z = (total_latent_kl / n_steps) * scalar * latent_kl_beta
+        avg_kl_alpha = (total_dir_kl / n_steps) * scalar * dirichlet_global_beta
+        total_loss = avg_recon + avg_kl_z + avg_kl_alpha
+    
         return {
             "loss": total_loss,
-            "recon_loss": avg_recon_loss.item(),
-            "kl_loss": avg_latent_kl.item(),
-            "dirichlet_local_loss": total_local_dirichlet.item() if isinstance(total_local_dirichlet, torch.Tensor) else total_local_dirichlet,
-            "dirichlet_global_loss": total_global_dirichlet.item() if isinstance(total_global_dirichlet, torch.Tensor) else total_global_dirichlet
+            "recon_loss": avg_recon,
+            "kl_z_loss": avg_kl_z,
+            "kl_alpha_loss": avg_kl_alpha
         }
     
     def get_diagnostics(self, vae_out):

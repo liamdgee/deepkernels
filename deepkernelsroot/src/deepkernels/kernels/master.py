@@ -13,6 +13,7 @@ class MasterKernel(Kernel):
         super().__init__(**kwargs)
         self.nkn = nkn
         self.dirichlet = dirichlet
+        
         self.base_kernel = ScaleKernel(LinearKernel()) #-dot product in feature space-#
 
     def forward(self, x1, x2, diag=False, **params):
