@@ -7,7 +7,7 @@ import torch.nn.utils.spectral_norm as sn
 import torch
 import math
 import gpytorch
-from gpytorch.kernels import Kernel
+from gpytorch.kernels import Kernel, LinearKernel
 from linear_operator.operators import RootLinearOperator, MatmulLinearOperator
 from gpytorch.means import Mean
 
@@ -29,20 +29,19 @@ class DynamicMixtureMean(Mean):
             return torch.zeros(x.shape[0], self.num_latents, device=x.device)
         
         # (Batch, 30) @ (30, 6) -> (Batch, 6)
-        return pi @ self.cluster_constants
+        latent_means = pi @ self.cluster_constants
+        return latent_means.t()
 
 
 
 class DeepKernel(Kernel):
     """
-    A unified Deep Kernel module.
-    1. Neural Phase: Transforms latent 'z' into high-dimensional task features.
-    2  Kernel Phase: Maps task features into an approximate Linear kernel with a matmul linear operator
+    master kernel
     """
     has_lengthscale = False
 
     def __init__(self, 
-                 input_dim=7680, 
+                 input_dim=2048, 
                  k_atoms=30, 
                  num_latents=6,
                  latent_dim=16, 
@@ -58,7 +57,6 @@ class DeepKernel(Kernel):
         self.latent_dim = latent_dim
         self.k_atoms = k_atoms
         self.output_dim_per_latent = num_rff * 2 #- 6 latents are assumed equivalent to 30 clusters-#
-        self.input_dim = 2048 #-dirichlet spectral embedding dim-#
         self.spectral_emb = num_rff * num_latents #-768
 
         # ==========================================
@@ -77,74 +75,76 @@ class DeepKernel(Kernel):
             ) 
             for _ in range(self.num_latents)
         ])
-
-
-        self.register_parameter(name="raw_outputscale", parameter=torch.nn.Parameter(torch.zeros(1)))
+    
+        self.register_parameter(
+            name="raw_outputscale", 
+            parameter=torch.nn.Parameter(torch.zeros(1))
+        )
         self.register_constraint("raw_outputscale", gpytorch.constraints.Positive())
         
-        self.register_parameter(name="raw_log_amplitude", parameter=torch.nn.Parameter(torch.zeros(num_latents, 1, 1)))
-        self.register_constraint("raw_log_amplitude", gpytorch.constraints.Positive())
+        # 2. PER-LATENT AMPLITUDE (Renamed for clarity)
+        # We initialize to 0.0 -> Softplus(0.0) approx 0.69 amplitude
+        self.register_parameter(
+            name="raw_latent_amplitude", 
+            parameter=torch.nn.Parameter(torch.zeros(num_latents, 1, 1))
+        )
+        self.register_constraint("raw_latent_amplitude", gpytorch.constraints.Positive())
         
+        # 3. INVERSE BANDWIDTH (Your Spectral Filter)
+        self.register_parameter(
+            name="raw_inv_bandwidth", 
+            parameter=torch.nn.Parameter(torch.zeros(1, input_dim))
+        )
+        self.register_constraint("raw_inv_bandwidth", gpytorch.constraints.Positive())
+
         self._init_weights()
 
     @property
     def outputscale(self):
+        # CORRECT: Access constraint directly on self
         return self.raw_outputscale_constraint.transform(self.raw_outputscale)
-
-    def _init_weights(self):
-        
-
-        for module in self.mixer.modules():
-            if isinstance(module, nn.Linear):
-                gain = nn.init.calculate_gain('relu')
-                nn.init.orthogonal_(module.weight, gain=gain)
-        
-        for head in self.heads.modules():
-            if isinstance(head, nn.Linear):
-                nn.init.orthogonal_(head.weight, gain=1.41)
     
     @property
-    def lengthscale(self):
-        return self.raw_lengthscale_constraint.transform(self.raw_lengthscale)
+    def latent_amplitude(self):
+        # Renamed property to match the parameter logic
+        return self.raw_latent_amplitude_constraint.transform(self.raw_latent_amplitude)
 
-    @lengthscale.setter
-    def lengthscale(self, value):
-        self._set_lengthscale(value)
-    
+    @property
+    def inv_bandwidth(self):
+        return self.raw_inv_bandwidth_constraint.transform(self.raw_inv_bandwidth)
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=1.41)
     
 
     def forward(self, x1, x2, diag=False, last_dim_is_batch=False, **params):
-        # 1. Get Latent Features: [num_latents, Batch, 256]
+        #-Get Latent Features: [num_latents, Batch, 256]
+        bw = self.inv_bandwidth
+        x1 = x1 * bw
         
-        bw_learned = params.get("bandwidth", None)
+        hidden_x1 = self.mixer(x1) #-shared-# [b, 768]
 
-        if bw is not None:
-            x1 = x1
-        
-        z1 = self._compute_primitives_and_interactions(x1)
-        if x2 is None or torch.equal(x1, x2):
-            z2 = z1
-            symmetric = True
-        else:
-            z2 = self._compute_primitives_and_interactions(x2)
-            symmetric = False
-        
-        amp = self.n_experts / self.num_latents
+        z1_list = [head(hidden_x1) for head in self.heads]
+        z1 = torch.stack(z1_list, dim=0)
 
+        amp = self.latent_amplitude.sqrt()
         z1 = z1 * amp
-        if not symmetric:
-            z2 = z2 * amp
-        if diag:
-            return (z1 * z2).sum(-1) # [6, Batch]
         
-        scale = self.outputscale.sqrt().view(1, 1, 1) 
-        z1 = z1 * scale
-        if not symmetric:
-            z2 = z2 * scale
+        if x2 is None or torch.equal(x1, x2):
+            return RootLinearOperator(z1) #-[6, b, b]
             
-        if symmetric:
-            return RootLinearOperator(z1)
-        
         else:
-            # Result: MatmulLinearOperator of shape [6, Batch1, Batch2]
-            return MatmulLinearOperator(z1, z2.transpose(-1, -2))
+            x2 = x2 * bw
+            hidden_x2 = self.mixer(x2)
+            
+            z2_list = [head(hidden_x2) for head in self.heads]
+            z2 = torch.stack(z2_list, dim=0)
+            z2 = z2 * amp
+            
+            if diag:
+                return (z1 * z2).sum(-1)
+            else:
+                # Matmul: (6, Batch, D) @ (6, D, Batch) -> (6, Batch, Batch)
+                return MatmulLinearOperator(z1, z2.transpose(-1, -2))

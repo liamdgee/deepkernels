@@ -2,6 +2,7 @@ import torch
 import gpytorch
 from torch.distributions import Normal, TransformedDistribution, kl_divergence, Dirichlet
 from torch.distributions.transforms import StickBreakingTransform
+from gpytorch.priors import GammaPrior, NormalPrior
 import math
 
 import torch.nn as nn
@@ -34,12 +35,18 @@ class HDPConfig(BaseModel):
 
 
 class AmortisedDirichlet(BaseGenerativeModel):
-    def __init__(self, 
-                 config=None, 
-                 k_atoms=30, 
-                 fourier_dim=128, 
-                 latent_dim=16, 
-                 spectral_emb_dim=2048):
+    def __init__(
+            self, 
+            config=None, 
+            k_atoms=30, 
+            fourier_dim=128, 
+            latent_dim=16, 
+            spectral_emb_dim=2048,
+            num_latents=6,
+            input_dim=30,
+            spectral_clusters=4,
+            bottleneck_dim=64
+    ):
         self.config = config or HDPConfig()
         self.n_data = 38003
         self.K = k_atoms or self.config.K
@@ -49,40 +56,58 @@ class AmortisedDirichlet(BaseGenerativeModel):
 
         self.compress_spectral_features_head = torch.nn.utils.spectral_norm(nn.Linear(k_atoms * fourier_dim * 2, spectral_emb_dim))
         
-        input_dim = 30
-        latent_dim = 16
+        self.bottleneck_mixer = nn.Sequential(
+            nn.utils.spectral_norm(nn.Linear(latent_dim, bottleneck_dim)),
+            nn.LayerNorm(bottleneck_dim),
+            nn.Tanh()
+        )
 
-        #--init constraints--#
-        self.mu_init = self.config.mu_init or 0.0
-        self.sigma_init = self.config.sigma_init or 1.0
-        self.log_sigma_init = math.log(self.sigma_init)
-        self.sigma_q_init = self.config.sigma_q_init or 1.5
-        self.qsig = (math.log(self.sigma_q_init)) * -1.0
-        self.sigma_h_init = self.config.sigma_h_init or 1.0
-        self.hsig = (math.log(self.sigma_h_init)) * -1.0
-        self.atom_factor = self.config.atom_factor or 0.0075
+        self.linear = nn.utils.spectral_norm(nn.Linear(spectral_emb_dim, bottleneck_dim))
+        self.linear_scale = nn.Parameter(torch.tensor(0.165))
+        
+        self.periodic = nn.utils.spectral_norm(nn.Linear(spectral_emb_dim, bottleneck_dim))
+        self.rbf = nn.utils.spectral_norm(nn.Linear(spectral_emb_dim, bottleneck_dim))
+        self.rational = nn.utils.spectral_norm(nn.Linear(spectral_emb_dim, bottleneck_dim))
+        
+        self.constant = nn.Parameter(torch.randn(num_latents, bottleneck_dim) * 0.165)
+        
+        self.primitive_norm = nn.LayerNorm(bottleneck_dim * num_latents)
 
-        # ---------------------------------------------------------
-        # Structure: GEM Global Mixing Weights (Beta)
-        # ---------------------------------------------------------
-        #-- variational params - q(v) ~ N(q_mu, q_log_sigma)
-        self.q_mu = nn.Parameter(torch.full((self.K - 1,), -2.0)) #--break symmetry-#
-        self.q_log_sigma = nn.Parameter(torch.full((self.K - 1,), -4.0)) # or self.qsig if you have it defined#-cluster stability-#
+        self.primitive_kernel_heads = nn.ModuleList([
+            torch.nn.utils.spectral_norm(
+                nn.Linear(bottleneck_dim, spectral_clusters) #-dim 128 for each latent gp-#
+            ) 
+            for _ in range(num_latents)
+        ])
 
         # ---------------------------------------------------------
         # Content: Spectral Frequencies (Omega)
         # ---------------------------------------------------------
         #--spectral mixture kernel: defined by weight (pi), center (atom_mu), width (atom_log_scale)
 
-        #--Global Base Distribution (H) defines kernel smoothness & freq
-        self.h_mu = nn.Parameter(torch.zeros(1, 1, input_dim)) #-center of kernels -- mu prior on gram matrix-#
-        self.h_log_sigma = nn.Parameter(torch.tensor(self.hsig)) #-global bandwidth-#
+        self.register_parameter(
+            name="variational_omega_mu", 
+            parameter=torch.nn.Parameter(torch.randn(num_latents, spectral_clusters, input_dim))
+        )
+        
+        # 2. Variational Log Variance (The Frequency Uncertainty)
+        # Shape: (6, 4, 16)
+        # Init to -4.0 (small variance) to start confident, then expand if needed
+        self.register_parameter(
+            name="variational_omega_logvar", 
+            parameter=torch.nn.Parameter(torch.ones(num_latents, spectral_clusters, input_dim) * -4.0)
+        )
 
-        #-local atom deviation (additive)-#
-        self.atom_log_sigma = nn.Parameter(torch.zeros(1, fourier_dim, input_dim) * math.sqrt(self.atom_factor))
-        self.atom_mu = nn.Parameter(torch.randn(self.K, 1, input_dim) * self.atom_factor)
+        # --- REPARAMETERIZATION NOISE (Standard Normal Buffer) ---
+        # Fixed buffer for the "epsilon" in the reparameterization trick
+        # We make it large enough for a batch (e.g., M samples)
+        # Shape: (1, Latents, Mixtures, Dim) for broadcasting
+        self.register_buffer(
+            "fixed_epsilon", 
+            torch.randn(1, num_latents, spectral_clusters, input_dim)
+        )
 
-        #--RFF Constants - fixed noise params--#
+        #--RFF Constants - fixed noise buffers--#
         #-draw standard normal once and freeze (fundamental random fourier projection assumption)--#
         self.register_buffer("noise_weights", torch.randn(self.K, self.M, input_dim)) #-Shape: [K, M, D]-#
         self.register_buffer("noise_bias", torch.rand(self.K, self.M) * 2 * math.pi)
@@ -94,12 +119,46 @@ class AmortisedDirichlet(BaseGenerativeModel):
         self.gamma_init = 2.0
         self.gamma = nn.Parameter(torch.tensor(float(self.gamma_init)))
 
+        self.register_parameter(name="raw_logits", parameter=nn.Parameter(torch.randn(30)))
+
+        self.register_prior(
+            "logit_prior",
+            NormalPrior(loc=0.0, scale=1.0),
+            lambda m: F.softplus(m.raw_logits)
+        )
+
+        self.register_prior("gamma_prior", GammaPrior(2.5, 1.0), lambda m: F.softplus(m.gamma), lambda m, v: None)
+
         #--Define torch stickbreak module-#
         self.stick_break_transform = StickBreakingTransform()
 
         super().__init__()
     
-    def dynamic_random_fourier_features(self, z: torch.Tensor, omega: torch.Tensor, pi: Optional[torch.Tensor]=None):
+    def _init_weights(self):
+        # 1. Linear Primitive (Identity)
+        nn.init.orthogonal_(self.linear.weight, gain=1.0)
+        
+        # 2. Periodic Primitive (Cosine) -> gain = sqrt(2)
+        nn.init.orthogonal_(self.periodic.weight, gain=1.41)
+        
+        # 3. RBF Primitive (Gaussian) - centres of rbfs
+        nn.init.orthogonal_(self.rbf.weight, gain=2.0)
+        nn.init.uniform_(self.rbf.bias, -1.0, 1.0)
+        
+        # 4. Rational Primitive (Cauchy)
+        nn.init.orthogonal_(self.rational.weight, gain=1.41)
+
+        for module in self.primitive_kernel_heads.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=1.41)
+
+        for module in self.bottleneck_mixer.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=nn.init.calculate_gain('tanh'))
+        
+
+
+    def dynamic_random_fourier_features(self, z: torch.Tensor, omega: torch.Tensor, pi: Optional[torch.Tensor]=None, ls: Optional[torch.Tensor]=None):
         """
         Args:
             z: [Batch, D]
@@ -107,6 +166,9 @@ class AmortisedDirichlet(BaseGenerativeModel):
             pi: [B, K] 
         """
         B, D = z.shape
+        if ls is not None:
+            z = z / (ls + 1e-6) #-kernel smoothing-#
+        
         if pi is None:
             pi = torch.full((B, self.K), 1.0/self.K, device=z.device)
             pi = pi + (torch.randn_like(pi) * 0.01)
@@ -122,7 +184,8 @@ class AmortisedDirichlet(BaseGenerativeModel):
             proj = proj.view(B, self.K, self.M)
         
         #-phase shift-#
-        proj = proj + self.noise_bias.unsqueeze(0) #- [K, M] -> [1, K, M]
+        weights = self.noise_bias
+        proj = proj + weights.view(1, self.K, self.M) #- [K, M] -> [1, K, M]
         
         #-scale for vae-#
         scale = 1.0 / math.sqrt(self.M)
@@ -143,58 +206,63 @@ class AmortisedDirichlet(BaseGenerativeModel):
     
     def get_omega(self, ls_pred=None):
         """
-        Generates the Spectral Frequencies (Omega) for the current batch.
+        Generates Variational Spectral Frequencies (Omega).
         
-        Logic: Omega ~ N(mu_global + mu_local, sigma_global + sigma_local * ls_dynamic)
+        Logic: Omega ~ q(omega | ls_pred) = N(mu, sigma_variational * ls_modifier)
         
         Args:
-            ls_pred: [Batch, K, D] (Optional) - Amortised lengthscales from VAE.
-                     If None, uses the learned prior (static kernel).
+            ls_pred: [Batch, Latents, D] (Optional) - Amortised lengthscales from VAE.
+                     If None, uses purely the learned variational variance.
         Returns:
-            omega: [Batch, K, M, D] - The frequency set for every atom in every image.
+            omega: [Batch, Latents, Mixtures, D]
         """
-
-        #-h_mu (Global) + atom_mu (Local Cluster Center)
-        #-Shape: [1, 1, D] + [K, 1, D] = [K, 1, D]
-        means = self.h_mu + self.atom_mu 
         
-        # Broadcast to [1, K, 1, D] for batch compatibility
-        means_expanded = means.unsqueeze(0) 
-
-        # ---------------------------------------------------------
-        # 2. Compute The Bandwidth / Variance (Hierarchical)
-        # ---------------------------------------------------------
-        log_scale = self.h_log_sigma + self.atom_log_sigma
-        bw_base = F.softplus(log_scale) # Shape: [K, 1, D]
+        # 1. Get Variational Parameters
+        # mu shape: [Latents, Mixtures, D]
+        mu = self.variational_omega_mu
         
-        # B) Dynamic Scaling (Amortised Inference)
+        # sigma shape: [Latents, Mixtures, D]
+        sigma = F.softplus(self.variational_omega_logvar) + 1e-6
+
+        # 2. Apply Amortized Scaling (Optional)
+        # If the VAE says "High Lengthscale", we should SHRINK the frequency variance.
+        # Logic: bandwidth ~ 1 / lengthscale
+        
         if ls_pred is not None:
-            # ls_pred: [Batch, K, D]
-            ls_inv = 1.0 / (ls_pred + 1e-6) 
+            # ls_pred: [Batch, Latents, D]
+            # We need to broadcast it to [Batch, Latents, 1, D] to match Mixtures
+            ls_inv = 1.0 / (ls_pred.unsqueeze(2) + 1e-6)
             
-            # Combine: [1, K, 1, D] * [Batch, K, 1, D]
-            bw_dynamic = bw_base.unsqueeze(0) * ls_inv.unsqueeze(2)
+            # Combine Variational Sigma with Dynamic Lengthscale
+            # [1, L, M, D] * [B, L, 1, D] -> [B, L, M, D]
+            dynamic_sigma = sigma.unsqueeze(0) * ls_inv
+            
+            # Expand mu for batch: [1, L, M, D] -> [B, L, M, D]
+            # (Or let broadcasting handle it in the next step)
+            dynamic_mu = mu.unsqueeze(0)
+            
         else:
-            # Static Mode: Just use the base learned width
-            bw_dynamic = bw_base.unsqueeze(0) # [1, K, 1, D]
+            # Static Mode (Standard Variational GP)
+            dynamic_sigma = sigma.unsqueeze(0) # [1, L, M, D]
+            dynamic_mu = mu.unsqueeze(0)       # [1, L, M, D]
+        #-Stochastic Sampling for Training
+        epsilon = torch.randn_like(dynamic_sigma) 
+
+        omega = dynamic_mu + (dynamic_sigma * epsilon)
         
-        # noise_weights: [K, M, D] -> [1, K, M, D]
-        noise_expanded = self.noise_weights.unsqueeze(0)
-        
-        # [1, K, 1, D] + ([Batch, K, 1, D] * [1, K, M, D])
-        omega_unclamped = means_expanded + (bw_dynamic * noise_expanded)
-        omega = torch.clamp(omega_unclamped, -100.0, 100.0)
-        return omega #-[Batch, K_atoms, M_modes, D_dim]-#
-        
+        return omega # [Batch, Latents, Mixtures, Dim]
+    
+    def kernel_network(self, z):
 
     def forward(self, 
-            z, 
+            x,
+            q_dist, #-low rank mvn-#
             batch_shape=torch.Size([]), 
             ls: Optional[torch.Tensor]=None, 
-            alpha: Optional[torch.Tensor]=None):
+            alpha: Optional[torch.Tensor]=None,):
         """
         Args:
-            z: [Batch, D] - Latent (Required for features)
+            z (referenced as x for gpytorch): [Batch, D] - Latent (Required for features)
             alpha_amortised: [Batch, K] - Dirichlet Concentration (from Encoder)
             ls_amortised: [Batch, K, D] - Lengthscales (from Encoder or Override)
         """
@@ -203,8 +271,6 @@ class AmortisedDirichlet(BaseGenerativeModel):
         # 1. Global Variational Inference (Stick Breaking)
         # ---------------------------------------------------------
         #--A) define variational posterior - q(v)-#
-        q_sig = F.softplus(self.q_log_sigma)
-        q_dist = Normal(self.q_mu, q_sig)
         
         #-loss for q-#
         #-sample from logit space-#
@@ -247,8 +313,8 @@ class AmortisedDirichlet(BaseGenerativeModel):
         prior_conc = torch.clamp(prior_conc, min=1e-2, max=100.0)
         ls_pred = None
         #--E) amortised inference--#
-        if z is not None:
-            batch_size = z.size(0)
+        if x is not None:
+            batch_size = x.size(0)
             prior_conc_expanded = prior_conc.unsqueeze(0).expand(batch_size, -1) #-[K] -> [1, K] -> [B, K]-#
         else:
             if len(batch_shape) > 0:
@@ -290,8 +356,8 @@ class AmortisedDirichlet(BaseGenerativeModel):
 
         omega_frequencies = self.get_omega(ls_pred) #-[B, K, M, D]-#
 
-        features = self.dynamic_random_fourier_features(z, omega_frequencies)
+        features = self.dynamic_random_fourier_features(x, omega_frequencies)
 
         kernel_features_projection = self.compress_spectral_features_head(features)
         
-        return kernel_features_projection
+        return kernel_features_projection, omega_frequencies, pi, ls_pred
