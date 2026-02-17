@@ -83,7 +83,7 @@ class GenerativeKernelProcess(ApproximateGP):
         self.encoder = self.vae.encoder
     
     
-    def forward(self, x):
+    def forward(self, x, **params):
         """beware that steps is encoded in init for the vae call"""
         self.vae.encoder(x)
         self.vae.dirichlet(x)
