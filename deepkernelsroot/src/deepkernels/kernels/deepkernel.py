@@ -33,7 +33,6 @@ class DynamicMixtureMean(Mean):
         return latent_means.t()
 
 
-
 class DeepKernel(Kernel):
     """
     master kernel
@@ -90,7 +89,6 @@ class DeepKernel(Kernel):
         )
         self.register_constraint("raw_latent_amplitude", gpytorch.constraints.Positive())
         
-        # 3. INVERSE BANDWIDTH (Your Spectral Filter)
         self.register_parameter(
             name="raw_inv_bandwidth", 
             parameter=torch.nn.Parameter(torch.zeros(1, input_dim))
@@ -101,12 +99,10 @@ class DeepKernel(Kernel):
 
     @property
     def outputscale(self):
-        # CORRECT: Access constraint directly on self
         return self.raw_outputscale_constraint.transform(self.raw_outputscale)
     
     @property
     def latent_amplitude(self):
-        # Renamed property to match the parameter logic
         return self.raw_latent_amplitude_constraint.transform(self.raw_latent_amplitude)
 
     @property
