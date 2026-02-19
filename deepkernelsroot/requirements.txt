@@ -11,6 +11,7 @@ torchvision
 gpytorch>=1.11
 linear_operator>=0.5.0
 mlflow>=2.10.0
+pykeops
 
 # --- DEPLOYMENT & UTILS --- #
 opencv-python-headless 

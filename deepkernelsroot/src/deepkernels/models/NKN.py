@@ -4,10 +4,23 @@ import math
 import torch.nn.utils.parametrizations as P
 import torch.nn.functional as F
 from deepkernels.models.parent import BaseGenerativeModel
+import gpytorch
+from typing import Optional, Any
+from deepkernels.models.simplegp import KeOpsSimpleGP
 
 class KernelNetwork(BaseGenerativeModel):
-    def __init__(self, bottleneck_dim=64, num_latents=8, spectral_emb_dim=2048):
+    def __init__(self, 
+                 bottleneck_dim=64, 
+                 num_latents=8, 
+                 spectral_emb_dim=2048, 
+                 gate_dim=16,
+                 loop_dim=30,
+                 gp_head: Optional[gpytorch.models.ApproximateGP]=None, 
+                 inducing: Optional[torch.Tensor]=None):
         super().__init__()
+        
+        if gp_head is not None and inducing is not None:
+            self.gp = KeOpsSimpleGP(inducing_points=inducing)
 
         # --- Dimensions ---
         self.individual_kernel_dim_out = 32
@@ -49,19 +62,52 @@ class KernelNetwork(BaseGenerativeModel):
                 nn.Sigmoid()
         )
 
+        self.gates = nn.Sequential(
+            nn.Linear(self.head_input_dim, 128),
+            nn.LayerNorm(128),
+            nn.Tanh(),
+            nn.Linear(128, 16),
+            nn.Softplus()                   
+        )
+
         self.init_weights_nkn()
     
-    
-    def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), **params):
+    def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only=False, **params):
         """
-        This inputs the latent bottleneck dim (64)
+        inputs the latent bottleneck dim (64)
         """
         lin, per, rbf, rat = self.compute_primitives(x)        
 
         custom_interactions = self.compute_kernel_interactions(lin, per, rbf, rat) #- outputs [B, 12, 128]
 
         kernel_features = torch.cat([lin, per, rbf, rat, custom_interactions], dim=-1) #-[B,256]
+
+        features_large = self.feed_dirichlet_gate(kernel_features)
         
-        return self.feed_dirichlet_gate(kernel_features)
+        if features_only:
+            return features_large
+        
+        covariances = self.get_cov_matrices(kernel_features)
+        gates = self.gates(kernel_features)
+
+        return {
+            'features_large': features_large, 
+            'features_small': covariances,
+            'gates_for_kernel': gates
+        }
+
     
+    def init_weights_nkn(self):
+        nn.init.orthogonal_(self.linear.weight, gain=1.0)
+        nn.init.uniform_(self.linear.bias, 0.0, 2.0)
+        nn.init.orthogonal_(self.periodic.weight, gain=1.41)
+        nn.init.orthogonal_(self.rbf.weight, gain=2.0)
+        nn.init.uniform_(self.rbf.bias, -1.0, 1.0)
+        nn.init.orthogonal_(self.rational.weight, gain=1.41)
+        nn.init.orthogonal_(self.complex_interactions.weight, gain=1.41)
+
+        for module in self.latent_kernel_heads.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=1.41)
+
     
