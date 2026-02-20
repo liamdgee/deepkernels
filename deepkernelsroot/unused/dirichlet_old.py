@@ -1,4 +1,24 @@
 # filename: dirichlet_clusters.py
+        #-stick breaking logic (Numerically Stable)-#
+        qv_global = torch.sigmoid(qz_global)
+        
+        # log(1 - v) is exactly -softplus(z_global)
+        log_one_minus_v = -F.softplus(qz_global)
+        
+        # cumprod in log-space is just cumsum
+        log_cumprod_one_minus_v = torch.cumsum(log_one_minus_v, dim=-1)
+        
+        # Exponentiate back to linear space only at the very end
+        cumprod_one_minus_v = torch.exp(log_cumprod_one_minus_v)
+
+        pad = torch.ones_like(cumprod_one_minus_v[..., :1])
+        previous_remaining = torch.cat([pad, cumprod_one_minus_v[..., :-1]], dim=-1)
+
+        beta_k = qv_global * previous_remaining
+        beta_last = cumprod_one_minus_v[..., -1:]
+        beta = torch.cat([beta_k, beta_last], dim=-1)
+#changes for logistic normal to sb 
+
 import torch
 import torch.nn as nn
 
