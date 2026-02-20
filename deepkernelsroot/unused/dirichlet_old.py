@@ -1,4 +1,65 @@
 # filename: dirichlet_clusters.py
+import torch
+import torch.nn as nn
+
+class KumaraswamyStickBreaking(nn.Module):
+    def __init__(self, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def kumaraswamy_rsample(self, a, b):
+        """
+        Samples from the Kumaraswamy distribution using the inverse CDF method.
+        a, b: Parameters of the distribution, outputted by the encoder.
+        """
+        # Draw uniform noise
+        u = torch.rand_like(a)
+        u = torch.clamp(u, self.eps, 1.0 - self.eps)
+        
+        # Inverse CDF reparameterization trick
+        v = (1.0 - (1.0 - u).pow(1.0 / b)).pow(1.0 / a)
+        
+        # Clamp to prevent strictly 0 or 1 values for log stability
+        return torch.clamp(v, self.eps, 1.0 - self.eps)
+
+    def forward(self, a, b):
+        """
+        Takes parameters a and b of shape (batch_size, K-1)
+        Returns the simplex vector pi of shape (batch_size, K)
+        """
+        # 1. Sample the breaking fractions
+        v = self.kumaraswamy_rsample(a, b)
+        
+        # 2. Compute log(v) and log(1-v)
+        log_v = torch.log(v)
+        log_1_minus_v = torch.log(1.0 - v)
+        
+        # 3. Compute the log of the remaining stick length
+        # We prepend a zero because the first stick has no prior breaks
+        pad = torch.zeros_like(log_1_minus_v[..., :1])
+        log_remaining = torch.cat([pad, log_1_minus_v], dim=-1).cumsum(dim=-1)
+        
+        # 4. Compute log probabilities for each component
+        # The final stick portion uses the remaining stick, so we append log(1.0) = 0 to log_v
+        log_v_extended = torch.cat([log_v, torch.zeros_like(log_v[..., :1])], dim=-1)
+        log_pi = log_v_extended + log_remaining
+        
+        # Return to linear space on the simplex
+        return torch.exp(log_pi)
+
+# Example usage:
+# Assuming an encoder outputs `a` and `b` for K-1 components
+batch_size = 32
+K = 10 
+
+# Dummy outputs from an encoder network (must be strictly positive, e.g., via Softplus)
+a = torch.rand(batch_size, K-1) + 0.1 
+b = torch.rand(batch_size, K-1) + 0.1
+
+sbp_layer = KumaraswamyStickBreaking()
+pi = sbp_layer(a, b)
+
+# pi is now shape (32, 10), sums to 1 across dim=-1, and is fully differentiable
 
 #--- Dependencies---#
 import numpy as np
