@@ -20,6 +20,32 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+from typing import NamedTuple
+
+class DirichletOutput(NamedTuple):
+    features: torch.Tensor
+    frequencies: torch.Tensor
+    gated_weights: torch.Tensor
+    predicted_lengthscale: torch.Tensor
+    learned_bandwidth: torch.Tensor
+    z_in: torch.Tensor
+    bottleneck: torch.Tensor
+    beta: torch.Tensor
+    pi: torch.Tensor
+    concentration_prior: torch.Tensor
+    concentration_posterior: torch.Tensor
+
+class LossTerm(gpytorch.mlls.AddedLossTerm):
+    """
+    A concrete implementation of an AddedLossTerm that simply 
+    returns a pre-calculated scalar tensor.
+    """
+    def __init__(self, loss_tensor):
+        self.loss_tensor = loss_tensor
+        
+    def loss(self):
+        return self.loss_tensor
+
 class HDPConfig(BaseModel):
     K: int = 30
     M: int = 128
@@ -92,10 +118,14 @@ class AmortisedDirichlet(BaseGenerativeModel):
         #-buffers-#
         self.register_buffer("noise_weights", torch.randn(k_atoms, fourier_dim, latent_dim))
         self.register_buffer("noise_bias", torch.rand(k_atoms, fourier_dim))
-        
+
+        #-loss terms-#
+        self.register_added_loss_term("global_divergence")
+        self.register_added_loss_term("local_divergence")
+        self.register_added_loss_term("likelihood_kernel_hyperprior")
         
 
-    def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
+    def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params) -> DirichletOutput:
         """
         performs nonparametric clustering according to a hierarchical dirichlet process using learned lengthscale
         and concentration param refinement via pi (logit mixture weights)
@@ -103,10 +133,12 @@ class AmortisedDirichlet(BaseGenerativeModel):
             latent z (param: x) -- dim 16
         """
         
-        pi = vae_out['pi']
+        pi = vae_out['pi'] if vae_out else None
         mualpha, factoralpha, diagalpha = vae_out['mu_alpha'], vae_out['factor_alpha'], vae_out['diag_alpha']
-        ls = params.get('ls', None)
+        ls = params.get('ls') or (vae_out.get('ls') if vae_out else None)
 
+        
+        
         beta, log_pv, log_qv, gamma_conc = self.global_stick_breaking()
 
         self.log_global_kl(log_pv, log_qv)
@@ -125,21 +157,27 @@ class AmortisedDirichlet(BaseGenerativeModel):
 
         gated_features = self.compress_and_gate(raw_features, gate)
         
-        dirichlet_out = {
-            "features": gated_features,
-            "frequencies": omega,
-            "gated_weights": gate,
-            "predicted_lengthscale": ls_pred,
-            "learned_bandwidth": bw_learned,
-            "z_in": x,
-            "bottleneck": bottleneck,
-            'beta': beta,
-            'pi': pi,
-            'concentration_prior': gamma_conc,
-            'concentration_posterior': local_conc
-        }
-        
-        return dirichlet_out
+        return DirichletOutput(
+            features=gated_features,
+            frequencies=omega,
+            gated_weights=gate,
+            predicted_lengthscale=ls_pred,
+            learned_bandwidth=bw_learned,
+            z_in=x,
+            bottleneck=bottleneck,
+            beta=beta,
+            pi=pi,
+            concentration_prior=gamma_conc,
+            concentration_posterior=local_conc
+        )
+    
+    def log_global_kl(self, log_pv, log_qv):
+        self.update_added_loss_term("global_divergence", LossTerm(log_qv - log_pv))
+    
+    def numerically_stable_gamma(self, gamma_concentration_init):
+        raw = float(gamma_concentration_init)
+        safe = math.log(math.exp(raw) - 1)
+        return safe
     
     def get_omega(self, bw, k_atoms=30, fourier_dim=128, latent_dim=16, **params):
         # Broadcasting: [1, 1, D] + [K, 1, D] + ([K, M, D] * [B, K, 1, D])
@@ -208,12 +246,11 @@ class AmortisedDirichlet(BaseGenerativeModel):
         sigmas = self.h_log_sigma + self.atom_log_sigma 
         log_scale = self.apply_softplus(sigmas) if hasattr(self, 'apply_softplus') else F.softplus(sigmas)
         bw_base = log_scale.exp()
-
-        hyperprior_nll = -sum(prior.log_prob(param).sum() for name, prior, closure, param in self.named_priors())
-        self.update_added_loss_term("likelihood_kernel_hyperprior", SimpleLoss(hyperprior_nll))
-
-        if ls is None and vae_out is not None and 'ls' in vae_out:
-            ls = vae_out['ls']
+        hyperprior_nll = 0.0
+        for name, module, prior, closure, _ in self.named_priors():
+            hyperprior_nll += prior.log_prob(closure(module)).sum()
+        hyperprior_nll = -hyperprior_nll
+        self.update_added_loss_term("likelihood_kernel_hyperprior", LossTerm(hyperprior_nll))
 
         if ls is None:
             ls_pred = bw_base.squeeze(1).mean(dim=-1).unsqueeze(0) 
@@ -248,7 +285,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
         dist_post = dist.Dirichlet(post_conc)
         pi_posterior = dist_post.rsample()
         local_divergence = torch.distributions.kl_divergence(dist_post, dist_prior)
-        self.update_added_loss_term("local_divergence", SimpleLoss(local_divergence.sum()))
+        self.update_added_loss_term("local_divergence", LossTerm(local_divergence.sum()))
         
         return pi_posterior
     

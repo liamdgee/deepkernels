@@ -148,6 +148,7 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         mu = params.get('alpha_mu', None)
         factor = params.get("factor_alpha", None)
         diag = params.get("diag_alpha", None)
+        ls = params.get("ls", None)
         jitter=1e-6
         
         if vae_out:
@@ -206,6 +207,8 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
             "logvar_z": logvar_z,
         }
         
+        if ls is not None:
+            encoder_out['ls'] = ls
 
         return encoder_out
     

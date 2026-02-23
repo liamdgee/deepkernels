@@ -36,7 +36,6 @@ class KernelNetwork(BaseGenerativeModel):
         
         self.linear = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out))
         self.linear_scale = nn.Parameter(torch.tensor(0.1))
-        
         self.periodic = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out))
         self.rbf = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out))
         self.rational = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out))
@@ -78,7 +77,7 @@ class KernelNetwork(BaseGenerativeModel):
 
         self.init_weights_nkn()
     
-    def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only=False, **params):
+    def forward(self, x, vae_out=None, steps=None, batch_shape=torch.Size([]), features_only=False, **params):
         """
         inputs the latent bottleneck dim (64)
         """

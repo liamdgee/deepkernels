@@ -128,14 +128,6 @@ class BaseGenerativeModel(gpytorch.Module):
     def get_resource(self, name_string, **params):
         return getattr(self, name_string, None)
     
-    def numerically_stable_gamma(self, gamma_concentration_init):
-        raw = float(gamma_concentration_init)
-        safe = math.log(math.exp(raw) - 1)
-        return safe
-        
-    def log_global_kl(self, log_pv, log_qv):
-        self.update_added_loss_term("global_divergence", SimpleLoss(log_qv - log_pv))
-    
     @staticmethod
     def init_inducing_with_omega(
         omega: torch.Tensor, 
