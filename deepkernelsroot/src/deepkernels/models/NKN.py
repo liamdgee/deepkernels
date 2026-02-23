@@ -12,9 +12,9 @@ class KernelNetwork(BaseGenerativeModel):
     def __init__(self, 
                  bottleneck_dim=64, 
                  num_latents=8, 
-                 spectral_emb_dim=2048, 
-                 gate_dim=16,
-                 loop_dim=30,
+                 spectral_emb_dim=2048,
+                 gp_dim=1,
+                 spectral_micro_mixtures=4,
                  gp_head: Optional[gpytorch.models.ApproximateGP]=None, 
                  inducing: Optional[torch.Tensor]=None):
         super().__init__()
@@ -49,26 +49,32 @@ class KernelNetwork(BaseGenerativeModel):
             nn.Linear(self.products_total_dim, self.compression_dim) #-384 -> 128
         )
 
-        self.latent_kernel_heads = nn.ModuleList([
-            torch.nn.utils.spectral_norm(
-                nn.Linear(self.head_input_dim, self.individual_kernel_dim_out)
-            ) 
-            for _ in range(num_latents)
-        ])
-
         self.spectral_feedback_loop = nn.Sequential(
             torch.nn.utils.spectral_norm(
                 nn.Linear(self.head_input_dim, spectral_emb_dim)),
                 nn.Sigmoid()
         )
 
-        self.gates = nn.Sequential(
+        self.gate_head = nn.Sequential(
             nn.Linear(self.head_input_dim, 128),
             nn.LayerNorm(128),
             nn.Tanh(),
             nn.Linear(128, 16),
             nn.Softplus()                   
         )
+
+        #- KeOps Parameter Generator Heads-#
+        #- first 4 params are primitive kernel params, last 3 are specific spectral mixture params-#
+        #- gp_dim determines if you use Isotropic (gp_dim=1) or ARD (gp_dim=Input_Dim) for spectral lengthscales
+        self.param_heads = nn.ModuleDict({
+            'ls_rbf': nn.Linear(self.head_input_dim, gp_dim),
+            'ls_per': nn.Linear(self.head_input_dim, gp_dim),
+            'p_per':  nn.Linear(self.head_input_dim, gp_dim),
+            'ls_mat': nn.Linear(self.head_input_dim, gp_dim),
+            'w_sm':   nn.Linear(self.head_input_dim, spectral_micro_mixtures),
+            'mu_sm':  nn.Linear(self.head_input_dim, spectral_micro_mixtures),
+            'v_sm':   nn.Linear(self.head_input_dim, spectral_micro_mixtures),
+        })
 
         self.init_weights_nkn()
     
@@ -87,13 +93,11 @@ class KernelNetwork(BaseGenerativeModel):
         if features_only:
             return features_large
         
-        covariances = self.get_cov_matrices(kernel_features)
-        gates = self.gates(kernel_features)
+        gp_params = self.get_keops_gp_params(kernel_features)
 
         return {
-            'features_large': features_large, 
-            'features_small': covariances,
-            'gates_for_kernel': gates
+            'features_large': features_large, #- for dirichlet amortised hypternet-#
+            'gp_params': gp_params            #-for keops hybrid kernel-#
         }
 
     
@@ -106,8 +110,47 @@ class KernelNetwork(BaseGenerativeModel):
         nn.init.orthogonal_(self.rational.weight, gain=1.41)
         nn.init.orthogonal_(self.complex_interactions.weight, gain=1.41)
 
-        for module in self.latent_kernel_heads.modules():
+        for head in self.param_heads.values():
+            if isinstance(head, nn.Linear):
+                nn.init.orthogonal_(head.weight, gain=1.0)
+                nn.init.zeros_(head.bias)
+                
+        for module in self.gate_head.modules():
             if isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight, gain=1.41)
+                nn.init.orthogonal_(module.weight, gain=1.0)
+    
+    def compute_primitives(self, x):
+        lin = self.linear(x) * self.linear_scale
+        per = torch.cos(self.periodic(x))
+        rbf = torch.exp(-torch.pow(self.rbf(x), 2))
+        rat = 1.0 / (1.0 + torch.pow(self.rational(x), 2))
+        return lin, per, rbf, rat
+    
+    def get_keops_gp_params(self, kernel_features):
+        gates = self.gate_head(kernel_features)
+        gates = gates.view(gates.size(0), 1, 1, -1)
+        gp_params = {'gates': gates}
+        for name, head in self.param_heads.items():
+            raw_val = head(kernel_features)
+            val = F.softplus(raw_val) + 2e-4
+            gp_params[name] = val.view(val.size(0), 1, 1, -1)
+        return gp_params
+    
+    def compute_kernel_interactions(self, lin, per, rbf, rat):
+        "input stack: [B, 4, 32]"
+        stack = torch.stack([lin, per, rbf, rat], dim=1)
+        mask = torch.sigmoid(self.selection_weights).unsqueeze(-1)
+        stack_safe = torch.abs(stack) + 1e-6
+        log_stack = torch.log(stack_safe)
+        
+        #- b p d (batch, primitives, dim), k p   (products, primitives) -> b k d (batch, products, dim)
+        log_product = torch.einsum('bpd, kp -> bkd', log_stack, mask.squeeze(-1))
+
+        product_features = torch.exp(log_product) #-[B, 12, 32]
+        interactions_matrix = product_features.flatten(start_dim=1) #-[B, 384]
+        return self.complex_interactions(interactions_matrix) #-[B, products, 128]
+    
+    def feed_dirichlet_gate(self, kernel_features):
+        return self.spectral_feedback_loop(kernel_features)
 
     

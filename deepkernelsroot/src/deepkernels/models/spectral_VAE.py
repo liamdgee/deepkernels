@@ -28,6 +28,35 @@ class SpectralVAE(nn.Module):
         self.decoder = SpectralDecoder()
         self.encoder = RecurrentEncoder()
         self.eps = 1e-4
+    
+    def dirichlet_sample(self, alpha):
+        alpha = F.softplus(alpha)
+        alpha = torch.clamp(alpha, min=4e-2)
+        q_alpha= torch.distributions.Dirichlet(alpha)
+        pi_sample = q_alpha.rsample()
+        return pi_sample
+    
+
+    def refinement_loop(self, x, vae_out=None, steps=3, batch_shape=torch.Size([]), **params):
+        pi_current = params.get("pi_current", None)
+        features_current = params.get("features_currnt", None)
+        alpha_current = params.get("alpha_current", None)
+        for _ in range(steps):
+            encoder_out = self.encoder(x, pi=pi_current, spectral_features=features_current)
+            alpha, mu_alpha, factor_alpha, diag_alpha, pi, z, mu_z, logvar_z = 
+            if alpha.dim() > 2:
+                alpha = alpha.squeeze(-1)
+            
+            pi_refined = self.dirichlet_sample(alpha)
+
+            
+            dirichlet_out = self.dirichlet(z, alpha=alpha, ls=ls, features_only=True)
+
+            post_z_std = torch.exp(0.5 * logvar_z)
+            post_z_eps = torch.randn_like(post_z_std)
+            post_z = mu_z + post_z_eps * post_z_std #-reparameterisation trick-#
+            
+        recon_step = self.decoder(features_current)
 
     def forward(self, x, steps=3, pi=None, spectral_features=None):
         """
@@ -46,7 +75,7 @@ class SpectralVAE(nn.Module):
 
         #-refinement loop-#
         for step in range(steps):
-            z, alpha, ls, mu, logvar = self.encoder(x, pi=pi_current, spectral_features=features_current)
+            alpha_params, latent_params = self.encoder(x, pi=pi_current, spectral_features=features_current)
             if alpha.dim() > 2:
                 alpha = alpha.squeeze(-1)
             alpha = torch.clamp(alpha, min=1e-3, max=100.0)
@@ -91,7 +120,6 @@ class SpectralVAE(nn.Module):
         n_steps = len(recons)
         total_recon_loss = 0.0
         total_latent_kl = 0.0
-        total_dir_kl = 0.0
 
         device = y_target.device
         latent_dim = 16

@@ -42,7 +42,7 @@ class DeepKernel(Kernel):
     def __init__(self, 
                  input_dim=2048, 
                  k_atoms=30, 
-                 num_latents=6,
+                 num_latents=8,
                  latent_dim=16, 
                  num_rff=128, 
                  data_dim=30, 
@@ -59,18 +59,27 @@ class DeepKernel(Kernel):
         self.spectral_emb = num_rff * num_latents #-768
 
         # ==========================================
-        # Neural Network Architecture
+        # 1. The Omega Bank (Frequencies per cluster)
         # ==========================================
-
-        self.mixer = nn.Sequential(
-            torch.nn.utils.spectral_norm(nn.Linear(self.input_dim, self.spectral_emb)),
-            nn.SiLU(),
-            nn.LayerNorm(self.spectral_emb)
+        # Shape: [k_atoms, input_dim, num_rff]
+        self.register_parameter(
+            name="raw_omega", 
+            parameter=nn.Parameter(torch.randn(k_atoms, input_dim, num_rff))
+        )
+        
+        # Optional: Biases for the phase shift
+        self.register_parameter(
+            name="phase_bias", 
+            parameter=nn.Parameter(torch.rand(k_atoms, 1, num_rff) * 2 * math.pi)
         )
 
+        # ==========================================
+        # 2. The Multi-Latent Heads
+        # ==========================================
+        # Maps the dynamic RFF features to the multi-latent GP outputs
         self.heads = nn.ModuleList([
             torch.nn.utils.spectral_norm(
-                nn.Linear(self.spectral_emb, self.output_dim_per_latent) #-dim 128 for each latent gp-#
+                nn.Linear(self.output_dim_per_latent, self.output_dim_per_latent) 
             ) 
             for _ in range(self.num_latents)
         ])
@@ -81,8 +90,6 @@ class DeepKernel(Kernel):
         )
         self.register_constraint("raw_outputscale", gpytorch.constraints.Positive())
         
-        # 2. PER-LATENT AMPLITUDE (Renamed for clarity)
-        # We initialize to 0.0 -> Softplus(0.0) approx 0.69 amplitude
         self.register_parameter(
             name="raw_latent_amplitude", 
             parameter=torch.nn.Parameter(torch.zeros(num_latents, 1, 1))
@@ -112,18 +119,36 @@ class DeepKernel(Kernel):
     def _init_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight, gain=1.41)
+                nn.init.orthogonal_(module.weight, gain=1.0)
     
 
     def forward(self, x1, x2, diag=False, last_dim_is_batch=False, **params):
+        pi = params.get("pi", None)
+        if pi is None:
+            pi = torch.full((x1.size(0), self.k_atoms), 1.0/self.k_atoms, device=x1.device)
         #-Get Latent Features: [num_latents, Batch, 256]
-        bw = self.inv_bandwidth
-        x1 = x1 * bw
-        
-        hidden_x1 = self.mixer(x1) #-shared-# [b, 768]
+        dynamic_omega = torch.einsum('bk, kdf -> bdf', pi, self.raw_omega)
+        dynamic_phase = torch.einsum('bk, kof -> bof', pi, self.phase_bias)
 
-        z1_list = [head(hidden_x1) for head in self.heads]
-        z1 = torch.stack(z1_list, dim=0)
+        # ---------------------------------------------------------
+        # 3. True Random Fourier Features (RFF) Projection
+        # ---------------------------------------------------------
+        # Projection: x1 -> [Batch, 1, input_dim] @ [Batch, input_dim, num_rff] -> [Batch, 1, num_rff]
+        proj_x1 = torch.bmm(x1.unsqueeze(1), dynamic_omega) + dynamic_phase
+        proj_x1 = proj_x1.squeeze(1)
+
+        # Apply trigonometric activations to enter the spectral domain
+        rff_x1 = torch.cat([torch.cos(proj_x1), torch.sin(proj_x1)], dim=-1)
+        
+        # Scale by 1/sqrt(num_rff) to maintain variance
+        rff_x1 = rff_x1 / math.sqrt(self.num_rff)
+
+        # ---------------------------------------------------------
+        # 4. Latent Heads & Operators
+        # ---------------------------------------------------------
+        z1_list = [head(rff_x1) for head in self.heads]
+        
+        z1 = torch.stack(z1_list, dim=0) # [num_latents, Batch, 256]
 
         amp = self.latent_amplitude.sqrt()
         z1 = z1 * amp

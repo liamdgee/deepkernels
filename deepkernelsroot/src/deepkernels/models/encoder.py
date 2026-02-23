@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.parametrizations as P
-from pydantic import Field, BaseModel, PositiveInt, PositiveFloat, validator
+from pydantic import Field, BaseModel, PositiveInt, PositiveFloat
 import math
 from typing import Optional, Annotated
 import torch.nn.utils.spectral_norm as sn
@@ -72,125 +72,193 @@ class VAEConfig(BaseModel):
             }
         }
 
-class RecurrentEncoder(nn.Module):
+from deepkernels.losses.simple import SimpleLoss
+from deepkernels.models.parent import BaseGenerativeModel
+
+class ConvolutionalLoopEncoder(BaseGenerativeModel):
+    """
+    Role: Compress to latent space (latent_dim=16)
+    input_features: The number of variables in your time series (e.g., 1 for univariate)
+    bottleneck_dim: The exact dimension your KernelNetwork expects (64)
+    """
     def __init__(self,
                  config: Optional[VAEConfig]=None,
-                 input_dim=30
+                 input_dim=30,
+                 latent_dim=16,
+                 k_atoms=30,
+                 bottleneck_dim=64,
+                 dropout=0.05
         ):
         super().__init__()
         self.config = config or VAEConfig()
         
         self.input_dim = input_dim
-        
-        hidden_dims = [128, 64, 32]
-        self.hidden_dims = hidden_dims
-    
-        self.latent_dim = 16
-        self.k_atoms = 30
+        self.spectral_input_dim=2048
+        self.latent_dim = latent_dim
+        self.k_atoms = k_atoms
         self.M = 128
         self.jitter = 1e-6
+        self.bottleneck_dim = bottleneck_dim or 64
         self.rank = 3
-        self.dropout = 0.1
-        self.total_features = 900
-        self.spectral_input_dim = 7680 #~7680
-        self.spectral_emb_dim = 128
-        self.spectral_compressor = torch.nn.utils.spectral_norm(nn.Linear(self.spectral_input_dim, self.spectral_emb_dim))
-
-        # --- Deep Encoder Network (x -> h) ---
-        layers = []
-        #-- current_dim = Data(D) + LogPi(K) + SpectralEmbedding(D) -#
-        current_dim = 188 #--188 = 37 + 30 + 121 (spectral emb_dim)
         
-        for hdim in hidden_dims:
-            layers.append(torch.nn.utils.spectral_norm(nn.Linear(current_dim, hdim)))
-            layers.append(nn.BatchNorm1d(hdim))
-            layers.append(nn.SiLU())
-            layers.append(nn.Dropout(self.dropout))
-            current_dim = hdim
-        
-        self.encoder_network = nn.Sequential(*layers)
 
-        # --- Latent Projections (h -> mu, logvar) # 32 -> 16---
-        self.mu_latent_z = nn.Linear(current_dim, self.latent_dim)
-        self.var_latent_z = nn.Linear(current_dim, self.latent_dim) #-> to latent
-
-        #-kernel reconstruction in real time-#
-        #- we want chol.chol.t() + diag for positive definite kernel outputs
-        self.mu_alpha = nn.Linear(self.latent_dim, self.k_atoms)
-        self.chol_alpha = nn.Linear(self.latent_dim, 90)
-        self.diag_alpha = nn.Linear(self.latent_dim, self.k_atoms) #-diag_alpha is logvar diagonal-#
-        
-        #-kernel lengthscale-#
-        self.ls_head = nn.Linear(self.latent_dim, 30*30)
-
-    def reparameterize(self, mu, logvar):
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            z = mu + eps * std
-            return z
-        return mu
-    
-    def multivariate_projection(self, mu, factor, diag):
-        """for alpha params: input projections from three alpha heads"""
-        mvn = dist.LowRankMultivariateNormal(
-            loc=mu,
-            cov_factor=factor,
-            cov_diag=diag
+        # --- Fusion Layer ---
+        # Concatenates GRU State (64) + Spectral State (64) + Prev Pi (30) -> 158
+        self.fusion_net = nn.Sequential(
+            torch.nn.utils.spectral_norm(nn.Linear(158, 64)),
+            nn.LayerNorm(64),
+            nn.Tanh()
         )
-        logits = mvn.rsample()
-        alpha = F.softplus(logits) + self.jitter
-        
-        return alpha, mvn
 
-    def forward(self, real_x, step=3, pi: Optional[torch.Tensor] = None, spectral_features: Optional[torch.Tensor]=None):
+        #-wide base filter for rough trends-#
+        self.stem = nn.Sequential(
+            nn.Conv1d(input_dim, 32, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.GroupNorm(8, 32),
+            nn.SiLU()
+        )
+        
+        #- Convolutional layers capture sequentially tighter & higher frequencies)
+        self.stage1 = ConvolutionalNetwork1D(32, 64, kernel_size=5, stride=2)
+        self.stage2 = ConvolutionalNetwork1D(64, 128, kernel_size=3, stride=2)
+        self.stage3 = ConvolutionalNetwork1D(128, 256, kernel_size=3, stride=2)
+        
+        #- Global average pooling -- makes bottleneck invariant to the exact sequence length
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+
+        self.fc_mu = nn.Linear(256, bottleneck_dim)
+        self.fc_logvar = nn.Linear(256, bottleneck_dim)
+        
+        self.latent_mu = nn.Linear(bottleneck_dim, latent_dim)
+        self.latent_logvar = nn.Linear(bottleneck_dim, latent_dim)
+    
+    
+    def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         """
         Args:
-            real_x: Input features [Batch, Input_Dim]
-            pi: Dirichlet mixture weights [Batch, K_Atoms]. 
-            spectral_features: [Batch, K * M * 2] --> unflatten with ' .view(B, K, -1). '
+            x: Input features [Batch, 30] or recon_x
+            pi: Dirichlet mixture weights [Batch, 30]. 
+            spectral_bottleneck: [Batch, 64]
         """
         #-for first iter: Handle missing args and scale by 2.1x-#
+        batch_size = x.size(0)
+        device = x.device
+        pi = params.get('pi', None)
+        bottleneck = params.get('bottleneck', None)
+        alpha = params.get("alpha", None)
+        mu = params.get('alpha_mu', None)
+        factor = params.get("factor_alpha", None)
+        diag = params.get("diag_alpha", None)
+        jitter=1e-6
+        
+        if vae_out:
+            recon = vae_out['recon']
+            alpha = vae_out['alpha']
+            if alpha is not None:
+                mu, factor, diag = vae_out['mu_alpha'], vae_out['factor_alpha'], vae_out['diag_alpha']
+            if pi is None:
+                pi = vae_out['pi']
+            if bottleneck is None:
+                bottleneck = vae_out['bottleneck']
 
         if pi is None:
-            pi = torch.full((real_x.size(0), self.k_atoms), 1.0/self.k_atoms, device=real_x.device)
+            pi = torch.full((x.size(0), self.k_atoms), 1.0/self.k_atoms, device=x.device)
             pi = pi + (torch.randn_like(pi) * 0.01)
             pi = F.softmax(pi, dim=-1)
         
-        if spectral_features is None:
-            spectral_features = torch.zeros(
-                real_x.size(0), 
-                self.spectral_input_dim, 
-                device=real_x.device, 
-                dtype=real_x.dtype
+        if bottleneck is None:
+            bottleneck = torch.zeros(
+                x.size(0), 
+                self.bottleneck_dim, 
+                device=x.device, 
+                dtype=x.dtype
             )
-            
-        #-processing steps:-#
-        log_pi = torch.log(pi + self.jitter)
-
-        #-compression of spectral features--tanh activation -> [256, 7680] -> [256, 128]
-        spectral_emb = self.spectral_compressor(spectral_features)
-        spectral_emb = torch.tanh(spectral_emb)
-
-        #-concat [Data, logpi, spectral_emb] [30, 30, 128] i think?
-        weights = torch.cat([real_x, log_pi, spectral_emb], dim=-1)
-
-        #-network forward passes-#
-        h = self.encoder_network(weights)
-        mu = self.mu_latent_z(h)
-        logvar = self.var_latent_z(h)
-        z = self.reparameterize(mu, logvar) #-latent reparameterisation-> [Batch, 16]
         
-        mu_alpha_out = self.mu_alpha(z)
-        chol = self.chol_alpha(z).view(-1, 30, 3)
-        diag = F.softplus(self.diag_alpha(z)) + self.jitter
-
-        #-sample from mvn-#
-        alpha, mvn = self.multivariate_projection(mu_alpha_out, chol, diag)
+        if alpha is None:
+            alpha_mu = torch.zeros(batch_size, self.k_atoms, device=device)
+            alpha_factor = torch.randn(batch_size, self.k_atoms, self.rank, device=device) * 0.1
+            alpha_diag = torch.ones(batch_size, self.k_atoms, device=device)
+            alpha = self.lowrankmultivariatenorm(alpha_mu, alpha_factor, alpha_diag)
         
-        #-Kernel parameters- [256, 30 * 30] -> [256, 30, 30]-#
-        ls = self.ls_head(z)
-        ls = F.softplus(ls) + self.jitter
-        ls = ls.view(-1, 30, 30) #- [B, K, D]
+        mu_data, logvar_data = self.run_convolutional_layers(x)
 
-        return z, alpha, ls, mu, logvar
+        conv_bottleneck = self.reparameterise(mu_data, logvar_data)
+
+        log_pi = torch.log(pi + jitter)
+
+        weights = torch.cat([conv_bottleneck, log_pi, bottleneck], dim=-1) #-dim 158
+
+        post_bottleneck = self.fusion_net(weights)
+        
+        mu_z = self.latent_mu(post_bottleneck)
+        logvar_z = self.latent_logvar(post_bottleneck)
+
+        z = self.reparameterise(mu_z, logvar_z)
+
+        encoder_out = {
+            "alpha": alpha,
+            "mu_alpha": mu,
+            "factor_alpha": factor,
+            "diag_alpha": diag,
+            "log_pi": log_pi,
+            "pi": pi,
+            "z": z,
+            "mu_z": mu_z,
+            "logvar_z": logvar_z,
+        }
+        
+
+        return encoder_out
+    
+    def run_convolutional_layers(self, x):
+        """
+        x: Expected shape [Batch, Seq_Len, Features] (Standard PyTorch sequence format)
+        """
+        if x.dim() == 2:
+            x = x.unsqueeze(1) # [Batch, 1, Features]
+        
+        x = x.transpose(1, 2)
+        
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        
+        x = self.global_pool(x).squeeze(-1)
+        
+        mu = self.fc_mu(x)
+        
+        logvar = torch.clamp(self.fc_logvar(x), min=-10.0, max=4.0)
+        
+        return mu, logvar
+    
+
+class ConvolutionalNetwork1D(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1):
+        super().__init__()
+        # Ensure padding keeps sequence length consistent if stride=1
+        padding = kernel_size // 2 
+        
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding, bias=False)
+        self.norm1 = nn.GroupNorm(num_groups=8, num_channels=out_channels)
+        self.act1 = nn.SiLU()
+        
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, 1, padding, bias=False)
+        self.norm2 = nn.GroupNorm(num_groups=8, num_channels=out_channels)
+        self.act2 = nn.SiLU()
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.GroupNorm(num_groups=8, num_channels=out_channels)
+            )
+    def forward(self, x):
+        residual = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.act1(out)
+        out = self.conv2(out)
+        out = self.norm2(out)
+        out += residual
+        out = self.act2(out)
+        return out

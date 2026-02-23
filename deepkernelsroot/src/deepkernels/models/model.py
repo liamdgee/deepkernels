@@ -28,6 +28,7 @@ from gpytorch.distributions import MultitaskMultivariateNormal, MultivariateNorm
 from gpytorch.models import ApproximateGP
 
 from deepkernels.losses import kl
+from deepkernels.models.parent import BaseGenerativeModel
 
 
 class GenerativeKernelProcess(ApproximateGP):

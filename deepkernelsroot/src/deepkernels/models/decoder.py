@@ -123,7 +123,6 @@ class SpectralDecoder(BaseGenerativeModel):
             'mu_alpha': mu,
             'factor_alpha': factor,
             'diag_alpha': diag,
-            'recon': recon,
             "mixture_means_per_expert": mixture_means,
             "parameters_per_expert": variational_parameters,
             "recon": recon,
@@ -133,7 +132,6 @@ class SpectralDecoder(BaseGenerativeModel):
             "trend": trend,
             "res": residuals,
             "ls": ls_sample,
-            "bw_mod": bandwidth_mod
         }
         
         return vae_out
@@ -198,20 +196,13 @@ class SpectralDecoder(BaseGenerativeModel):
         kl = kl_divergence(q_dist, p_dist)
         self.update_added_loss_term("alpha_kl", SimpleLoss(kl))
         return self
-    
-    def dirichlet_sample(self, alpha):
-        alpha = torch.clamp(alpha, min=1e-3)
-        q_alpha= torch.distributions.Dirichlet(alpha)
-        pi_sample = q_alpha.rsample()
-        return pi_sample
-    
 
     def predict_lengthscale_and_log_kl(self, bottleneck, eps=1e-4):
         """
         Computes the posterior over lengthscales, applies the reparameterisation trick, 
         and logs the KL divergence against a Log-Normal prior.
         """
-        mu = self.lengthscale_mu(bottleneck)
+        mu = self.lengthscale_mu(bottleneck) #-> shape k_atoms
         #- no softplus for sds!-#
         sigma = torch.exp(0.5 * self.lengthscale_logvar(bottleneck)) + eps
         

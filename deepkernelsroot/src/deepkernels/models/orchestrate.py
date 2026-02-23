@@ -31,8 +31,11 @@ from gpytorch.models import ApproximateGP
 from gpytorch.mlls import AddedLossTerm
 from torch.distributions import kl_divergence
 
+from gpytorch.priors import HorseshoePrior, HalfCauchyPrior
+from deepkernels.models.parent import BaseGenerativeModel
 
-class GenerativeModel(gpytorch.Module):
+
+class GenerativeModel(BaseGenerativeModel):
     def __init__(self,
                  train_loader,
                  train_x,
@@ -53,6 +56,7 @@ class GenerativeModel(gpytorch.Module):
                  num_inducing: int=1024,
                  feature_dim: int=2048
     ):
+        super().__init__()
         
         batch_x, batch_y = next(iter(train_loader))
 
@@ -62,87 +66,23 @@ class GenerativeModel(gpytorch.Module):
             num_data=self.num_data
         )
 
-        self.encoder = encoder or RecurrentEncoder()
-        self.dirichlet = dirichlet or AmortisedDirichlet()
-        self.vae = vae or SpectralVAE()
-        self.decoder = decoder or SpectralDecoder()
-        self.kernel = kernel or DeepKernel()
-
+        self.encoder = RecurrentEncoder()
+        self.dirichlet = AmortisedDirichlet()
+        self.vae = SpectralVAE()
+        self.decoder = SpectralDecoder()
+        self.kernel = DeepKernel()
 
         super().__init__()
         
         inducing_points = self.init_inducing_with_fft(train_y, num_inducing, feature_dim)
 
-        self.gp = gp or GenerativeKernelProcess(inducing_points=inducing_points)
+        self.model = GenerativeKernelProcess(inducing_points=inducing_points)
 
-        # 3. INIT THE LIKELIHOOD
         self.likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(
             num_tasks=num_latents
         )
 
-        # 4. MOVE TO GPU (Orchestrator handles hardware)
         if torch.cuda.is_available():
             self.model = self.model.cuda()
             self.likelihood = self.likelihood.cuda()
-
-
-    @staticmethod
-    def init_inducing_with_fft(
-        y_target, 
-        n_inducing, 
-        feature_dim
-    ):
-        """
-        Initializes inducing point values based on the FFT of the target signal.
         
-        Args:
-            y_target: [N_data] tensor of training targets used for initialization (Assuming somewhat evenly spaced or interpolated)
-            n_inducing: Number of inducing points (must match model)
-            M: Number of RFF components (M from dirichlet or encoder -- these will match)
-            feature_dim: K clusters (30) * M fourier features (128) * 2 = 7680
-        """
-        #-fast fourier transform of target variable y-#
-        if y_target is None:
-            return torch.randn(n_inducing, feature_dim) / math.sqrt(feature_dim)
-        
-        yflat = y_target.flatten().cpu()
-        if yflat.abs().sum() < 1e-6:
-             return torch.randn(n_inducing, feature_dim) / math.sqrt(feature_dim)
-        
-        fourier_vals = torch.fft.rfft(yflat)
-        jitter = 1e-6
-        eps = 1e-9
-        
-        #-Construct a Probability Distribution from FFT magnitudes to sample weights from-#
-        density = torch.abs(fourier_vals)
-        if density.shape[0] > 0:
-            density[0] = 0 #-remove DC component-#
-        
-        cdf = density.sum()
-        if cdf < eps:
-             return torch.randn(n_inducing, feature_dim) / math.sqrt(feature_dim)
-        
-        p = density / cdf
-        
-        # 3. Sample- generate probabilistic indices in feature space-#
-        indices = torch.multinomial(p, feature_dim, replacement=True)
-        
-        # Retrieve the actual magnitudes for those sampled indices
-        samples = density[indices]
-        
-        #-random signs for uniformity-#
-        binary_mask = torch.bernoulli(torch.full((feature_dim,), 0.5))
-        plus_or_minus_one = 2 * binary_mask - 1
-        
-        sigma_y = y_target.std() + jitter
-        sigma_samples = samples.std() + jitter
-
-        sqrt_feature_dim_scale = sigma_y / (sigma_samples * math.sqrt(feature_dim))
-        weights_flat = samples * plus_or_minus_one * sqrt_feature_dim_scale
-
-        #-expand to inducing-#
-        inducing = weights_flat.unsqueeze(0).repeat(n_inducing, 1)
-        inducing_jitter = torch.randn_like(inducing) * (sqrt_feature_dim_scale * sigma_samples * 0.13)
-        inducing = inducing + inducing_jitter
-        
-        return inducing

@@ -41,3 +41,8 @@ data/
 deepkernels/unused/
 .DS_Store
 Thumbs.db
+
+.vscode
+.vscode/*
+*.vscode
+.DS_Store

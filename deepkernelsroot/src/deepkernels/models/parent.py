@@ -27,13 +27,6 @@ class BaseGenerativeModel(gpytorch.Module):
         self.register_constraint(name, constraint)
         return self
     
-    def register_priors_for_dirichlet(self):
-        if hasattr(self, "gamma"):
-            self.register_prior("gamma_prior", GammaPrior(2.5, 1.0), lambda m: F.softplus(m.gamma), lambda m, v: None)
-        
-        if hasattr(self, "raw_logits"):
-            self.register_prior("logit_prior", NormalPrior(loc=0.0, scale=1.0),lambda m: F.softplus(m.raw_logits))
-    
     
     def register_kernel_priors(self):
         if hasattr(self, "covar_module"):
@@ -48,6 +41,12 @@ class BaseGenerativeModel(gpytorch.Module):
              raise RuntimeError(f"Loss term '{name}' not registered in Base __init__")
         scalar_loss = value.sum() if value.dim() > 0 else value
         self.update_added_loss_term(name, SimpleLoss(scalar_loss))
+    
+    def sample_logistic_normal(self, mu, logvar):
+        z = self.reparameterise(mu, logvar)
+        pi = F.softmax(z, dim=-1)
+        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+        self.update_added_loss_term("logistic_kl", SimpleLoss(kl.mean()))
 
     
     def reparameterise(self, mu, logvar):
@@ -73,6 +72,14 @@ class BaseGenerativeModel(gpytorch.Module):
         alpha = torch.nn.functional.softplus(logits) + jitter
         
         return alpha
+    
+    def dirichlet_sample(self, alpha):
+        alpha = F.softplus(alpha)
+        alpha = torch.clamp(alpha, min=2e-4)
+        q_alpha= torch.distributions.Dirichlet(alpha)
+        pi_sample = q_alpha.rsample()
+        return pi_sample
+    
 
     def get_device(self, device_request: Union[str, torch.device, None] = None) -> torch.device:
 
@@ -113,8 +120,7 @@ class BaseGenerativeModel(gpytorch.Module):
         return logits # Return logits, softplus them later
     
     def apply_softplus(self, x, jitter=1e-6):
-        return torch.nn.functional.softplus(x) + jitter
-    
+        return F.softplus(x) + jitter
     
     def stack_features(self, latent_kernels):
         return torch.stack(latent_kernels)
@@ -129,29 +135,6 @@ class BaseGenerativeModel(gpytorch.Module):
         
     def log_global_kl(self, log_pv, log_qv):
         self.update_added_loss_term("global_divergence", SimpleLoss(log_qv - log_pv))
-    
-    def dirichlet_posterior_inference_and_log_local_loss(self, x, gamma_conc, beta, local_conc, eps=1e-3):
-        prior_conc = (gamma_conc * beta) + eps
-        prior_conc = torch.clamp(prior_conc, min=eps)
-        prior_conc = prior_conc.unsqueeze(0).expand(x.size(0), -1)
-
-        post_conc = prior_conc + local_conc
-        post_conc = torch.clamp(post_conc, min=eps)
-
-        dist_prior = dist.Dirichlet(prior_conc)
-        dist_post = dist.Dirichlet(post_conc)
-
-        pi_posterior = dist_post.rsample()
-        local_divergence = torch.distributions.kl_divergence(dist_post, dist_prior)
-        self.update_added_loss_term("local_divergence", SimpleLoss(local_divergence.sum()))
-        
-        return pi_posterior
-    
-    def get_local_evidence(self, mualpha, factoralpha, diagalpha):
-        alpha_logits = self.lowrankmultivariatenorm(mualpha, factoralpha, diagalpha)
-        local_conc = self.apply_softplus(alpha_logits)
-        return local_conc
-    
     
     @staticmethod
     def init_inducing_with_omega(
@@ -259,3 +242,16 @@ class BaseGenerativeModel(gpytorch.Module):
         inducing_jitter = torch.randn_like(inducing) * (sqrt_feature_dim_scale * sigma_samples * 0.13)
         inducing = inducing + inducing_jitter
         return inducing
+
+
+    def create_sequences(flat_data, seq_len):
+        """
+        flat_data shape: [Total_Timesteps, Features] (e.g., [1000, 30])
+        Returns shape: [Total_Samples, seq_len, Features]
+        """
+        
+        sequences = flat_data.unfold(0, seq_len, 1)
+        
+        sequences = sequences.transpose(1, 2)
+        
+        return sequences

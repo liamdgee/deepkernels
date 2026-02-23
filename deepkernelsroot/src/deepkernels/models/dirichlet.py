@@ -5,6 +5,8 @@ from torch.distributions import Normal, Dirichlet
 from torch.distributions.transforms import StickBreakingTransform
 import math
 import logging
+import gpytorch
+from gpytorch.priors import NormalPrior, GammaPrior
 from typing import Optional
 
 from deepkernels.models.parent import BaseGenerativeModel
@@ -61,16 +63,37 @@ class AmortisedDirichlet(BaseGenerativeModel):
         self.q_log_sigma_global = nn.Parameter(torch.ones(k_atoms - 1) * -4.0)
         self.h_mu = nn.Parameter(torch.zeros(1, 1, latent_dim)) 
         self.h_log_sigma = nn.Parameter(torch.tensor(3.0))
-        self.atom_log_sigma = nn.Parameter(torch.randn(k_atoms, 1, latent_dim) * 0.01)
-        self.atom_mu = nn.Parameter(torch.randn(k_atoms, 1, latent_dim) * 2 * math.sqrt(0.01))
+        self.atom_log_sigma = nn.Parameter(torch.randn(k_atoms, 1, latent_dim) * 0.025)
+        self.atom_mu = nn.Parameter(torch.randn(k_atoms, 1, latent_dim) * 2 * math.sqrt(0.025))
+        self.raw_gamma = nn.Parameter(torch.tensor((self.numerically_stable_gamma(gamma_concentration_init))))
+
+        #-priors-#
+        self.register_prior(
+            "h_scale_prior", 
+            NormalPrior(loc=3.0, scale=1.0), 
+            lambda m: m.h_log_sigma, 
+            lambda m, v: None
+        )
+
+        self.register_prior(
+            "atom_log_sigma_prior",
+            NormalPrior(loc=0.0, scale=0.025),
+            lambda m: m.atom_log_sigma,
+            lambda m, v: None
+        )
+
+        self.register_prior(
+            "gamma_prior", 
+            GammaPrior(concentration=1.5, rate=0.5), 
+            lambda m: F.softplus(m.raw_gamma),
+            lambda m, v: None
+        )
 
         #-buffers-#
         self.register_buffer("noise_weights", torch.randn(k_atoms, fourier_dim, latent_dim))
         self.register_buffer("noise_bias", torch.rand(k_atoms, fourier_dim))
-
-        safe = self.numerically_stable_gamma(gamma_concentration_init)
         
-        self.raw_gamma = nn.Parameter(torch.tensor(safe))
+        
 
     def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         """
@@ -79,13 +102,10 @@ class AmortisedDirichlet(BaseGenerativeModel):
         Args:
             latent z (param: x) -- dim 16
         """
-
-        _, mualpha, cholalpha, diagalpha, _ = vae_out['alpha_params']
-        z, _, _ = vae_out['latent_params']
+        
+        pi = vae_out['pi']
+        mualpha, factoralpha, diagalpha = vae_out['mu_alpha'], vae_out['factor_alpha'], vae_out['diag_alpha']
         ls = params.get('ls', None)
-
-        if z is not None:
-            x = z
 
         beta, log_pv, log_qv, gamma_conc = self.global_stick_breaking()
 
@@ -93,7 +113,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
     
         bottleneck, gate = self.run_neural_nets_dirichlet(x)
         
-        local_conc = self.get_local_evidence(mualpha, cholalpha, diagalpha)
+        local_conc = self.get_local_evidence(mualpha, factoralpha, diagalpha)
 
         pi = self.dirichlet_posterior_inference_and_log_local_loss(x, gamma_conc, beta, local_conc)
         
@@ -105,41 +125,31 @@ class AmortisedDirichlet(BaseGenerativeModel):
 
         gated_features = self.compress_and_gate(raw_features, gate)
         
-        spectral_features = {
+        dirichlet_out = {
             "features": gated_features,
             "frequencies": omega,
-            "gated_weights": gate
-        }
-
-        lengthscale_features = {
+            "gated_weights": gate,
             "predicted_lengthscale": ls_pred,
             "learned_bandwidth": bw_learned,
-        }
-        latent_features = {
-            "z": x,
+            "z_in": x,
             "bottleneck": bottleneck,
-        }
-
-        probabilistic_features = {
             'beta': beta,
             'pi': pi,
             'concentration_prior': gamma_conc,
             'concentration_posterior': local_conc
         }
-        if features_only:
-            return bottleneck, pi, omega, gated_features
         
-        return spectral_features, lengthscale_features, latent_features, probabilistic_features
+        return dirichlet_out
     
     def get_omega(self, bw, k_atoms=30, fourier_dim=128, latent_dim=16, **params):
         # Broadcasting: [1, 1, D] + [K, 1, D] + ([K, M, D] * [B, K, 1, D])
-        noise_weights = params.get("noise_weights", getattr(self, "noise_weights", torch.randn(k_atoms, fourier_dim, latent_dim)))
+        noise_weights = self.noise_weights
         omega = self.h_mu + self.atom_mu + noise_weights.unsqueeze(0) * bw
         return torch.clamp(omega, -100.0, 100.0)
     
     def random_fourier_features(self, z, omega, pi, k_atoms=30, M=128, latent_dim=16, **params):
         """inputs latent dim z"""
-        noise_bias = params.get("noise_bias", getattr(self, "noise_bias", torch.rand(k_atoms, M)))
+        noise_bias = self.noise_bias
         B, D = z.shape
         if pi is None:
             pi = torch.full((B, k_atoms), 1.0/k_atoms, device=z.device)
@@ -166,25 +176,17 @@ class AmortisedDirichlet(BaseGenerativeModel):
         return feats.flatten(1)
     
     def global_stick_breaking(self, k_atoms=30, **params):
-        device = next(self.parameters()).device if list(self.parameters()) else torch.device('cpu')
-        q_sig_fallback = torch.ones(k_atoms - 1, device=device) * -4.0
-        q_mu_fallback = torch.zeros(k_atoms - 1, device=device)
-        q_sig_global = params.get("q_sig_global", getattr(self, "q_sig_global", q_sig_fallback))
-        q_mu_global = params.get("q_mu_global", getattr(self, "q_mu_global", q_mu_fallback))
-        safe = self.numerically_stable_gamma(2.5)
-        raw_gamma_fallback = torch.tensor(safe, device=device)
-        raw_gamma = params.get("raw_gamma", getattr(self, "raw_gamma",raw_gamma_fallback))
-        
         #-variational inference-#
-        q_sig_global = self.apply_softplus(q_sig_global)
-        q_dist_global = torch.distributions.Normal(q_mu_global, q_sig_global)
+        q_sig_global = self.apply_softplus(self.q_log_sigma_global)
+        q_dist_global = torch.distributions.Normal(self.q_mu_global, q_sig_global)
         qz_global = q_dist_global.rsample()
+
         #-jacobian // entropy-#
         log_detj = -F.softplus(-qz_global) - F.softplus(qz_global)
         log_qv = q_dist_global.log_prob(qz_global).sum() - log_detj.sum()
         
         #-prior log likelihood-#
-        gamma_conc = self.apply_softplus(raw_gamma)
+        gamma_conc = self.apply_softplus(self.raw_gamma)
         log_pv = (torch.log(gamma_conc + 1e-3) + (gamma_conc - 1) * (-F.softplus(qz_global))).sum()
         
         #-stick breaking logic-#
@@ -201,42 +203,40 @@ class AmortisedDirichlet(BaseGenerativeModel):
         
         return beta, log_pv, log_qv, gamma_conc
     
-    def predict_kernel_lengthscale_and_log_mse_loss(self, ls, vae_out: Optional[dict]=None, eps=1e-3, k_atoms=30, latent_dim=16, **params):
-        device = next(self.parameters()).device if list(self.parameters()) else torch.device('cpu')
-        h_log_sigma_fallback = torch.tensor(3.0, device=device)
-        h_log_sigma = params.get("h_log_sigma", getattr(self, "h_log_sigma", h_log_sigma_fallback))
-        atom_log_sigma_fallback = torch.randn(k_atoms, 1, latent_dim, device=device) * 0.01
-        atom_log_sigma = params.get("atom_log_sigma", getattr(self, "atom_log_sigma", atom_log_sigma_fallback))
-        if ls is None:
-            if vae_out is not None and 'ls_params' in vae_out:
-                ls = vae_out['ls_params'].get('ls')
-            if ls is None:
-                ls = self.apply_softplus(h_log_sigma + atom_log_sigma)
-
-        ls_pred = torch.clamp(ls, min=eps, max=50.0)
-        log_ls = torch.log(ls_pred) 
-        log_target = torch.zeros_like(log_ls)
-        ls_mse = F.mse_loss(log_ls, log_target)
-        self.update_added_loss_term("lengthscale_prior_reg", SimpleLoss(ls_mse))
-
-        sigmas = h_log_sigma + atom_log_sigma
-        log_scale = self.apply_softplus(sigmas)
-        bw_base = log_scale.exp()
-        precision = 1.0 / (ls_pred.unsqueeze(2) + eps)
-        bw_learned = bw_base.unsqueeze(0) * precision
+    def predict_kernel_lengthscale_and_log_mse_loss(self, ls, vae_out: Optional[dict]=None, eps=1e-3, max_ls=100.0, k_atoms=30, latent_dim=16, **params):
         
+        sigmas = self.h_log_sigma + self.atom_log_sigma 
+        log_scale = self.apply_softplus(sigmas) if hasattr(self, 'apply_softplus') else F.softplus(sigmas)
+        bw_base = log_scale.exp()
+
+        hyperprior_nll = -sum(prior.log_prob(param).sum() for name, prior, closure, param in self.named_priors())
+        self.update_added_loss_term("likelihood_kernel_hyperprior", SimpleLoss(hyperprior_nll))
+
+        if ls is None and vae_out is not None and 'ls' in vae_out:
+            ls = vae_out['ls']
+
+        if ls is None:
+            ls_pred = bw_base.squeeze(1).mean(dim=-1).unsqueeze(0) 
+            ls_pred = torch.clamp(ls_pred, min=eps, max=max_ls)
+            bw_learned = bw_base.unsqueeze(0) 
+        else:
+            ls_pred = torch.clamp(ls, min=eps, max=max_ls)
+            batch_size = ls_pred.size(0)
+            precision = 1.0 / (ls_pred.view(batch_size, k_atoms, 1, 1) + eps)
+            bw_learned = bw_base.unsqueeze(0) * precision 
+
         return ls_pred, bw_learned
     
     def run_neural_nets_dirichlet(self, x):
-        bottleneck_dim = self.bottleneck_mixer(x) #-takes latent z[B,16] -> [B,64]
-        features = self.kernel_network(bottleneck_dim, features_only=True)
-        return bottleneck_dim, features
+        bottleneck = self.bottleneck_mixer(x) #-takes latent z[B,16] -> [B,64]
+        features = self.kernel_network(bottleneck, features_only=True)
+        return bottleneck, features
     
     def compress_and_gate(self, features, gate):
         embedded_features = self.compress_spectral_features_head(features)
         return gate * embedded_features
     
-    def dirichlet_posterior_inference_and_log_local_loss(self, x, gamma_conc, beta, local_conc, eps=1e-3):
+    def dirichlet_posterior_inference_and_log_local_loss(self, x, gamma_conc, beta, local_conc, eps=4e-2):
         prior_conc = (gamma_conc * beta) + eps
         prior_conc = torch.clamp(prior_conc, min=eps)
         prior_conc = prior_conc.unsqueeze(0).expand(x.size(0), -1)
@@ -246,12 +246,16 @@ class AmortisedDirichlet(BaseGenerativeModel):
 
         dist_prior = dist.Dirichlet(prior_conc)
         dist_post = dist.Dirichlet(post_conc)
-
         pi_posterior = dist_post.rsample()
         local_divergence = torch.distributions.kl_divergence(dist_post, dist_prior)
         self.update_added_loss_term("local_divergence", SimpleLoss(local_divergence.sum()))
         
         return pi_posterior
+    
+    def get_local_evidence(self, mualpha, factoralpha, diagalpha):
+        alpha_logits = self.lowrankmultivariatenorm(mualpha, factoralpha, diagalpha)
+        local_conc = self.apply_softplus(alpha_logits)
+        return local_conc
     
     
    

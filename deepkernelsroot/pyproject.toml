@@ -20,7 +20,8 @@ dependencies = [
     "scikit-learn==1.7.2",
     "gpytorch>=1.11",
     "mlflow",
-    "linear-operator"
+    "linear-operator",
+    "pykeops"
 ]
 
 [project.optional-dependencies]
