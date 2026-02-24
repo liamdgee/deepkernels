@@ -1,3 +1,104 @@
+#updated refinement loop for spectral VAE
+#this is not going to run here
+
+class SpectralVAE(BaseGenerativeModel):
+    def __init__(self):
+        super().__init__()
+        self.dirichlet = AmortisedDirichlet()
+        self.decoder = SpectralDecoder()
+        self.encoder = ConvolutionalLoopEncoder()
+        self.eps = 1e-4
+    
+    def refinement_loop(self, x, steps, initial_state=None, generative_mode:bool=False):
+        current_state = initial_state 
+
+        hist_recons, hist_latents, hist_pis = [], [], []
+        hist_expert_mixtures, hist_bottlenecks, hist_expert_params = [], [], []
+        hist_frequencies, hist_trends, hist_bw_mods = [], [], []
+        hist_ls, hist_gate_weights = [], []
+        
+        batch_size, seq_len, features = x.shape
+        
+        # --- THE SEQUENCE LOOP ---
+        for t in range(seq_len):
+            if generative_mode and t > 0:
+                x_t = current_state.recon 
+            else:
+                x_t = x[:, t, :]
+                
+            # --- THE REFINEMENT LOOP ---
+            for _ in range(steps):
+                # FIX 1: Pass x_t instead of x
+                encoder_out = self.encoder(x_t, vae_out=current_state)
+                
+                alpha = encoder_out.alpha
+                if alpha.dim() > 2:
+                    alpha = alpha.squeeze(-1)
+                
+                pi_current = self.dirichlet_sample(alpha)
+                
+                current_ls = encoder_out.ls
+                if current_ls is not None and current_ls.numel() == 0:
+                    current_ls = None
+                
+                dirichlet_out = self.dirichlet(encoder_out.z, pi=pi_current, ls=current_ls)
+                
+                # Check your exact Dirichlet output attribute names here! 
+                # (Assuming they are .predicted_lengthscale and .ls_logvar)
+                pred_ls = getattr(dirichlet_out, 'predicted_lengthscale', None)
+                pred_ls_logvar = getattr(dirichlet_out, 'ls_logvar', None)
+                
+                # FIX 2: Pass the predictive prior to the Decoder
+                decoder_out = self.decoder(
+                    dirichlet_out.features,
+                    ls_pred=pred_ls,
+                    ls_logvar=pred_ls_logvar
+                )
+                
+                current_state = decoder_out
+
+            # FIX 3: Append to history OUTSIDE the refinement loop
+            # Only track the final refined state for timestep t
+            hist_recons.append(decoder_out.recon)
+            hist_pis.append(dirichlet_out.pi)
+            hist_latents.append(encoder_out.z)
+            hist_bottlenecks.append(decoder_out.bottleneck)
+            hist_frequencies.append(dirichlet_out.omega)
+            hist_expert_params.append(decoder_out.parameters_per_expert)
+            hist_expert_mixtures.append(decoder_out.mixture_means_per_expert)
+            hist_trends.append(decoder_out.trend)
+            hist_ls.append(decoder_out.ls)
+            hist_bw_mods.append(decoder_out.bandwidth_mod)
+            hist_gate_weights.append(dirichlet_out.gated_weights)
+        
+        history = HistoryOutput(
+            recons=torch.stack(hist_recons, dim=1),
+            latents=torch.stack(hist_latents, dim=1),
+            pis=torch.stack(hist_pis, dim=1),
+            expert_mixtures=torch.stack(hist_expert_mixtures, dim=1),
+            bottlenecks=torch.stack(hist_bottlenecks, dim=1),
+            expert_params=torch.stack(hist_expert_params, dim=1),
+            frequencies=torch.stack(hist_frequencies, dim=1),
+            trends=torch.stack(hist_trends, dim=1),
+            bw_mods=torch.stack(hist_bw_mods, dim=1),
+            ls=torch.stack(hist_ls, dim=1),
+            gate_weights=torch.stack(hist_gate_weights, dim=1)
+        )
+            
+        return current_state, history
+    
+
+    def forward(self, x, vae_out, steps=1, batch_shape=torch.Size([]), features_only:bool=False, **params):
+        """Args: current state = vae_out"""
+        # Default steps=1 here so it defaults to standard processing unless told to refine
+        current_state, history = self.refinement_loop(x=x, steps=steps, initial_state=vae_out, generative_mode=False)
+        
+        return StateSpaceOutput(
+            current_state=current_state, # Fixed variable name to match NamedTuple definition
+            history=history
+        )
+
+
 # filename: dirichlet_clusters.py
         #-stick breaking logic (Numerically Stable)-#
         qv_global = torch.sigmoid(qz_global)
