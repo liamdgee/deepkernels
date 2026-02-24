@@ -1,13 +1,46 @@
 import torch
 import torch.nn as nn
-import torch.nn.utils.spectral_norm
+from torch.nn.utils import spectral_norm
+
 from deepkernels.models.parent import BaseGenerativeModel
+
 import torch.nn.functional as F
-from deepkernels.losses.simple import SimpleLoss
 import torch.distributions as dist
 
+import gpytorch
 import torch
+
 from torch.distributions import LowRankMultivariateNormal, Independent, Normal, kl_divergence
+
+from typing import NamedTuple
+
+class LossTerm(gpytorch.mlls.AddedLossTerm):
+    """
+    A concrete implementation of an AddedLossTerm that simply 
+    returns a pre-calculated scalar tensor.
+    """
+    def __init__(self, loss_tensor):
+        self.loss_tensor = loss_tensor
+        
+    def loss(self):
+        return self.loss_tensor
+
+class DecoderOutput(NamedTuple):
+    """Structured output for the SpectralDecoder."""
+    bottleneck: torch.Tensor
+    alpha: torch.Tensor
+    alpha_mu: torch.Tensor
+    alpha_factor: torch.Tensor
+    alpha_diag: torch.Tensor
+    mixture_means_per_expert: torch.Tensor
+    parameters_per_expert: torch.Tensor
+    recon: torch.Tensor
+    bandwidth_mod: torch.Tensor
+    pi: torch.Tensor
+    amp: torch.Tensor
+    trend: torch.Tensor
+    res: torch.Tensor
+    ls: torch.Tensor
 
 class SpectralDecoder(BaseGenerativeModel):
     def __init__(self, 
@@ -28,6 +61,7 @@ class SpectralDecoder(BaseGenerativeModel):
         self.num_experts = num_experts
         self.k_atoms = k_atoms
         current_dim = spectral_emb_dim
+        self.latent_dim = latent_dim
         layers = []
         for compression in spectral_compressions:
             layers.append(torch.nn.utils.spectral_norm(nn.Linear(current_dim, compression)))
@@ -36,6 +70,7 @@ class SpectralDecoder(BaseGenerativeModel):
             layers.append(nn.Dropout(dropout))
             current_dim = compression
         
+
         #-current_dim is now 64
         self.compression_network = nn.Sequential(*layers)
 
@@ -76,6 +111,9 @@ class SpectralDecoder(BaseGenerativeModel):
         self.lengthscale_logvar = nn.Linear(bottleneck_dim, k_atoms)
         self.scale_head_per_expert = torch.nn.utils.spectral_norm(nn.Linear(k_atoms, num_experts))
 
+        self.register_added_loss_term("lengthscale_kl")
+        self.register_added_loss_term("alpha_kl")
+
         self._init_weights()
     
     def _init_weights(self):
@@ -89,7 +127,12 @@ class SpectralDecoder(BaseGenerativeModel):
         """
         Args:
             spectral_features: [Batch, K*M*2] OR [Batch, K, M*2] as 'x' (embedded dim = 2048)
+            vae_out: dirichlet_out
         """
+
+        ls_pred_prior = getattr(vae_out, 'ls_pred', None)
+
+        ls_logvar_prior = getattr(vae_out, 'ls_logvar', None)
         
         spectral_bottleneck = self.compression_network(x)
         
@@ -109,7 +152,7 @@ class SpectralDecoder(BaseGenerativeModel):
 
         pi_sample = self.dirichlet_sample(alpha_logits)
         
-        ls_sample = self.predict_lengthscale_and_log_kl(bottleneck)
+        ls_sample = self.predict_lengthscale_and_log_kl(bottleneck, ls_pred_prior, ls_logvar_prior)
 
         bandwidth_mod = torch.sigmoid(self.scale_head_per_expert(ls_sample)) * 2.0
 
@@ -117,22 +160,22 @@ class SpectralDecoder(BaseGenerativeModel):
 
         mixture_means = self.stack_features(mixture_means_per_expert)
 
-        vae_out = {
-            'bottleneck': bottleneck,
-            'alpha':  alpha_logits,
-            'mu_alpha': mu,
-            'factor_alpha': factor,
-            'diag_alpha': diag,
-            "mixture_means_per_expert": mixture_means,
-            "parameters_per_expert": variational_parameters,
-            "recon": recon,
-            "bandwidth_mod": bandwidth_mod,
-            "pi": pi_sample,
-            "amp": amp,
-            "trend": trend,
-            "res": residuals,
-            "ls": ls_sample,
-        }
+        vae_out = DecoderOutput(
+            bottleneck=bottleneck,
+            alpha=alpha_logits,
+            alpha_mu=mu,
+            alpha_factor=factor,
+            alpha_diag=diag,
+            mixture_means_per_expert=mixture_means,
+            parameters_per_expert=variational_parameters,
+            recon=recon,
+            bandwidth_mod=bandwidth_mod,
+            pi=pi_sample,
+            amp=amp,
+            trend=trend,
+            res=residuals,
+            ls=ls_sample
+        )
         
         return vae_out
     
@@ -188,39 +231,43 @@ class SpectralDecoder(BaseGenerativeModel):
             cov_factor=cov_factor,
             cov_diag=cov_diag
         )
-        p_dist = Independent(Normal(
+        
+        p_dist = LowRankMultivariateNormal(
             loc=torch.zeros_like(mu), 
-            scale=torch.ones_like(mu)
-        ), 1)
+            cov_factor=torch.zeros_like(cov_factor),
+            cov_diag=torch.ones_like(cov_diag)
+        )
         
         kl = kl_divergence(q_dist, p_dist)
-        self.update_added_loss_term("alpha_kl", SimpleLoss(kl))
+        self.update_added_loss_term("alpha_kl", LossTerm(kl))
+
         return self
 
-    def predict_lengthscale_and_log_kl(self, bottleneck, eps=1e-4):
+    def predict_lengthscale_and_log_kl(self, bottleneck, ls_pred_prior=None, ls_logvar_prior=None, eps=1e-4):
         """
         Computes the posterior over lengthscales, applies the reparameterisation trick, 
         and logs the KL divergence against a Log-Normal prior.
         """
-        mu = self.lengthscale_mu(bottleneck) #-> shape k_atoms
-        #- no softplus for sds!-#
+        mu = self.lengthscale_mu(bottleneck)
         sigma = torch.exp(0.5 * self.lengthscale_logvar(bottleneck)) + eps
         
         #- Variational Posterior q(log_l | x) -- normal in log space (lognormal)
         q_log_ls = dist.Normal(mu, sigma)
-        
-        #-- The Reparameterisation Trick -- rsample() with eps -tilde (0, 1)
         log_ls_sample = q_log_ls.rsample()
         
-        # 4. Prior p(log_l) -- expect lengthscales are centered around exp(0) = 1.0
-        prior_loc = torch.zeros_like(mu)
-        prior_scale = torch.ones_like(sigma) * 2.5 #-weakly informative-#
+        if ls_pred_prior is not None and ls_logvar_prior is not None:
+            prior_loc = torch.log(ls_pred_prior + eps)
+            prior_scale = torch.exp(0.5 * ls_logvar_prior) + eps
+        else:
+            prior_loc = torch.zeros_like(mu)
+            prior_scale = torch.ones_like(sigma) * 2.5
+        #- Prior p(log_l) -- expect lengthscales are centered around exp(0) = 1.0 -#
         
         p_log_ls = dist.Normal(prior_loc, prior_scale)
         
         kl_div = dist.kl_divergence(q_log_ls, p_log_ls)
         
-        self.update_added_loss_term("lengthscale_kl", SimpleLoss(kl_div.sum()))
+        self.update_added_loss_term("lengthscale_kl", LossTerm(kl_div.sum()))
         
         #-transform to lengthscale space-#
         ls_sample = torch.exp(log_ls_sample)

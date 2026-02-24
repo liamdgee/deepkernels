@@ -75,11 +75,10 @@ class BaseGenerativeModel(gpytorch.Module):
     
     def dirichlet_sample(self, alpha):
         alpha = F.softplus(alpha)
-        alpha = torch.clamp(alpha, min=2e-4)
+        alpha = torch.clamp(alpha, min=4e-2)
         q_alpha= torch.distributions.Dirichlet(alpha)
         pi_sample = q_alpha.rsample()
         return pi_sample
-    
 
     def get_device(self, device_request: Union[str, torch.device, None] = None) -> torch.device:
 

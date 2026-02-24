@@ -2,13 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.parametrizations as P
-from pydantic import Field, BaseModel, PositiveInt, PositiveFloat
 import math
 from typing import Optional, Annotated
 import torch.nn.utils.spectral_norm as sn
-from typing import Tuple, Optional, TypeAlias, Tuple, Union
+from typing import Tuple, Optional, TypeAlias, Tuple, Union, NamedTuple, Optional
 import torch.nn.functional as F
 import torch.distributions as dist
+from pydantic import BaseModel, Field, PositiveInt, PositiveFloat, ConfigDict
 
 class VAEConfig(BaseModel):
     """
@@ -27,7 +27,6 @@ class VAEConfig(BaseModel):
         ge=8, 
         description="Size of the VAE bottleneck (z)"
     )
-    hidden_dim: Union[int, list[int]] = [128, 64, 32]
     
     # --- Mixture & Spectral Params ---
     k_atoms: PositiveInt = Field(
@@ -60,9 +59,9 @@ class VAEConfig(BaseModel):
         description="Numerical stability term for matrix operations"
     )
 
-    class Config:
-        extra = "forbid" 
-        json_schema_extra = {
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
             "example": {
                 "input_dim": 128,
                 "k_atoms": 50,
@@ -71,9 +70,22 @@ class VAEConfig(BaseModel):
                 "beta": 4.0
             }
         }
+    )
 
 from deepkernels.losses.simple import SimpleLoss
 from deepkernels.models.parent import BaseGenerativeModel
+
+class EncoderOutput(NamedTuple):
+    alpha: torch.Tensor
+    alpha_mu: torch.Tensor
+    alpha_factor: torch.Tensor
+    alpha_diag: torch.Tensor
+    log_pi: torch.Tensor
+    pi: torch.Tensor
+    z: torch.Tensor
+    mu_z: torch.Tensor
+    logvar_z: torch.Tensor
+    ls: torch.Tensor
 
 class ConvolutionalLoopEncoder(BaseGenerativeModel):
     """
@@ -142,43 +154,51 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         #-for first iter: Handle missing args and scale by 2.1x-#
         batch_size = x.size(0)
         device = x.device
+        empty_tensor = torch.empty(0, device=device)
+        
         pi = params.get('pi', None)
         bottleneck = params.get('bottleneck', None)
         alpha = params.get("alpha", None)
-        mu = params.get('alpha_mu', None)
-        factor = params.get("factor_alpha", None)
-        diag = params.get("diag_alpha", None)
-        ls = params.get("ls", None)
+        alpha_mu = params.get('alpha_mu', None)
+        alpha_factor = params.get("alpha_factor", None)
+        alpha_diag = params.get("alpha_diag", None)
+        ls = params.get('ls', None)
         jitter=1e-6
-        
-        if vae_out:
-            recon = vae_out['recon']
-            alpha = vae_out['alpha']
-            if alpha is not None:
-                mu, factor, diag = vae_out['mu_alpha'], vae_out['factor_alpha'], vae_out['diag_alpha']
-            if pi is None:
-                pi = vae_out['pi']
-            if bottleneck is None:
-                bottleneck = vae_out['bottleneck']
 
+        if vae_out is not None:
+            alpha = vae_out.get('alpha') if isinstance(vae_out, dict) else getattr(vae_out, 'alpha', None)
+            
+            if alpha is not None:
+                alpha_mu = vae_out.get('alpha_mu') if isinstance(vae_out, dict) else getattr(vae_out, 'alpha_mu', None)
+                alpha_factor = vae_out.get('alpha_factor') if isinstance(vae_out, dict) else getattr(vae_out, 'alpha_factor', None)
+                alpha_diag = vae_out.get('alpha_diag') if isinstance(vae_out, dict) else getattr(vae_out, 'alpha_diag', None)
+                
+            if pi is None:
+                pi = vae_out.get('pi') if isinstance(vae_out, dict) else getattr(vae_out, 'pi', None)
+            if bottleneck is None:
+                bottleneck = vae_out.get('bottleneck') if isinstance(vae_out, dict) else getattr(vae_out, 'bottleneck', None)
         if pi is None:
-            pi = torch.full((x.size(0), self.k_atoms), 1.0/self.k_atoms, device=x.device)
+            pi = torch.full((batch_size, self.k_atoms), 1.0/self.k_atoms, device=device)
             pi = pi + (torch.randn_like(pi) * 0.01)
             pi = F.softmax(pi, dim=-1)
-        
+            
         if bottleneck is None:
-            bottleneck = torch.zeros(
-                x.size(0), 
-                self.bottleneck_dim, 
-                device=x.device, 
-                dtype=x.dtype
-            )
-        
+            bottleneck = torch.zeros(batch_size, self.bottleneck_dim, device=device, dtype=x.dtype)
+            
         if alpha is None:
             alpha_mu = torch.zeros(batch_size, self.k_atoms, device=device)
             alpha_factor = torch.randn(batch_size, self.k_atoms, self.rank, device=device) * 0.1
             alpha_diag = torch.ones(batch_size, self.k_atoms, device=device)
             alpha = self.lowrankmultivariatenorm(alpha_mu, alpha_factor, alpha_diag)
+            
+        # --- 4. GPYTORCH FIX: Sanitize remaining Nones into empty tensors ---
+        empty_tensor = torch.empty(0, device=device)
+        
+        alpha_mu = empty_tensor if alpha_mu is None else alpha_mu
+        alpha_factor = empty_tensor if alpha_factor is None else alpha_factor
+        alpha_diag = empty_tensor if alpha_diag is None else alpha_diag
+        ls = empty_tensor if ls is None else ls
+        
         
         mu_data, logvar_data = self.run_convolutional_layers(x)
 
@@ -194,21 +214,19 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         logvar_z = self.latent_logvar(post_bottleneck)
 
         z = self.reparameterise(mu_z, logvar_z)
-
-        encoder_out = {
-            "alpha": alpha,
-            "mu_alpha": mu,
-            "factor_alpha": factor,
-            "diag_alpha": diag,
-            "log_pi": log_pi,
-            "pi": pi,
-            "z": z,
-            "mu_z": mu_z,
-            "logvar_z": logvar_z,
-        }
         
-        if ls is not None:
-            encoder_out['ls'] = ls
+        encoder_out = EncoderOutput(
+            alpha=alpha,
+            alpha_mu=alpha_mu,
+            alpha_factor=alpha_factor,
+            alpha_diag=alpha_diag,
+            log_pi=log_pi,
+            pi=pi,
+            z=z,
+            mu_z=mu_z,
+            logvar_z=logvar_z,
+            ls=ls
+        )
 
         return encoder_out
     
