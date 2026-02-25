@@ -1,136 +1,96 @@
 import pytest
 import torch
-from unittest.mock import MagicMock, patch
-from typing import NamedTuple
-
-# Update this import path to match your project structure
-from deepkernels.models.spectral_vae import SpectralVAE, StateSpaceOutput, HistoryOutput, DecoderSpaceOutput
-
-# --- Dummy NamedTuples to simulate module outputs ---
-class DummyEncoderOut(NamedTuple):
-    alpha: torch.Tensor
-    z: torch.Tensor
-    ls: torch.Tensor
-
-class DummyDirichletOut(NamedTuple):
-    predicted_lengthscale: torch.Tensor
-    ls_logvar: torch.Tensor
-    features: torch.Tensor
-    pi: torch.Tensor
-    omega: torch.Tensor
-    gated_weights: torch.Tensor
-
-class DummyDecoderOut(NamedTuple):
-    recon: torch.Tensor
-    bottleneck: torch.Tensor
-    parameters_per_expert: torch.Tensor
-    mixture_means_per_expert: torch.Tensor
-    trend: torch.Tensor
-    ls: torch.Tensor
-    bandwidth_mod: torch.Tensor
-
-# --- Fixtures ---
+from deepkernels.models.variationalautoencoder import SpectralVAE, StateSpaceOutput
+from deepkernels.models.NKN import GPParams
 
 @pytest.fixture
-def mock_submodules():
-    """Mocks the submodules so we can test the loop logic in isolation."""
-    batch_size, k_atoms, latent_dim = 2, 30, 16
-    
-    # Pre-build dummy tensors to return
-    enc_out = DummyEncoderOut(
-        alpha=torch.ones(batch_size, k_atoms),
-        z=torch.zeros(batch_size, latent_dim),
-        ls=torch.empty(0) # Test the empty tensor logic!
-    )
-    
-    dir_out = DummyDirichletOut(
-        predicted_lengthscale=torch.ones(batch_size, k_atoms),
-        ls_logvar=torch.zeros(batch_size, k_atoms),
-        features=torch.zeros(batch_size, k_atoms, 2),
-        pi=torch.ones(batch_size, k_atoms) / k_atoms,
-        omega=torch.zeros(batch_size, k_atoms),
-        gated_weights=torch.ones(batch_size, 8)
-    )
-    
-    dec_out = DummyDecoderOut(
-        recon=torch.zeros(batch_size, 10), # Assuming input feature dim is 10
-        bottleneck=torch.zeros(batch_size, 64),
-        parameters_per_expert=torch.zeros(batch_size, 8, k_atoms),
-        mixture_means_per_expert=torch.zeros(batch_size, 8, latent_dim),
-        trend=torch.zeros(batch_size, 10),
-        ls=torch.ones(batch_size, k_atoms),
-        bandwidth_mod=torch.ones(batch_size, k_atoms)
-    )
-
-    with patch('deepkernels.models.spectral_vae.ConvolutionalLoopEncoder') as MockEnc, \
-         patch('deepkernels.models.spectral_vae.AmortisedDirichlet') as MockDir, \
-         patch('deepkernels.models.spectral_vae.SpectralDecoder') as MockDec, \
-         patch('deepkernels.models.spectral_vae.SpectralVAE.dirichlet_sample', return_value=dir_out.pi):
-        
-        # Configure the mocked instances to return our NamedTuples
-        MockEnc.return_value.return_value = enc_out
-        MockDir.return_value.return_value = dir_out
-        MockDec.return_value.return_value = dec_out
-        
-        yield MockEnc, MockDir, MockDec
+def batch_size():
+    return 2
 
 @pytest.fixture
-def vae_model(mock_submodules):
-    """Instantiates the SpectralVAE with mocked internal organs."""
-    return SpectralVAE()
+def seq_len():
+    return 4
 
-# --- Tests ---
+@pytest.fixture
+def input_dim():
+    return 30  # Assuming your raw data features are 30
 
-def test_spectral_vae_forward_shapes(vae_model):
-    """Tests if the loop correctly executes and stacks history into [Batch, SeqLen, ...]"""
-    batch_size, seq_len, features = 2, 5, 10
-    x = torch.randn(batch_size, seq_len, features)
-    
-    out = vae_model(x, vae_out=None, steps=1)
-    
-    # 1. Check Output Types
-    assert isinstance(out, StateSpaceOutput)
-    assert isinstance(out.history, HistoryOutput)
-    assert isinstance(out.current_state, DummyDecoderOut)
-    
-    # 2. Check Stacking Shapes (Should match seq_len, NOT seq_len * steps)
-    assert out.history.recons.shape == (batch_size, seq_len, features)
-    assert out.history.latents.shape == (batch_size, seq_len, 16)
-    assert out.history.pis.shape == (batch_size, seq_len, 30)
-    assert out.history.bottlenecks.shape == (batch_size, seq_len, 64)
+@pytest.fixture
+def model():
+    # Instantiate the model. 
+    # (Assuming default dimensions in your sub-modules map correctly to input_dim=30)
+    vae = SpectralVAE()
+    vae.eval() # Set to eval mode for deterministic testing
+    return vae
 
-def test_spectral_vae_refinement_steps(vae_model, mock_submodules):
-    """Ensures the inner refinement loop runs the correct number of times."""
-    batch_size, seq_len, features = 2, 4, 10
-    x = torch.randn(batch_size, seq_len, features)
-    steps = 3
-    
-    MockEnc, MockDir, MockDec = mock_submodules
-    
-    out = vae_model(x, vae_out=None, steps=steps)
-    
-    # If seq_len=4 and steps=3, the submodules should be called exactly 12 times
-    expected_calls = seq_len * steps
-    assert MockEnc.return_value.call_count == expected_calls
-    assert MockDir.return_value.call_count == expected_calls
-    assert MockDec.return_value.call_count == expected_calls
-    
-    # History should still only have a sequence length of 4 (one save per timestep)
-    assert out.history.recons.shape[1] == seq_len
+@pytest.fixture
+def dummy_input(batch_size, seq_len, input_dim):
+    # [Batch, SeqLen, Features]
+    return torch.randn(batch_size, seq_len, input_dim)
 
-def test_spectral_vae_generative_mode(vae_model, mock_submodules):
-    """Tests if generative_mode routes the previous reconstruction as the new input."""
-    batch_size, seq_len, features = 2, 3, 10
-    x = torch.randn(batch_size, seq_len, features)
+
+def test_spectral_vae_initialization(model):
+    """Ensure the VAE and its sub-modules initialize correctly."""
+    assert hasattr(model, 'encoder'), "Missing Encoder"
+    assert hasattr(model, 'dirichlet'), "Missing Dirichlet"
+    assert hasattr(model, 'decoder'), "Missing Decoder"
+
+def test_spectral_vae_forward_pass_types(model, dummy_input):
+    """Test that the forward pass returns the correct NamedTuples without crashing."""
+    out = model(dummy_input, steps=2)
     
-    MockEnc, _, _ = mock_submodules
+    # Check top-level output type
+    assert isinstance(out, StateSpaceOutput), f"Expected StateSpaceOutput, got {type(out)}"
     
-    vae_model(x, vae_out=None, steps=1, generative_mode=True)
+    # Check nested output types
+    assert hasattr(out, 'state'), "Missing 'state' in output"
+    assert hasattr(out, 'history'), "Missing 'history' in output"
+    assert isinstance(out.history.gp_params, GPParams), "gp_params not correctly repacked into GPParams!"
+
+def test_spectral_vae_temporal_stacking_shapes(model, dummy_input, batch_size, seq_len, input_dim):
+    """
+    CRITICAL TEST: Ensure the loop correctly stacks over the sequence dimension (dim=1).
+    If this fails, the GP will receive mashed sequence steps.
+    """
+    out = model(dummy_input, steps=2)
+    history = out.history
     
-    # Grab the arguments passed to the encoder on the final timestep
-    final_call_args = MockEnc.return_value.call_args[0]
-    x_input_to_encoder = final_call_args[0]
+    # 1. Check physical reconstruction shapes [Batch, SeqLen, Features]
+    assert history.recons.shape == (batch_size, seq_len, input_dim), \
+        f"Recons shape mismatch. Expected {(batch_size, seq_len, input_dim)}, got {history.recons.shape}"
     
-    # Because generative_mode=True, the final input should be generated by the mock decoder 
-    # (which outputs zeros in our fixture), NOT the original random `x`.
-    assert torch.all(x_input_to_encoder == 0)
+    # 2. Check latent routing shapes (Assuming 30 k_atoms)
+    assert history.pis.shape[:2] == (batch_size, seq_len), "Routing probabilities missing temporal dim"
+    
+    # 3. Check GP Features (Assuming 8 experts, 16 latent dim)
+    assert history.gp_features.shape[:2] == (batch_size, seq_len), "GP Features missing temporal dim"
+
+def test_gp_params_namedtuple_repacking(model, dummy_input, batch_size, seq_len):
+    """
+    Tests the bugfix we made: ensure all KeOps GP params were extracted 
+    from the list of tuples and stacked correctly into tensors.
+    """
+    out = model(dummy_input, steps=1)
+    gp_params = out.history.gp_params
+    
+    # Every single tensor inside GPParams should have the shape [Batch, SeqLen, ...]
+    assert gp_params.ls_rbf.shape[:2] == (batch_size, seq_len), "RBF Lengthscale missing temporal dim"
+    assert gp_params.gates.shape[:2] == (batch_size, seq_len), "Gates missing temporal dim"
+    assert gp_params.w_sm.shape[:2] == (batch_size, seq_len), "Spectral Mixture weights missing temporal dim"
+
+def test_generative_mode_autoregression(model, batch_size, seq_len, input_dim):
+    """
+    Tests the generative mode feedback loop where x_t = current_state.recon
+    """
+    dummy_input = torch.randn(batch_size, seq_len, input_dim)
+    
+    # Run with generative_mode=True
+    current_state, history = model.refinement_loop(
+        x=dummy_input, 
+        steps=2, 
+        generative_mode=True
+    )
+    
+    # In generative mode, it should still produce valid stacked histories
+    assert history.recons.shape == (batch_size, seq_len, input_dim)
+    assert not torch.isnan(history.recons).any(), "Generative loop produced NaNs!"

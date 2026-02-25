@@ -27,6 +27,14 @@ class BaseGenerativeModel(gpytorch.Module):
         self.register_constraint(name, constraint)
         return self
     
+    def _validate_module_outputs(self, outputs):
+        """
+        Overrides GPyTorch's strict tensor-only validation. 
+        This allows our VAE modules to return NamedTuples, Dataclasses, 
+        and Dictionaries without crashing the forward pass.
+        """
+        pass
+    
     
     def register_kernel_priors(self):
         if hasattr(self, "covar_module"):

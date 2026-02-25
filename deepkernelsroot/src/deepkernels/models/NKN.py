@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from deepkernels.models.parent import BaseGenerativeModel
 import gpytorch
 from typing import Optional, Any, NamedTuple
+from dataclasses import dataclass
 
 class GPParams(NamedTuple):
     gates: torch.Tensor

@@ -135,11 +135,15 @@ class AmortisedDirichlet(BaseGenerativeModel):
             latent z (param: x) -- dim 16
         """
         
-        pi = params.get('pi') or (getattr(vae_out, 'pi', None) if vae_out else None)
+        pi = params.get('pi')
+        if pi is None and vae_out is not None:
+            pi = getattr(vae_out, 'pi', None)
         
-        mualpha, factoralpha, diagalpha = vae_out.mu_alpha, vae_out.factor_alpha, vae_out.diag_alpha
+        mualpha, factoralpha, diagalpha = vae_out.alpha_mu, vae_out.alpha_factor, vae_out.alpha_diag
         
-        ls = params.get('ls') or (vae_out.get('ls') if vae_out else None)
+        ls = params.get('ls')
+        if ls is None and vae_out is not None:
+            ls = getattr(vae_out, 'ls', None)
         
         beta, log_pv, log_qv, gamma_conc = self.global_stick_breaking()
 
@@ -267,8 +271,8 @@ class AmortisedDirichlet(BaseGenerativeModel):
     
     def run_neural_nets_dirichlet(self, x):
         bottleneck = self.bottleneck_mixer(x) #-takes latent z[B,16] -> [B,64]
-        features, gp_params = self.kernel_network(bottleneck)
-        return bottleneck, features, gp_params
+        nkn_out = self.kernel_network(bottleneck)
+        return bottleneck, nkn_out.dirichlet_features, nkn_out.gp_params
     
     def compress_and_gate(self, features, gate):
         embedded_features = self.compress_spectral_features_head(features)

@@ -96,12 +96,16 @@ class SpectralVAE(BaseGenerativeModel):
                 if current_ls is not None and current_ls.numel() == 0:
                     current_ls = None
                 
-                dirichlet_out = self.dirichlet(encoder_out.z, pi=pi_current, ls=current_ls)
+                dirichlet_out = self.dirichlet(
+                    encoder_out.z, 
+                    encoder_out, 
+                    pi=pi_current, 
+                    ls=current_ls
+                )
                 
                 decoder_out = self.decoder(
                     dirichlet_out.features,
-                    ls_pred=dirichlet_out.ls_pred,
-                    ls_logvar=dirichlet_out.ls_logvar
+                    dirichlet_out
                 )
                 
                 current_state = decoder_out
