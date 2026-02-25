@@ -11,7 +11,7 @@ from typing import Optional
 
 from deepkernels.models.parent import BaseGenerativeModel
 from deepkernels.losses.simple import SimpleLoss
-from deepkernels.models.NKN import KernelNetwork
+from deepkernels.models.NKN import KernelNetwork, KernelNetworkOutput, GPParams
 from pydantic import BaseModel
 import torch.distributions as dist
 
@@ -35,6 +35,7 @@ class DirichletOutput(NamedTuple):
     conc_prior: torch.Tensor
     conc_post: torch.Tensor
     ls_logvar: torch.Tensor
+    gp_params: GPParams
 
 class LossTerm(gpytorch.mlls.AddedLossTerm):
     """
@@ -124,7 +125,6 @@ class AmortisedDirichlet(BaseGenerativeModel):
         #-loss terms-#
         self.register_added_loss_term("global_divergence")
         self.register_added_loss_term("local_divergence")
-        self.register_added_loss_term("likelihood_kernel_hyperprior")
         
 
     def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params) -> DirichletOutput:
@@ -145,7 +145,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
 
         self.log_global_kl(log_pv, log_qv)
     
-        bottleneck, gate = self.run_neural_nets_dirichlet(x)
+        bottleneck, gate, gp_params = self.run_neural_nets_dirichlet(x)
         
         local_conc = self.get_local_evidence(mualpha, factoralpha, diagalpha)
 
@@ -171,7 +171,8 @@ class AmortisedDirichlet(BaseGenerativeModel):
             pi=pi,
             conc_prior=gamma_conc,
             conc_post=local_conc,
-            ls_logvar=ls_logvar
+            ls_logvar=ls_logvar,
+            gp_params=gp_params
         )
     
     def log_global_kl(self, log_pv, log_qv):
@@ -266,8 +267,8 @@ class AmortisedDirichlet(BaseGenerativeModel):
     
     def run_neural_nets_dirichlet(self, x):
         bottleneck = self.bottleneck_mixer(x) #-takes latent z[B,16] -> [B,64]
-        features = self.kernel_network(bottleneck, features_only=True)
-        return bottleneck, features
+        features, gp_params = self.kernel_network(bottleneck)
+        return bottleneck, features, gp_params
     
     def compress_and_gate(self, features, gate):
         embedded_features = self.compress_spectral_features_head(features)

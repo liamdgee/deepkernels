@@ -11,6 +11,7 @@ import gpytorch
 import torch
 
 from torch.distributions import LowRankMultivariateNormal, Independent, Normal, kl_divergence
+from deepkernels.models.NKN import GPParams
 
 from typing import NamedTuple
 
@@ -32,7 +33,8 @@ class DecoderOutput(NamedTuple):
     alpha_mu: torch.Tensor
     alpha_factor: torch.Tensor
     alpha_diag: torch.Tensor
-    mixture_means_per_expert: torch.Tensor
+    gp_features: torch.Tensor
+    gp_params: GPParams
     parameters_per_expert: torch.Tensor
     recon: torch.Tensor
     bandwidth_mod: torch.Tensor
@@ -156,9 +158,9 @@ class SpectralDecoder(BaseGenerativeModel):
 
         bandwidth_mod = torch.sigmoid(self.scale_head_per_expert(ls_sample)) * 2.0
 
-        mixture_means_per_expert = [latent(pi_sample) for latent in self.expert_logit_heads]
+        latent_features_per_expert = [head(var_state) for head, var_state in zip(self.expert_logit_heads, latent_expert_functions)]
 
-        mixture_means = self.stack_features(mixture_means_per_expert)
+        gp_features = torch.stack(latent_features_per_expert, dim=1)
 
         vae_out = DecoderOutput(
             bottleneck=bottleneck,
@@ -166,7 +168,8 @@ class SpectralDecoder(BaseGenerativeModel):
             alpha_mu=mu,
             alpha_factor=factor,
             alpha_diag=diag,
-            mixture_means_per_expert=mixture_means,
+            gp_features=gp_features,
+            gp_params=vae_out.gp_params,
             parameters_per_expert=variational_parameters,
             recon=recon,
             bandwidth_mod=bandwidth_mod,

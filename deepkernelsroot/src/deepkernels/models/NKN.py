@@ -5,8 +5,23 @@ import torch.nn.utils.parametrizations as P
 import torch.nn.functional as F
 from deepkernels.models.parent import BaseGenerativeModel
 import gpytorch
-from typing import Optional, Any
-from deepkernels.models.simplegp import KeOpsSimpleGP
+from typing import Optional, Any, NamedTuple
+
+class GPParams(NamedTuple):
+    gates: torch.Tensor
+    ls_rbf: torch.Tensor
+    ls_per: torch.Tensor
+    p_per: torch.Tensor
+    ls_mat: torch.Tensor
+    w_sm: torch.Tensor
+    mu_sm: torch.Tensor
+    v_sm: torch.Tensor
+    
+
+class KernelNetworkOutput(NamedTuple):
+    dirichlet_features: torch.Tensor
+    gp_params: GPParams
+
 
 class KernelNetwork(BaseGenerativeModel):
     def __init__(self, 
@@ -14,13 +29,8 @@ class KernelNetwork(BaseGenerativeModel):
                  num_latents=8, 
                  spectral_emb_dim=2048,
                  gp_dim=1,
-                 spectral_micro_mixtures=4,
-                 gp_head: Optional[gpytorch.models.ApproximateGP]=None, 
-                 inducing: Optional[torch.Tensor]=None):
+                 spectral_micro_mixtures=4):
         super().__init__()
-        
-        if gp_head is not None and inducing is not None:
-            self.gp = KeOpsSimpleGP(inducing_points=inducing)
 
         # --- Dimensions ---
         self.individual_kernel_dim_out = 32
@@ -89,15 +99,12 @@ class KernelNetwork(BaseGenerativeModel):
 
         features_large = self.feed_dirichlet_gate(kernel_features)
         
-        if features_only:
-            return features_large
-        
         gp_params = self.get_keops_gp_params(kernel_features)
 
-        return {
-            'features_large': features_large, #- for dirichlet amortised hypternet-#
-            'gp_params': gp_params            #-for keops hybrid kernel-#
-        }
+        return KernelNetworkOutput(
+            dirichlet_features=features_large,
+            gp_params=gp_params
+        )
 
     
     def init_weights_nkn(self):
@@ -127,27 +134,26 @@ class KernelNetwork(BaseGenerativeModel):
     
     def get_keops_gp_params(self, kernel_features):
         gates = self.gate_head(kernel_features)
-        gates = gates.view(gates.size(0), 1, 1, -1)
+        gates = gates.unsqueeze(-2).unsqueeze(-2)
         gp_params = {'gates': gates}
         for name, head in self.param_heads.items():
             raw_val = head(kernel_features)
             val = F.softplus(raw_val) + 2e-4
-            gp_params[name] = val.view(val.size(0), 1, 1, -1)
-        return gp_params
+            gp_params[name] = val.unsqueeze(-2).unsqueeze(-2)
+        return GPParams(**gp_params)
     
     def compute_kernel_interactions(self, lin, per, rbf, rat):
-        "input stack: [B, 4, 32]"
-        stack = torch.stack([lin, per, rbf, rat], dim=1)
-        mask = torch.sigmoid(self.selection_weights).unsqueeze(-1)
+        stack = torch.stack([lin, per, rbf, rat], dim=-2) 
+        mask = torch.sigmoid(self.selection_weights)
+        
         stack_safe = torch.abs(stack) + 1e-6
         log_stack = torch.log(stack_safe)
         
-        #- b p d (batch, primitives, dim), k p   (products, primitives) -> b k d (batch, products, dim)
-        log_product = torch.einsum('bpd, kp -> bkd', log_stack, mask.squeeze(-1))
-
-        product_features = torch.exp(log_product) #-[B, 12, 32]
-        interactions_matrix = product_features.flatten(start_dim=1) #-[B, 384]
-        return self.complex_interactions(interactions_matrix) #-[B, products, 128]
+        log_product = torch.einsum('...pd, kp -> ...kd', log_stack, mask)
+        
+        product_features = torch.exp(log_product) 
+        interactions_matrix = product_features.flatten(start_dim=-2) 
+        return self.complex_interactions(interactions_matrix)
     
     def feed_dirichlet_gate(self, kernel_features):
         return self.spectral_feedback_loop(kernel_features)

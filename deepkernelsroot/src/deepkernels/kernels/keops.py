@@ -5,15 +5,22 @@ import gpytorch
 from gpytorch.kernels import Kernel
 from pykeops.torch import LazyTensor
 from linear_operator.operators import KeOpsLinearOperator
+from gpytorch.kernels.keops import RBFKernel
 
 
-class GenerativeKeOpsHybridKernel(Kernel):
+class GenerativeKernel(Kernel):
     has_lengthscale = False
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, batch_shape=torch.Size([]), **kwargs):
+        super().__init__(batch_shape=batch_shape, **kwargs)
         self.num_primitives = 4     #--> 4 Primitives + 6 Pairs + 4 Self-Squared + 2 Triples = 16 Kernels-#
-        self.kernels_out = 16 
+        self.kernels_out = 16
+        self.base_kernel = RBFKernel(batch_shape=batch_shape)
+
+        self.register_parameter(
+            name="raw_outputscale",
+            parameter=torch.nn.Parameter(torch.zeros(*batch_shape))
+        )
 
     def forward(self, x1, x2, diag=False, **params):
         """
@@ -52,10 +59,11 @@ class GenerativeKeOpsHybridKernel(Kernel):
         prims = []
 
         #-RBF Primitive: exp(-0.5 * d^2 / ls^2) wrapped as (B, 1, 1, 1)
-        ls_rbf = LazyTensor(ls_rbf.view(-1, 1, 1, 1))
+        ls_rbf = LazyTensor(ls_rbf.unsqueeze(-1).unsqueeze(-1))
         k_rbf = (-0.5 * d2 / (ls_rbf ** 2)).exp()
         prims.append(k_rbf)
 
+        
         #-Spectral Mixture Primitive-- isotropic SM formulation over distances wrapped as (B, 1, 1, Q)
         # sum_q [ w_q * cos(2pi * d * mu_q) * exp(-2pi^2 * d^2 * v_q) ]
         w_sm = LazyTensor(w_sm.unsqueeze(-2).unsqueeze(-2))
@@ -72,14 +80,14 @@ class GenerativeKeOpsHybridKernel(Kernel):
         prims.append(k_sm)
 
         #- Periodic Primitive: exp(-2 * sin^2(pi * d / p) / ls^2)
-        p_per = LazyTensor(p_per.view(-1, 1, 1, 1))
-        ls_per = LazyTensor(ls_per.view(-1, 1, 1, 1))
+        p_per = LazyTensor(p_per.unsqueeze(-1).unsqueeze(-1))
+        ls_per = LazyTensor(ls_per.unsqueeze(-1).unsqueeze(-1))
         sine_term = (math.pi * d / p_per).sin() ** 2
         k_per = (-2.0 * sine_term / (ls_per ** 2)).exp()
         prims.append(k_per)
 
         #- Matern-1/2 Primitive for linear & exponential trends-
-        ls_mat = LazyTensor(ls_mat.view(-1, 1, 1, 1))
+        ls_mat = LazyTensor(ls_mat.unsqueeze(-1).unsqueeze(-1))
         k_mat = (-d / ls_mat).exp()
         prims.append(k_mat)
 
@@ -97,8 +105,8 @@ class GenerativeKeOpsHybridKernel(Kernel):
         
         kernels = prims + interactions 
 
-        # --- 4. GATED ROUTING ---shape: (Batch, 1, 1, 16)
-        gates = gates.view(x1.size(0), 1, 1, self.kernels_out)
+        # --- GATED ROUTING ---shape: (Batch, 1, 1, 16)
+        gates = gates.unsqueeze(-2).unsqueeze(-2)
         gate_0 = LazyTensor(gates[..., 0:1])
         k_final = gate_0 * kernels[0]
         
@@ -106,16 +114,20 @@ class GenerativeKeOpsHybridKernel(Kernel):
             gate_i = LazyTensor(gates[..., i:i+1])
             k_final = k_final + (gate_i * kernels[i])
 
-        return KeOpsLinearOperator(k_final) #-keops lazy tensor-#
+        #-batch aware output scale-#
+        outputscale = torch.nn.functional.softplus(self.raw_outputscale)
+        outputscale = outputscale.view(*self.batch_shape, 1, 1)
+        k_final = k_final * LazyTensor(outputscale)
+        return KeOpsLinearOperator(k_final)
 
     def _forward_diag_fallback(self, x1, x2, **params):
-        batch_size, n, _ = x1.shape
+        target_shape = x1.shape[:-1]
         device = x1.device
         
         hyperparams = params.get("gp_params", params)
         
-        diag_ones = torch.ones(batch_size, n, device=device)
-        diag_sm = hyperparams['w_sm'].sum(-1).view(batch_size, 1).expand(batch_size, n)
+        diag_ones = torch.ones(*target_shape, device=device)
+        diag_sm = hyperparams['w_sm'].sum(-1).unsqueeze(-1).expand(*target_shape)
         
         prims_diag = [diag_ones, diag_sm, diag_ones, diag_ones]
         
@@ -129,19 +141,19 @@ class GenerativeKeOpsHybridKernel(Kernel):
         
         all_diag = prims_diag + interactions_diag
         
-        gates = hyperparams['gates'].view(batch_size, self.kernels_out)
-        k_final_diag = gates[:, 0:1] * all_diag[0]
+        gates = hyperparams['gates']
+        k_final_diag = gates[..., 0:1] * all_diag[0]
         for i in range(1, self.kernels_out):
-            k_final_diag += gates[:, i:i+1] * all_diag[i]
-            
-        return k_final_diag
+            k_final_diag += gates[..., i:i+1] * all_diag[i]
+        outputscale = torch.nn.functional.softplus(self.raw_outputscale).view(*self.batch_shape, 1)
+        return k_final_diag * outputscale
 
 class ProbabilisticMixtureMean(gpytorch.means.Mean):
-    def __init__(self, k_atoms=30):
-        super().__init__()
+    def __init__(self, k_atoms=30, batch_shape=torch.Size([])):
+        super().__init__(batch_shape=batch_shape)
         self.register_parameter(
             name="cluster_constants", 
-            parameter=torch.nn.Parameter(torch.randn(k_atoms, 1) * 0.1)
+            parameter=torch.nn.Parameter(torch.randn(k_atoms, *batch_shape) * 0.1)
         )
 
     def forward(self, x, **params):
@@ -151,14 +163,14 @@ class ProbabilisticMixtureMean(gpytorch.means.Mean):
         # cluster_constants shape: [k_atoms, 1]
         # batch_mean shape: [Batch, 1]
         """
-        batch_size, n, _ = x.shape
+        target_shape = x.shape[:-1]
+
+        expert_means = params.get("mixture_means_per_expert", None)
         
-        pi = params.get("pi", None)
-        
-        if pi is None:
-            return torch.zeros(batch_size, n, device=x.device)
-            
-        
-        batch_mean = pi @ self.cluster_constants
-        
-        return batch_mean.expand(batch_size, n)
+        if expert_means is not None:
+            # expert_means shape from VAE is likely [Batch, 8]
+            # Expand it to [Batch, 8, N] to match the sequence length
+            return expert_means.unsqueeze(-1).expand(target_shape)
+        else:
+            # Fallback if the VAE didn't pass them
+            return torch.zeros(target_shape, device=x.device)

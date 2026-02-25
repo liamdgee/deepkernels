@@ -1,5 +1,5 @@
 from deepkernels.models.dirichlet import AmortisedDirichlet
-from deepkernels.models.spectral_VAE import SpectralVAE
+from deepkernelsroot.src.deepkernels.models.variationalautoencoder import SpectralVAE
 from deepkernels.models.encoder import RecurrentEncoder
 from deepkernels.models.model import GenerativeKernelProcess
 from deepkernels.kernels.deepkernel import DeepKernel, DynamicMixtureMean
