@@ -139,11 +139,17 @@ class AmortisedDirichlet(BaseGenerativeModel):
         if pi is None and vae_out is not None:
             pi = getattr(vae_out, 'pi', None)
         
+        if isinstance(pi, torch.Tensor) and pi.numel() == 0:
+            pi = None
+        
         mualpha, factoralpha, diagalpha = vae_out.alpha_mu, vae_out.alpha_factor, vae_out.alpha_diag
         
         ls = params.get('ls')
         if ls is None and vae_out is not None:
             ls = getattr(vae_out, 'ls', None)
+        
+        if isinstance(ls, torch.Tensor) and ls.numel() == 0:
+            ls = None
         
         beta, log_pv, log_qv, gamma_conc = self.global_stick_breaking()
 

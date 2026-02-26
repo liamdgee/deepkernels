@@ -22,19 +22,17 @@ class BaseGenerativeModel(gpytorch.Module):
     def __init__(self):
         super().__init__()
     
+    def __call__(self, *args, **kwargs):
+        """
+        bypasses GPyTorch's strict output policing 
+        by routing the execution directly through torch
+        """
+        return torch.nn.Module.__call__(self, *args, **kwargs)
+    
     def register_constrained_parameter(self, name, parameter, constraint):
         self.register_parameter(name, parameter)
         self.register_constraint(name, constraint)
         return self
-    
-    def _validate_module_outputs(self, outputs):
-        """
-        Overrides GPyTorch's strict tensor-only validation. 
-        This allows our VAE modules to return NamedTuples, Dataclasses, 
-        and Dictionaries without crashing the forward pass.
-        """
-        pass
-    
     
     def register_kernel_priors(self):
         if hasattr(self, "covar_module"):

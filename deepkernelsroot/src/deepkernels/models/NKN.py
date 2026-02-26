@@ -49,7 +49,7 @@ class KernelNetwork(BaseGenerativeModel):
         self.linear_scale = nn.Parameter(torch.tensor(0.1))
         self.periodic = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out))
         self.rbf = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out))
-        self.rational = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out))
+        self.matern = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out))
 
         #--all individaul kernels were projected to dim 32 (aggregate: 128)--#
 
@@ -92,11 +92,11 @@ class KernelNetwork(BaseGenerativeModel):
         """
         inputs the latent bottleneck dim (64)
         """
-        lin, per, rbf, rat = self.compute_primitives(x)        
+        lin, per, rbf, mat = self.compute_primitives(x)        
 
-        custom_interactions = self.compute_kernel_interactions(lin, per, rbf, rat) #- outputs [B, 12, 128]
+        custom_interactions = self.compute_kernel_interactions(lin, per, rbf, mat) #- outputs [B, 12, 128]
 
-        kernel_features = torch.cat([lin, per, rbf, rat, custom_interactions], dim=-1) #-[B,256]
+        kernel_features = torch.cat([lin, per, rbf, mat, custom_interactions], dim=-1) #-[B,256]
 
         features_large = self.feed_dirichlet_gate(kernel_features)
         
@@ -130,21 +130,23 @@ class KernelNetwork(BaseGenerativeModel):
         lin = self.linear(x) * self.linear_scale
         per = torch.cos(self.periodic(x))
         rbf = torch.exp(-torch.pow(self.rbf(x), 2))
-        rat = 1.0 / (1.0 + torch.pow(self.rational(x), 2))
-        return lin, per, rbf, rat
+        #-matern 5/2-#
+        dist = torch.abs(self.matern(x))
+        sqrt5 = math.sqrt(5.0)
+        mat = (1.0 + sqrt5 * dist + (5.0 / 3.0) * torch.pow(dist, 2)) * torch.exp(-sqrt5 * dist)
+        return lin, per, rbf, mat
     
     def get_keops_gp_params(self, kernel_features):
         gates = self.gate_head(kernel_features)
-        gates = gates.unsqueeze(-2).unsqueeze(-2)
         gp_params = {'gates': gates}
         for name, head in self.param_heads.items():
             raw_val = head(kernel_features)
             val = F.softplus(raw_val) + 2e-4
-            gp_params[name] = val.unsqueeze(-2).unsqueeze(-2)
+            gp_params[name] = val
         return GPParams(**gp_params)
     
-    def compute_kernel_interactions(self, lin, per, rbf, rat):
-        stack = torch.stack([lin, per, rbf, rat], dim=-2) 
+    def compute_kernel_interactions(self, lin, per, rbf, mat):
+        stack = torch.stack([lin, per, rbf, mat], dim=-2) 
         mask = torch.sigmoid(self.selection_weights)
         
         stack_safe = torch.abs(stack) + 1e-6

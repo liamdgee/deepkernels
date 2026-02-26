@@ -124,14 +124,14 @@ class SpectralVAE(BaseGenerativeModel):
             hist_gate_weights.append(dirichlet_out.gated_weights)
         
         stacked_gp_params = GPParams(
-            gates=torch.stack([p.gates for p in hist_params_nkn], dim=1),
-            ls_rbf=torch.stack([p.ls_rbf for p in hist_params_nkn], dim=1),
-            ls_per=torch.stack([p.ls_per for p in hist_params_nkn], dim=1),
-            p_per=torch.stack([p.p_per for p in hist_params_nkn], dim=1),
-            ls_mat=torch.stack([p.ls_mat for p in hist_params_nkn], dim=1),
-            w_sm=torch.stack([p.w_sm for p in hist_params_nkn], dim=1),
-            mu_sm=torch.stack([p.mu_sm for p in hist_params_nkn], dim=1),
-            v_sm=torch.stack([p.v_sm for p in hist_params_nkn], dim=1)
+            gates=torch.stack([p.gates for p in hist_params_nkn], dim=1).unsqueeze(1),
+            ls_rbf=torch.stack([p.ls_rbf for p in hist_params_nkn], dim=1).unsqueeze(1),
+            ls_per=torch.stack([p.ls_per for p in hist_params_nkn], dim=1).unsqueeze(1),
+            p_per=torch.stack([p.p_per for p in hist_params_nkn], dim=1).unsqueeze(1),
+            ls_mat=torch.stack([p.ls_mat for p in hist_params_nkn], dim=1).unsqueeze(1),
+            w_sm=torch.stack([p.w_sm for p in hist_params_nkn], dim=1).unsqueeze(1),
+            mu_sm=torch.stack([p.mu_sm for p in hist_params_nkn], dim=1).unsqueeze(1),
+            v_sm=torch.stack([p.v_sm for p in hist_params_nkn], dim=1).unsqueeze(1)
         )
         
         history = HistoryOutput(
@@ -139,9 +139,9 @@ class SpectralVAE(BaseGenerativeModel):
             recons=torch.stack(hist_recons, dim=1),
             latents=torch.stack(hist_latents, dim=1),
             pis=torch.stack(hist_pis, dim=1),
-            gp_features=torch.stack(hist_gp_features, dim=1),
+            gp_features=torch.stack(hist_gp_features, dim=1).transpose(1, 2),
             bottlenecks=torch.stack(hist_bottlenecks, dim=1),
-            expert_params=torch.stack(hist_expert_params, dim=1),
+            expert_params=torch.stack(hist_expert_params, dim=1).transpose(1, 2),
             frequencies=torch.stack(hist_frequencies, dim=1),
             trends=torch.stack(hist_trends, dim=1),
             bw_mods=torch.stack(hist_bw_mods, dim=1),

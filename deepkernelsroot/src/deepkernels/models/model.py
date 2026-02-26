@@ -7,18 +7,20 @@ from deepkernels.models.parent import BaseGenerativeModel
 
 from tqdm import tqdm
 
-from deepkernelsroot.src.deepkernels.models.variationalautoencoder import *
-from deepkernelsroot.src.deepkernels.models.gaussianprocess import *
+from deepkernels.models.variationalautoencoder import SpectralVAE, StateSpaceOutput, DecoderStateOutput, HistoryOutput
+from deepkernels.models.gaussianprocess import AcceleratedKernelGP
+from deepkernels.models.NKN import GPParams
 
 class StateSpaceKernelProcess(BaseGenerativeModel):
     def __init__(self, vae=None, gp=None):
+        super().__init__()
         self.vae = vae if vae is not None else SpectralVAE()
         self.gp = gp if gp is not None else AcceleratedKernelGP()
     
-    def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
+    def forward(self, x, vae_out=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         
         
-        state_space_tuple = self.vae(
+        state, history = self.vae(
             x,
             vae_out=vae_out,
             steps=steps,
@@ -26,17 +28,16 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
             features_only=features_only,
             **params
         )
-        history = state_space_tuple.history
-        gp_input = history.features 
+
+        gp_in = history.gp_features
+
+        if isinstance(gp_in, tuple):
+            gp_in = gp_in[0]
         
-        if gp_input.dim() == 3:
-            gp_input = gp_input.unsqueeze(-2)
-            
         gp_kwargs = {
-            "gp_params": history.expert_params,
-            "mixture_means_per_expert": history.expert_mixtures,
+            "gp_params": history.gp_params, 
         }
+
+        pred = self.gp(gp_in, **gp_kwargs)
         
-        gp_output = self.gp(gp_input, **gp_kwargs)
-        
-        return state_space_tuple.state, gp_output, gp_input, history
+        return state, pred, gp_in, history
