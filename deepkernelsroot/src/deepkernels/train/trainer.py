@@ -12,56 +12,29 @@ import mlflow
 from deepkernels.train.stochastic_annealer import StochasticAnnealer
 from deepkernels.models.model import StateSpaceKernelProcess
 from deepkernels.train.objective import EvidenceLowerBound
+from deepkernels.train.langevin_trainer import LangevinTrainer
 from typing import Union, Optional
-from tqdm import tdqm
 
+from tqdm import tqdm
 
+import torch
+from tqdm import tqdm
 
-#---Init logger---#
-logger = logging.getLogger(__name__)
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-#--Tracking Function Decorator using mlflow--#
-def tracker(kernel_experiment):
-    def decorator(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            mlflow.set_experiment(kernel_experiment)
-            with mlflow.start_run() as run:
-                mlflow.log_params(kwargs)
-                result = fn(*args, **kwargs)
-                mlflow.set_tag("train_dict", fn.__name__)
-                return result
-        return wrapper
-    return decorator
-
-@tracker(kernel_experiment="Dirichlet_Mixture_Proj")
-class Trainer:
-    def __init__(self, model, objective, device='cuda', **kwargs):
-        super().__init__()
+class ParameterIsolate:
+    def __init__(self, model, objective=None, device='cuda', **kwargs):
         self.model = model
-        self.gp = self.model.gp
-        self.vae = self.model.vae
-        self.objective = objective
         self.device = self.get_device(device)
+        self.kwargs = kwargs
+        self.objective = objective if objective is not None else EvidenceLowerBound(self.model)
 
-    def train(
-            self,
-            dataloader,
-            epochs=200,
-            **kwargs
-        ):
-        
+    def seperate_params_and_build_optimisers(self):
+        """Executes the massive parameter routing and returns the two optimizers."""
         model = self.model.to(self.device)
-        vae = self.model.vae.to(self.device)
-        gp = self.model.gp.to(self.device)
-        objective = self.objective.to(self.device)
         
         model.train()
-        objective.likelihood.train()
+        self.objective.likelihood.train()
         
-        #-param grouping-#
+        #-GROUP MODEL PARAMS-#
         
         #-encoder params include:
         all_encoder_params = []
@@ -186,123 +159,65 @@ class Trainer:
                 else:
                     dirichlet_all_params.append(param)
                     dirichlet_all_nn_params.append(param)
-                
-        self.fast_dir = kwargs.get('fast_dir', 1e-2)
-        self.med_dir = kwargs.get('med_dir', 2e-3)
-        self.slow_dir = kwargs.get('slow_dir', 4e-4)
-        self.gamma_lr = kwargs.get('gamma_lr', 5e-5)
-        self.temp = kwargs.get('langevin_temp', 7.5e-6)
         
-        dirichlet_params = optim.Adagrad([
-            {'params': [dirichlet.mu_atom], 'lr': self.med_dir},
-            {'params': [dirichlet.log_sigma_atom], 'lr': self.med_dir},
-            {'params': [dirichlet.h_mu], 'lr': self.slow_dir},
-            {'params': [dirichlet.h_log_sigma], 'lr': self.slow_dir},
-            {'params': [dirichlet.gamma], 'lr': self.gamma_lr},
-            {'params': [dirichlet.q_mu], 'lr': self.fast_dir},
-            {'params': [dirichlet.q_log_sigma], 'lr': self.fast_dir},
-        ])
+        #-build adamW optimiser-#
+        #-fdr adam optimiser-#
+        base_lr_adamw = self.kwargs.get('base_lr_adamw', 1.175e-3)
+        
+        base_decay_adamw = base_lr_adamw / 10
+        slow_lr = (base_lr_adamw / 10) * 4.77    #~-5e-4
+        very_slow_lr = (base_lr_adamw / 250) * 2.77 #~1.3e-5
 
-        optimiser = optim.AdamW([
-            {'params': vae.parameters(), 'lr': 2e-3, 'weight_decay': 1.2e-4},
-            {'params': gp.parameters(), 'lr': 0.015},
-            {'params': objective.likelihood.parameters(), 'lr': 0.015}
-        ])
-
-        total_steps = epochs * len(dataloader)
-
-        annealers = {
-            "dirichlet_global_kl": StochasticAnnealer(total_steps, n_cycles=4, stop_beta=0.1, noise_scale=0.01),
-            "dirichlet_local_kl": StochasticAnnealer(total_steps, n_cycles=4, stop_beta=0.1, noise_scale=0.01),
-            "lengthscale_kl": StochasticAnnealer(total_steps, n_cycles=1, ratio=0.2, stop_beta=1.0, noise_scale=0.0),
-            "alpha_kl": StochasticAnnealer(total_steps, n_cycles=1, ratio=0.2, stop_beta=1.0, noise_scale=0.0)
-        }
-
-        global_step = 0
-
-        # --- THE EPOCH LOOP ---
-        for epoch in range(epochs):
-            loop = tqdm(dataloader, leave=True, desc=f"Epoch {epoch+1}/{epochs}")
+        adamw_optimiser = torch.optim.AdamW([
+            {'params': conv_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
+            {'params': fusion_params, 'lr': base_lr_adamw, 'weight_decay': base_lr_adamw},
+            {'params': latent_params, 'lr': slow_lr, 'weight_decay': very_slow_lr},
             
-            for batch_idx, x_batch in enumerate(loop):
-                x_batch = x_batch.to(device) # Shape: [Batch, SeqLen, Features]
-                optimiser.zero_grad()
-                
-                # CRITICAL: Clear the VAE's internal loss dictionary from the previous batch!
-                # (Assuming your BaseGenerativeModel has a way to clear these. If it's a list/dict, clear it here)
-                if hasattr(model, 'added_loss_terms'):
-                    model.added_loss_terms.clear()
+            {'params': deterministic_recon_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
+            {'params': probabilistic_nn_params, 'lr': slow_lr, 'weight_decay': very_slow_lr},
+            
+            {'params': dirichlet_all_nn_params, 'lr': base_lr_adamw},
+            {'params': primitive_params, 'lr': base_lr_adamw},
+            {'params': combinatorics_params, 'lr': slow_lr},
+        ])
 
-                # Step the annealers and update the criterion weights
-                current_kl_weights = {
-                    name: annealer(global_step) for name, annealer in annealers.items()
-                }
-                criterion.kl_weights = current_kl_weights
+        #-for SGLD optimiser-#
+        fast_dir = self.kwargs.get('fast_dir', 1e-2)
+        med_dir = self.kwargs.get('med_dir', 2e-3)
+        slow_dir = self.kwargs.get('slow_dir', 3.5e-4)
+        gamma_lr = self.kwargs.get('gamma_lr', 1e-4)
 
-                # --- 1. VAE FORWARD PASS ---
-                ss_out = model(x_batch)
-                history = ss_out.history
+        langevin_temp = self.kwargs.get('langevin_temp', 7.5e-6)
+        
+        ultrasensitive_lr = self.kwargs.get('ultrasensitive_lr', 1e-6)
+        sensitive_lr = self.kwargs.get('sensitive_lr', 5e-5)
 
-                # --- 2. GP FORWARD PASS ---
-                # Extract the bottleneck features to feed the GP
-                # Assuming features_per_expert is [Batch, 8, N, 16] or similar
-                gp_input = history.bottlenecks  
-                
-                # Address the shape trap (if N is missing, e.g., [Batch, 8, 16] -> [Batch, 8, 1, 16])
-                if gp_input.dim() == 3:
-                    gp_input = gp_input.unsqueeze(-2)
+        gp_variational_lr = self.kwargs.get('gp_variational_lr', 0.045)
+        gp_lmc_lr = self.kwargs.get('gp_lmc_lr', 0.01277)
+        gp_mean_lr = self.kwargs.get('gp_mean_lr', 7.77e-3)
+        gp_likelihood_lr = self.kwargs.get('gp_likelihood_lr', 1.77e-2)
+        gp_hyper_lr = self.kwargs.get("gp_hyper_lr", 3.5e-3)
 
-                # Package the dynamic hyperparameters from the VAE to the GP
-                gp_kwargs = {
-                    "gp_params": {
-                        "ls_rbf": history.expert_params[..., 0], # Map these to your actual dictionary keys!
-                        "w_sm": history.expert_params[..., 1],
-                        # ... etc ...
-                        "gates": history.gate_weights
-                    },
-                    "mixture_means_per_expert": history.expert_mixtures,
-                    "pi": history.pis
-                }
+        langevin_optimiser = torch.optim.Adagrad([
+            {'params': gp_variational_params, 'lr': gp_variational_lr},
+            {'params': gp_lmc_params, 'lr': gp_lmc_lr},
+            {'params': gp_mean_params, 'lr': gp_mean_lr},
+            {'params': gp_kernel_hyperparams, 'lr': gp_hyper_lr},
+            
+            {'params': self.objective.likelihood.parameters(), 'lr': gp_likelihood_lr},
+            
+            {'params': sensitive_ls_params, 'lr': sensitive_lr},
+            {'params': ultrasensitive_spectral_params, 'lr': ultrasensitive_lr}, 
+            
+            {'params': dirichlet_atom_params, 'lr': med_dir},
+            {'params': dirichlet_global_dist_params, 'lr': slow_dir},
+            {'params': dirichlet_gamma_params, 'lr': gamma_lr},
+            {'params': dirichlet_ls_params, 'lr': sensitive_lr},
+            {'params': dirichlet_variational_params, 'lr': fast_dir},
+        ])
 
-                # Run the KeOps LMC GP!
-                gp_output = gp_model(gp_input, **gp_kwargs)
-
-                # --- 3. LOSS COMPUTATION ---
-                # Define what the GP is trying to predict (Target). 
-                # If it's predicting the expert features themselves, pass them here.
-                gp_target = history.expert_params # <-- Update to your specific target tensor
-                
-                loss, metrics = criterion(
-                    model=model,
-                    x_target=x_batch,
-                    ss_history=history,
-                    gp_output=gp_output,
-                    gp_target=gp_target
-                )
-
-                # --- 4. BACKWARD PASS & OPTIMIZE ---
-                loss.backward()
-                
-                # Optional but highly recommended for RNNs/VAEs: Gradient Clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                optimizer.step()
-                global_step += 1
-
-                # --- 5. LOGGING ---
-                # Update the progress bar with the most critical metrics
-                loop.set_postfix(
-                    Loss=f"{metrics['loss_total']:.2f}", 
-                    Recon=f"{metrics['loss_recon']:.2f}",
-                    GP=f"{metrics['loss_gp']:.2f}",
-                    DirKL=f"{metrics.get('loss_dirichlet_global_kl', 0.0):.2f}"
-                )
-                
-                # (Optional) Log to Weights & Biases here:
-                # wandb.log(metrics, step=global_step)
-
-        return model, gp
-
+        return adamw_optimiser, langevin_optimiser
+    
     def get_device(self, device_request: Union[str, torch.device, None] = None) -> torch.device:
 
             """

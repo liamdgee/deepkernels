@@ -8,8 +8,15 @@ from deepkernels.models.parent import BaseGenerativeModel
 from tqdm import tqdm
 
 from deepkernels.models.variationalautoencoder import SpectralVAE, StateSpaceOutput, DecoderStateOutput, HistoryOutput
-from deepkernels.models.gaussianprocess import AcceleratedKernelGP
+from deepkernels.models.gaussianprocess import AcceleratedKernelGP, GPOutput
 from deepkernels.models.NKN import GPParams
+from typing import NamedTuple
+
+class ModelOutput(NamedTuple):
+    state: DecoderStateOutput
+    history: HistoryOutput
+    gp_out: GPOutput
+    gp_in: torch.Tensor
 
 class StateSpaceKernelProcess(BaseGenerativeModel):
     def __init__(self, vae=None, gp=None):
@@ -34,10 +41,12 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
         if isinstance(gp_in, tuple):
             gp_in = gp_in[0]
         
+        gp_in = gp_in.contiguous()
+        
         gp_kwargs = {
             "gp_params": history.gp_params, 
         }
 
-        pred = self.gp(gp_in, **gp_kwargs)
+        gp_out = self.gp(gp_in, **gp_kwargs)
         
-        return state, pred, gp_in, history
+        return ModelOutput(state=state, history=history, gp_out=gp_out, gp_in=gp_in)

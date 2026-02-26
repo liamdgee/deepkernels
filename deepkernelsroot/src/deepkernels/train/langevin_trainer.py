@@ -8,18 +8,23 @@ import math
 import torch.nn as nn
 import functools
 import mlflow
+from collections import defaultdict
+import torch.nn.functional as F
 
+from deepkernels.train.objective import EvidenceLowerBound
+from deepkernels.train.stochastic_annealer import StochasticAnnealer
+from typing import Union
 #---Init logger---#
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 #--Tracking Function Decorator using mlflow--#
-def tracker(kernel_experiment):
+def tracker(experiment):
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            mlflow.set_experiment(kernel_experiment)
+            mlflow.set_experiment(experiment)
             with mlflow.start_run() as run:
                 mlflow.log_params(kwargs)
                 result = fn(*args, **kwargs)
@@ -29,175 +34,128 @@ def tracker(kernel_experiment):
     return decorator
 
 #---Class Definition: Stochastic Gradient Optimiser with Adaptive Langevin Dynamics--#
-@tracker(kernel_experiment="Dirichlet_Mixture_Proj")
-class HybridLangevinTrainer:
-    def __init__(self, model, **kwargs):
-        
+class LangevinTrainer:
+    def __init__(self, model, adam_optimiser, sgld_optimiser, device='cuda', **kwargs):
         self.model = model
-        gp = self.model
-        vae = gp.vae
-        dirichlet = vae.dirichlet
-        encoder = vae.encoder
-        decoder = vae.decoder
-
-        self.device = kwargs.get('device', 'cuda')
+        self.device = self.get_device(device)
         self.epochs = kwargs.get('total_epochs', 200)
-
-        #-learning rates-#
-        self.lr_decoder = kwargs.get('stable_rkhs_lr', 2e-4)
-        self.beta = kwargs.get('kl_div_beta', 0.2)
-
-        #--Param Grouping--#
-        #SGLD
-        self.fast_dir = kwargs.get('fast_dir', 1e-2)
-        self.med_dir = kwargs.get('med_dir', 2e-3)
-        self.slow_dir = kwargs.get('slow_dir', 4e-4)
-        self.gamma_lr = kwargs.get('gamma_lr', 5e-5)
         self.temp = kwargs.get('langevin_temp', 7.5e-6)
-        self.nn_lr = kwargs.get('nn_lr')
-
-        dirichlet_params = optim.Adagrad([
-            {'params': [dirichlet.mu_atom], 'lr': self.med_dir},
-            {'params': [dirichlet.log_sigma_atom], 'lr': self.med_dir},
-            {'params': [dirichlet.h_mu], 'lr': self.slow_dir},
-            {'params': [dirichlet.h_log_sigma], 'lr': self.slow_dir},
-            {'params': [dirichlet.gamma], 'lr': self.gamma_lr},
-            {'params': [dirichlet.q_mu], 'lr': self.fast_dir},
-            {'params': [dirichlet.q_log_sigma], 'lr': self.fast_dir},
-        ])
-
-        self.hyperparam_lr = kwargs.get('hyperparam_lr', 1e-3)
-        self.nn_weights_lr = kwargs.get('weights_lr', 5e-3)
-
-    
-    def comp_kl_divergence_for_dirichlet_module(self):
-        """
-        Calculates divergence between learned sticks (q) and dirichlet prior (p) 
-        defined by concentrations alpha & gamma
-        """
-        #--Fetch learned stick breaking params--#
-        v_k = torch.sigmoid(self.model.dirichlet.v_k) #--Global--#
-        v_j = torch.sigmoid(self.model.dirichlet.v_j) #--Local--#
-
-        #--Dirichlet Priors from model---#
-        gamma = torch.exp(self.model.dirichlet.gamma)
-        alpha = torch.exp(self.model.dirichlet.alpha)
-
-        #--KL Divergence for the GEM dist (stick breaking process mechanism)--#
-        kl_global = (v_k.log() + (gamma - 1) * (1 - v_k).log()).sum()
-        kl_local = (v_j.log() + (alpha - 1) * (1 - v_j).log()).sum()
-        divergence = -(kl_global + kl_local)
-        return divergence
-
-    def comp_loss(self, out, **kwargs):
-        """Computes loss and stores in dictionary"""
-
-        #--Stage A: Multi-Objective Evidence Collection--
-        y = kwargs.get('target_var')
-        h_vit_observed = kwargs.get('h_vit_observed')
-
-        #--Negative Log likelihood loss--#
-        safe_sig = torch.clamp(out['var'], min=1e-9)
-        dist = Normal(out['mu'], torch.sqrt(safe_sig))
-        likelihood = dist.log_prob(y).mean() #--positive log likelihood--#
-
-        #--KL_term--#
-        kl_div = self.comp_kl_divergence_for_dirichlet_module()
-
-        #--RKHS Loss---#
-        rkhs_loss = F.mse_loss(out['h_recon'], h_vit_observed)
-
-        #--Variational Objective (Negative ELBO)---#
-        neg_elbo = -likelihood + (self.beta * kl_div) + (self.rkhs_w * rkhs_loss)
-
-        loss_stats = {
-            "total": neg_elbo,
-            "nll": likelihood,
-            "kl": kl_div,
-            "rkhs": rkhs_loss
-        }
-
-        mlflow.log_metric("ELBO_loss")
-
-        return loss_stats
-    
+        self.objective = EvidenceLowerBound(gp_model=self.model.gp, num_data=38003).to(self.device  )
+        self.adam_optimiser = adam_optimiser
+        self.sgld_optimiser = sgld_optimiser
+        self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)
+        
     def _inject_langevin_noise(self, temp):
-        noise_scale = math.sqrt(2 * self.optimiser.param_groups[0]['lr'] * temp)
-        for g in self.optimiser.param_groups:
+        for g in self.sgld_optimiser.param_groups:
+            noise_scale = math.sqrt(2 * g['lr'] * temp)
             for p in g['params']:
                 if p.grad is not None:
-                    state = self.optimiser.state[p]
-                    G = state.get('sum_square', torch.ones_like(p.grad))
+                    state = self.sgld_optimiser.state[p]
+                    if 'sum' in state:
+                        G = state['sum']
+                    else:
+                        G = torch.ones_like(p.grad)
                     precond = 1.0 / (torch.sqrt(G) + 1e-8)
                     langevin_noise = torch.randn_like(p.grad) * noise_scale * torch.sqrt(precond)
                     p.grad.add_(langevin_noise)
     
-    def step(self, x, local_idx, y):
-        """Stages B + C: Langevin step with adagrad preconditioning"""
+    def get_device(self, device_request: Union[str, torch.device, None] = None) -> torch.device:
 
-        self.y = y
-        self.local_idx = local_idx
-
-        self.model.train()
-
-        self.optimiser.zero_grad()
-
-        with torch.no_grad():
-            h_vit_observed = self.model.transformer.vit_model(x)
-        
-        out = self.model(x, local_idx=local_idx, y=y)
-
-        loss_dict = self.comp_loss(out, y=y, h_vit_observed=h_vit_observed)
-
-        loss_dict['total'].backward()
-
-        self._inject_langevin_noise(self.temp)
-
-        self.optimiser.step()
-
-        return loss_dict
+            """
+            Resolves the optimal available device for PyTorch operations.
+            
+            Priority:
+            1. explicit device_request (if provided and valid)
+            2. cuda:0 (NVIDIA GPU)
+            3. mps (Apple Silicon Metal Performance Shaders)
+            4. cpu
+            
+            Args:
+                device_request: Optional string ('cuda', 'mps', 'cpu') or torch.device 
+                                to force a specific device.
+            
+            Returns:
+                torch.device: The resolved device.
+            """
+            if device_request is not None:
+                device = torch.device(device_request)
+                if device.type == 'cuda' and not torch.cuda.is_available():
+                    logging.warning(f"CUDA requested but unavailable. Falling back to CPU.")
+                    return torch.device('cpu')
+                if device.type == 'mps' and not torch.backends.mps.is_available():
+                    logging.warning(f"MPS (Apple Silicon) requested but unavailable. Falling back to CPU.")
+                    return torch.device('cpu')
+                return device
+            if torch.cuda.is_available():
+                return torch.device('cuda:0')
+            if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+                return torch.device('mps')
+            return torch.device('cpu')
     
-    def reinitialise(self):
-        """Maps new sliced params (by DirichletPruner) to fresh Adagrad buffers"""
+    def step(self, x, targets):
+        self.model.train()
+        
+        self.adam_optimiser.zero_grad()
+        self.sgld_optimiser.zero_grad()
+        
+        model_out = self.model(x)
 
-        logger.info("Reinitialising Adagrad for update in number of dirichlet cluster atoms")
+        loss, metrics = self.objective(
+            model=self.model,
+            x_target=x,
+            ss_history=model_out.history,
+            gp_output=model_out.gp_out.mvn,
+            gp_target=targets
+        )
 
-        new_groups = [
-            {'params': [self.model.dirichlet.mu_atom], 'lr': self.eta_a},
-            {'params': [self.model.dirichlet.log_sigma_atom], 'lr': self.eta_a},
-            {'params': [self.model.dirichlet.v_k], 'lr': self.eta_w},
-            {'params': [self.model.dirichlet.v_j], 'lr': self.eta_w},
-            {'params': self.model.decoder.parameters(), 'lr': self.lr_decoder}
-        ]
+        loss.backward()
 
-        self.optimiser = optim.Adagrad(new_groups, lr=self.eta_a)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
 
-        logger.info(f"Optimiser re-initialised after clustering change. Current atoms in CRP 'menu': {self.model.dirichlet.mu_atom.shape[0]}")
+        self._inject_langevin_noise(temp=self.temp)
+
+        self.adam_optimiser.step()
+        self.sgld_optimiser.step()
+        
+        return metrics
+    
+    def _log_metrics(self, epoch, metrics, prefix="train"):
+        """Dynamically logs any metric returned by EvidenceLowerBound to MLflow."""
+        for key, value in metrics.items():
+            mlflow.log_metric(f"{prefix}_{key}", value, step=epoch)
     
     def evaluate(self, test_loader, epoch=0):
         self.model.eval()
-        test_stats = {"total": 0, "nll": 0, "kl": 0, "rkhs": 0}
+        self.objective.eval() # Ensure loss modules (like GPyTorch MLL) are in eval mode
+        
+        test_stats = defaultdict(float)
         n_batches = len(test_loader)
 
-        t_preds = []
-        t_targets = []
-        t_vars = []
+        t_preds, t_targets, t_vars = [], [], []
 
         logger.info(f"---Running test eval for epoch: {epoch}---")
         with torch.no_grad():
             for x, y, ind in test_loader:
                 x, y = x.to(self.device), y.to(self.device)
-                h_vit_observed = self.model.transformer.vit_model(x)
-                out = self.model(x, local_idx=ind, y=y)
-                loss_dict_test_set = self.comp_loss(out, y=y, h_vit_observed=h_vit_observed)
-                for k in test_stats:
-                    test_stats[k] += loss_dict_test_set[k].item()
                 
-                t_preds.append(out['mu'])
+                out = self.model(x)
+                
+                _, metrics = self.objective(
+                    model=self.model,
+                    x_target=x,
+                    ss_history=out.history,
+                    gp_output=out.gp_out.mvn,
+                    gp_target=y
+                )
+                
+                for k, v in metrics.items():
+                    test_stats[k] += v
+                
+                t_preds.append(out.gp_out.mu)
                 t_targets.append(y)
-                t_vars.append(out['var'])
+                t_vars.append(out.gp_out.var)
         
-        mean_test_stats = {k : v / n_batches for k, v in test_stats.items()}
+        mean_test_stats = {k: v / n_batches for k, v in test_stats.items()}
 
         preds = torch.cat(t_preds)
         targets = torch.cat(t_targets)
@@ -206,48 +164,49 @@ class HybridLangevinTrainer:
         mse = F.mse_loss(preds, targets).item()
         aggregate_uncertainty = vars.mean().item()
 
-        self._log_val(epoch, mean_test_stats, mse, aggregate_uncertainty)
+        # Add global metrics to the dictionary before logging
+        mean_test_stats['mse_accuracy'] = mse
+        mean_test_stats['avg_predictive_variance'] = aggregate_uncertainty
 
+        self._log_metrics(epoch, mean_test_stats, prefix="val")
         logger.info(f"Val MSE: {mse:.4f} | Avg Uncertainty: {aggregate_uncertainty:.4f}")
 
         return mean_test_stats
     
-    def _log_val(self, epoch, stats, mse, uncertainty):
-        """Standardized MLflow logging for validation phase"""
-        mlflow.log_metric("val_total_loss", stats["total"], step=epoch)
-        mlflow.log_metric("val_nll", stats["nll"], step=epoch)
-        mlflow.log_metric("val_rkhs_mse", stats["rkhs"], step=epoch)
-        mlflow.log_metric("val_mse_accuracy", mse, step=epoch)
-        mlflow.log_metric("val_avg_predictive_variance", uncertainty, step=epoch)
-
-    def _log_epoch(self, epoch, stats):
-        """Standardized MLflow logging for DKL/HDP metrics"""
-        mlflow.log_metric("train_total_loss", stats["total"], step=epoch)
-        mlflow.log_metric("train_nll", stats["nll"], step=epoch)
-        mlflow.log_metric("train_kl_divergence", stats["kl"], step=epoch)
-        mlflow.log_metric("train_rkhs_mse", stats["rkhs"], step=epoch)
-        mlflow.log_metric("langevin_temp", self.temp, step=epoch)
-
+    @tracker(experiment="deepkernels")
     def fit(self, train_loader, test_loader=None):
-        logger.info(f"Starting trainng for {self.epochs} epochs on {self.device}")
-        for epoch in range(1, self.epochs+1):
-            stats_per_epoch = {"total_loss": 0, "nll": 0, "kl": 0, "rkhs": 0}
+        logger.info(f"Starting training for {self.epochs} epochs on {self.device}")
+        
+        total_steps = self.epochs * len(train_loader)
+        annealers = {
+            "dirichlet_global_kl": StochasticAnnealer(total_steps, n_cycles=4, stop_beta=0.1, noise_scale=0.01),
+            "dirichlet_local_kl": StochasticAnnealer(total_steps, n_cycles=4, stop_beta=0.1, noise_scale=0.01),
+            "lengthscale_kl": StochasticAnnealer(total_steps, n_cycles=1, ratio=0.2, stop_beta=1.0, noise_scale=0.0),
+            "alpha_kl": StochasticAnnealer(total_steps, n_cycles=1, ratio=0.2, stop_beta=1.0, noise_scale=0.0)
+        }
+        global_step=0
+        for epoch in range(1, self.epochs + 1):
+            train_stats = defaultdict(float)
             n_batches = len(train_loader)
-            for batch_idx, (x, y, ind) in enumerate(train_loader): #---idx currently unused--#
+            
+            for batch_idx, (x, y, ind) in enumerate(train_loader):
                 x, y = x.to(self.device), y.to(self.device)
-                loss_dict = self.step(x, y, ind)
-                for k in stats_per_epoch:
-                    stats_per_epoch[k] += loss_dict[k].item()
-            mean_train_stats = {k: v / n_batches for k, v in stats_per_epoch.items()}
+                current_kl_weights = {name: annealer(global_step) for name, annealer in annealers.items()}
+                self.objective.kl_weights = current_kl_weights
+                metrics = self.step(x, y) 
+                
+                for k, v in metrics.items():
+                    train_stats[k] += v
+                global_step += 1
+            
+            mean_train_stats = {k: v / n_batches for k, v in train_stats.items()}
+            self._log_metrics(epoch, mean_train_stats, prefix="train")
+            mlflow.log_metric("langevin_temp", self.temp, step=epoch)
 
-            #--Mlflow logging--#
-            self._log_epoch(epoch, mean_train_stats)
-            active_atoms = self.model.dirichlet.mu_atom.shape[0]
-            mlflow.log_metric("active_atoms", active_atoms, step=epoch)
-
-            logger.info(f"Epoch {epoch}/{self.epochs} | Loss: {mean_train_stats['total']:.4f} | Atoms: {active_atoms}")
+            total_loss = mean_train_stats.get('loss_total', 0.0)
+            logger.info(f"Epoch {epoch}/{self.epochs} | Loss: {total_loss:.4f}")
+            
             if test_loader:
                 self.evaluate(test_loader, epoch)
         
-        mlflow.pytorch.log_model(self.model, "final_mixture_model")
-
+        mlflow.pytorch.log_model(self.model, "deepkernels_model")

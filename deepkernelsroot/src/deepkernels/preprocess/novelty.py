@@ -106,7 +106,7 @@ class NoveltyConfig(BaseModel):
     bisg_cols: list[str] = ["black_s_pct", "black_g_pct", "black_fs_pct", "black_bifsg_pct", "black_sg_pct"] #-clip -> logits -> logit_z--#--mean_bisg-#
     pop_cols: list[str] = ["share_pop_black", "share_black_pop_geba"] #-clip -> logits -> logit_z--#
     lender_cols: list[str] = ["fintech", "cdfi", "creditunion", "bank"] #-type to flag -> create lender_id column-#
-    to_log_transform: Union[list[str], str] = ['total_percap_inc'] 
+    to_log_transform: list[str] = ['total_percap_inc'] 
     drop_patterns: list[str] = ['lmean_', 'approved_', 'delta_', 'false_', 'fintech_lenders_', 'lenders_sent_', 'non_fintech_', '_sent_to', 'one_per_borrower', 'rejected', 'shr_app_', 'shr_appr_', 'shr_loan_', 'shr_rej_', 'true_', 'year', 'unique_', 'black_final_race', '_rand', 'num_', 'unique_borrower', 'lender_borrower']
     
     
@@ -391,8 +391,12 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         """
         df = df_in.copy()
         drop_list = []
-  
-        potential_dupes = self.bisg_cols + self.pop_cols + self.seg_cols + self.to_log_transform + self.cat_cols
+        bisg_cols = self.bisg_cols
+        pop_cols = self.pop_cols
+        seg_cols = self.seg_cols
+        to_log_cols = self.to_log_transform
+        cat_cols = self.cat_cols
+        potential_dupes = bisg_cols + pop_cols + seg_cols + to_log_cols + cat_cols
         for col in potential_dupes:
             if col in df.columns:
                 if f"{col}_logit_z" in df.columns or f"{col}_logit" in df.columns or f"{col}_z" in df.columns or f"log_{col}" in df.columns:
@@ -401,7 +405,8 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
         noise_patterns = [
             'lg_bifsg', 's_bifsg', 'sg_lg_bifsg', 'sg_s_bifsg', 'lg_s_bifsg', 'lg_bifsg_lsg',
             'lg_s_bifsg',  'comp_int_3', 's_bifsg_lsg', 'amountsought', 'sg_lg_s',
-            'sg_bifsg_lsg', 'factoringccmca', 'has_masters', 'has_postgrad', 'is_ever_ceo', 'mdi_z'
+            'sg_bifsg_lsg', 'factoringccmca', 'has_masters', 'has_postgrad', 'is_ever_ceo', 'mdi_z',
+            "lender_clean", "sg_s", "lg_s", "s_lsg", "lfs", "lg_lsg", "sg_lsg"
         ] #-added amountsought because log_amountsought is in the original df -- this also includes ghost cols
 
         drop_list.extend([c for c in noise_patterns if c in df.columns])

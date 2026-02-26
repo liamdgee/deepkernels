@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import gpytorch
 import torch.nn.functional as F
+from typing import NamedTuple
 
 class EvidenceLowerBound(nn.Module):
     def __init__(self, 
@@ -37,34 +38,18 @@ class EvidenceLowerBound(nn.Module):
         kl_metrics = {}
         
         kl_loss = 0.0
-
-        vae_alpha_loss = 0.0
-        vae_ls_loss = 0.0
-
-        dir_global_loss = 0.0
-        dir_local_loss = 0.0
         
-        recon_loss = F.l1_loss(ss_history.recons, x_target, reduction='sum')
+        recon_loss = F.l1_loss(ss_history.recons, x_target, reduction='mean')
         
         for name, added_loss_term in model.named_added_loss_terms():
             raw_loss = added_loss_term.loss()
             weight = self.kl_weights.get(name, 1.0)
             scaled_loss = weight * raw_loss
             kl_loss += scaled_loss
-            
             kl_metrics[f'loss_{name}'] = scaled_loss.item()
-            
-            if "global" in name:
-                dir_global_loss += scaled_loss
-            elif "local" in name:
-                dir_local_loss += scaled_loss
-            elif "lengthscale" in name:
-                vae_ls_loss += scaled_loss
-            elif "alpha" in name:
-                vae_alpha_loss += scaled_loss
         
         # --- GP Marginal Log Likelihood (Variational ELBO)-- negative for gradient descent --- #
-        gp_loss = -self.mll(gp_output, gp_target).sum()
+        gp_loss = -self.mll(gp_output, gp_target)
 
         # --- Loss function ---
         total_loss = recon_loss + kl_loss + gp_loss
@@ -77,10 +62,6 @@ class EvidenceLowerBound(nn.Module):
             'loss_recon': to_item(recon_loss),
             'loss_kls': to_item(kl_loss),
             'loss_gp': to_item(gp_loss),
-            'dir_global_kl': to_item(dir_global_loss),
-            'dir_local_kl': to_item(dir_local_loss),
-            'vae_alpha_kl': to_item(vae_alpha_loss),
-            'vae_ls_kl': to_item(vae_ls_loss),
             **kl_metrics
         }
         

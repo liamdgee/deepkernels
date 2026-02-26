@@ -65,6 +65,7 @@ class SpectralDecoder(BaseGenerativeModel):
         current_dim = spectral_emb_dim
         self.latent_dim = latent_dim
         layers = []
+        
         for compression in spectral_compressions:
             layers.append(torch.nn.utils.spectral_norm(nn.Linear(current_dim, compression)))
             layers.append(nn.LayerNorm(compression))

@@ -52,7 +52,6 @@ class GenerativeKernel(Kernel):
         gates = pooled_params['gates']
 
         # --- THE RECIPE FOR GPYTORCH ---
-        # THE FIX: Require explicit **inner_params so PyTorch can track the graph!
         def covar_func(x1_, x2_, **inner_params):
             ls_rbf_in = inner_params['ls_rbf']
             ls_per_in = inner_params['ls_per']

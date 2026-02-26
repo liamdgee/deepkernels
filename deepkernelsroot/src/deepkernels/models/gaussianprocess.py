@@ -6,9 +6,16 @@ from gpytorch.models import ApproximateGP
 import torch.nn.functional as F
 from typing import Literal
 import random
+from typing import NamedTuple
 
 from deepkernels.models.parent import BaseGenerativeModel
 from deepkernels.kernels.keops import GenerativeKernel, ProbabilisticMixtureMean
+
+class GPOutput(NamedTuple):
+    mvn: gpytorch.distributions.MultivariateNormal
+    mu: torch.Tensor
+    var: torch.Tensor
+    covar: gpytorch.lazy.LazyTensor
 
 class AcceleratedKernelGP(ApproximateGP):
     def __init__(self, inducing=None, k_atoms=30, num_latents=8, **params):
@@ -50,4 +57,11 @@ class AcceleratedKernelGP(ApproximateGP):
         
         covar_x = self.covar_module(x, x, **kwargs)
         
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+        mvn = gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+        return GPOutput(
+            mvn=mvn,
+            mu=mvn.mean,
+            var=mvn.variance,
+            covar=mvn.lazy_covariance_matrix
+        )
