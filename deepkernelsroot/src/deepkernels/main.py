@@ -52,8 +52,8 @@ def main():
     if not os.path.exists(local_data_path1) or not os.path.exists(local_data_path2):
         raise FileNotFoundError(f"Could not find one or both data files. Please check your paths!\nPath 1: {local_data_path1}\nPath 2: {local_data_path2}")
     
-    df1 = pd.read_csv(local_data_path1)
-    df2 = pd.read_csv(local_data_path2)
+    df1 = pd.read_stata(local_data_path1)
+    df2 = pd.read_stata(local_data_path2)
 
     logger.info("Running Data Orchestrator (Parallel Cleaning -> Merging -> Harmonising -> Sequencing)...")
     
