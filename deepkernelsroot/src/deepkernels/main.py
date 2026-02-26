@@ -46,8 +46,8 @@ def main():
     #---------------------------------------------------------
     #-- data orchestration -- #
     # ---------------------------------------------------------
-    local_data_path1 = "data/lendio_all_methods_sociocorr_lender.dta"
-    local_data_path2 = "data/appr_reg_data.dta"
+    local_data_path1 = "/home/liam/deepkernels/data/lendio_all_methods_sociocorr_lender.dta"
+    local_data_path2 = "/home/liam/deepkernels/data/appr_reg_data.dta"
     
     if not os.path.exists(local_data_path1) or not os.path.exists(local_data_path2):
         raise FileNotFoundError(f"Could not find one or both data files. Please check your paths!\nPath 1: {local_data_path1}\nPath 2: {local_data_path2}")
