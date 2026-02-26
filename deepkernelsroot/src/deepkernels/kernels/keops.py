@@ -1,15 +1,24 @@
 import torch
+
+import os
+os.environ['CUDA_HOME'] = '/usr/local/cuda'
+os.environ['PATH'] = '/usr/local/cuda/bin:' + os.environ['PATH']
+
+import pykeops
+pykeops.clean_pykeops()
+pykeops.config.cuda_standalone = True
+pykeops.config.use_OpenMP = False
+
 import math
 import itertools
 import gpytorch
-import pykeops
 from gpytorch.kernels import Kernel
 from pykeops.torch import LazyTensor
 import linear_operator
 from linear_operator.operators import LinearOperator
 from gpytorch.operators import KeOpsLinearOperator
 from gpytorch.kernels.keops import RBFKernel
-pykeops.config.use_OpenMP = False
+
 
 
 class GenerativeKernel(Kernel):
@@ -179,15 +188,11 @@ class GenerativeKernel(Kernel):
         for i in range(1, self.kernels_out):
             k_final_diag += gates[..., i:i+1] * all_diag[i]
             
-        outputscale = torch.nn.functional.softplus(self.raw_outputscale).view(*self.batch_shape, 1)
+        outputscale = torch.nn.functional.softplus(self.raw_outputscale)
         
-        # Pad outputscale for broadcasting if needed
-        batch_dims = x1.shape[:-2] 
-        pad_dims = len(batch_dims) - len(self.batch_shape)
-        for _ in range(pad_dims):
-            outputscale = outputscale.unsqueeze(0)
-        outputscale = outputscale.unsqueeze(-1)
-            
+        while outputscale.dim() < k_final_diag.dim():
+            outputscale = outputscale.unsqueeze(0)        
+        # 3. Final multiplication
         return k_final_diag * outputscale
 
 class ProbabilisticMixtureMean(gpytorch.means.Mean):

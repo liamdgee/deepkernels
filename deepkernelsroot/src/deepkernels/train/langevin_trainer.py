@@ -40,7 +40,7 @@ class LangevinTrainer:
         self.device = self.get_device(device)
         self.epochs = kwargs.get('total_epochs', 200)
         self.temp = kwargs.get('langevin_temp', 7.5e-6)
-        self.objective = EvidenceLowerBound(gp_model=self.model.gp, num_data=38003).to(self.device  )
+        self.objective = EvidenceLowerBound(gp_model=self.model.gp, num_data=38003).to(self.device)
         self.adam_optimiser = adam_optimiser
         self.sgld_optimiser = sgld_optimiser
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)
