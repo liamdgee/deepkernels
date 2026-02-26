@@ -20,27 +20,11 @@ from deepkernels.preprocess.pipe import DataOrchestrator
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def get_dummy_data(num_samples=1000, seq_len=30, features=16, batch_size=128):
-    """Generates dummy data to test the pipeline plumbing."""
-    logger.info("Generating dummy dataset...")
-    
-    #-x: Input sequences [Batch, SeqLen, Features]
-    x_data = torch.randn(num_samples, seq_len, features)
-    
-    y_data = torch.randn(num_samples, seq_len, features) 
-    
-    ind_data = torch.arange(num_samples)
-    
-    dataset = TensorDataset(x_data, y_data, ind_data)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
-    return loader
-
 def main():
     #---------------------------------------------------------
     #-- device config --#
     # ---------------------------------------------------------
-    device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Initializing pipeline on device: {device}")
 
     #---------------------------------------------------------
