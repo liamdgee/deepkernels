@@ -5,7 +5,9 @@ import gpytorch
 import pykeops
 from gpytorch.kernels import Kernel
 from pykeops.torch import LazyTensor
-from linear_operator.operators import KeOpsLinearOperator
+import linear_operator
+from linear_operator.operators import LinearOperator
+from gpytorch.operators import KeOpsLinearOperator
 from gpytorch.kernels.keops import RBFKernel
 pykeops.config.use_OpenMP = False
 
@@ -24,7 +26,7 @@ class GenerativeKernel(Kernel):
             parameter=torch.nn.Parameter(torch.zeros(*batch_shape))
         )
 
-    def forward(self, x1, x2, diag=False, **params):
+    def forward(self, x1, x2, diag=False, **params) -> LinearOperator:
         if diag:
             return self._forward_diag_fallback(x1, x2, **params)
         
@@ -114,15 +116,15 @@ class GenerativeKernel(Kernel):
 
             # --- GATED ROUTING ---
             gates_lazy = gates_in.unsqueeze(-2).unsqueeze(-2)
-            k_final_inner = LazyTensor(gates_lazy[..., 0:1]) * kernels[0]
-            
-            for i in range(1, self.kernels_out):
-                k_final_inner = k_final_inner + (LazyTensor(gates_lazy[..., i:i+1]) * kernels[i])
-                
-            return k_final_inner
+            weighted_kernels = [
+                LazyTensor(gates_lazy[..., i:i+1]) * kernels[i] 
+                for i in range(self.kernels_out)
+            ]
+
+            return sum(weighted_kernels)
         
         keops_op = KeOpsLinearOperator(
-            x1, x2, covar_func,
+            x1.contiguous(), x2.contiguous(), covar_func,
             ls_rbf=ls_rbf, ls_per=ls_per, p_per=p_per, ls_mat=ls_mat,
             w_sm=w_sm, mu_sm=mu_sm, v_sm=v_sm, gates=gates
         )

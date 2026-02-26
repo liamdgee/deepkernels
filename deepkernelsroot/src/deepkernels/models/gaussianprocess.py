@@ -11,11 +11,20 @@ from typing import NamedTuple
 from deepkernels.models.parent import BaseGenerativeModel
 from deepkernels.kernels.keops import GenerativeKernel, ProbabilisticMixtureMean
 
+import math
+import itertools
+import pykeops
+from gpytorch.kernels import Kernel
+import linear_operator
+from linear_operator.operators import KeOpsLinearOperator, LinearOperator
+from gpytorch.kernels.keops import RBFKernel
+pykeops.config.use_OpenMP = False
+
 class GPOutput(NamedTuple):
     mvn: gpytorch.distributions.MultivariateNormal
     mu: torch.Tensor
     var: torch.Tensor
-    covar: gpytorch.lazy.LazyTensor
+    covar: linear_operator.operators.LinearOperator
 
 class AcceleratedKernelGP(ApproximateGP):
     def __init__(self, inducing=None, k_atoms=30, num_latents=8, **params):
@@ -37,7 +46,7 @@ class AcceleratedKernelGP(ApproximateGP):
 
         variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(num_inducing_points=num_inducing, batch_shape=latent_batch_shape)
 
-        inner_strategy = gpytorch.variational.VariationalStrategy(self, inducing_points, variational_distribution, learn_inducing_locations=False)
+        inner_strategy = gpytorch.variational.VariationalStrategy(self, inducing_points, variational_distribution, learn_inducing_locations=True)
         
         variational_strategy = gpytorch.variational.LMCVariationalStrategy(inner_strategy, num_tasks=self.k_atoms, num_latents=self.num_latents, latent_dim=-1)
         
@@ -52,16 +61,21 @@ class AcceleratedKernelGP(ApproximateGP):
         kwargs will contain 'gp_params' (from KernelNetwork) 
         and optionally 'pi' (from Dirichlet)
         """
+        diag = kwargs.get("diag", False)
         
         mean_x = self.mean_module(x)
         
         covar_x = self.covar_module(x, x, **kwargs)
         
-        mvn = gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+    
+    def __call__(self, x, **kwargs):
+        # This is where we wrap the result into your GPOutput for the rest of your pipeline
+        mvn = super().__call__(x, **kwargs)
+        
         return GPOutput(
             mvn=mvn,
             mu=mvn.mean,
             var=mvn.variance,
-            covar=mvn.lazy_covariance_matrix
+            covar=mvn.covariance_matrix
         )
