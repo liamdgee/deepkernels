@@ -1,44 +1,57 @@
-#-base (shared env)-#
-FROM python:3.10-slim as base
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PATH="/root/.local/bin:$PATH"
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y \
+    git \
+    ninja-build \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 #-builder-#
-FROM base as builder
+FROM base AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    curl \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 COPY pyproject.toml .
-
 RUN mkdir -p src/deepkernels && touch src/deepkernels/__init__.py
 
-RUN pip install --user --upgrade pip && \
-    pip install --user .[dev]
+RUN pip install --upgrade pip && \
+    pip install .[dev]
 
 #-test-#
-FROM builder as test
+FROM builder AS test
 
 COPY . .
 RUN black --check src/
 RUN pytest tests/unit/test_cleaner.py
-RUN pip install --user safety && /root/.local/bin/safety check --output bare
+RUN pip install safety && safety check --output bare
 
 #-prod-#
 FROM base AS production
 
-COPY --from=builder /root/.local /root/.local
+COPY --from=builder /opt/venv /opt/venv
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONPATH="/app/src" \
+    PYKEOPS_BUILD_DIR='/app/.cache/pykeops' \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+WORKDIR /app
+
 COPY src/ /app/src/
 COPY pyproject.toml /app/
 
-RUN useradd -m deepkerneluser && chown -R deepkerneluser /app
+RUN useradd -m deepkerneluser && \
+    mkdir -p /app/.cache/pykeops && \
+    chown -R deepkerneluser:deepkerneluser /app
+
 USER deepkerneluser
 
 LABEL maintainer="Liam Douglas Giles"

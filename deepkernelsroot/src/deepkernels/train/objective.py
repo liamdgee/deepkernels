@@ -6,8 +6,7 @@ from typing import NamedTuple
 
 class EvidenceLowerBound(nn.Module):
     def __init__(self, 
-                 gp_model, 
-                 likelihood = None, 
+                 model,
                  num_data=38003, 
                  kl_weights=None):
         """
@@ -17,10 +16,9 @@ class EvidenceLowerBound(nn.Module):
             num_data: Total number of samples in your entire training dataset (crucial for GP KL scaling).
         """
         super().__init__()
-        self.likelihood = likelihood if likelihood is not None else gpytorch.likelihoods.GaussianLikelihood()
         self.mll = gpytorch.mlls.VariationalELBO(
-            likelihood=self.likelihood, 
-            model=gp_model, 
+            likelihood=model.gp.likelihood, 
+            model=model.gp, 
             num_data=num_data
         )
         self.kl_weights = kl_weights or {}
@@ -42,8 +40,15 @@ class EvidenceLowerBound(nn.Module):
         recon_loss = F.l1_loss(ss_history.recons, x_target, reduction='mean')
         
         for name, added_loss_term in model.named_added_loss_terms():
+            if 'gp' in name or isinstance(added_loss_term, gpytorch.mlls.AddedLossTerm):
+                continue
+                
             raw_loss = added_loss_term.loss()
-            weight = self.kl_weights.get(name, 1.0)
+            weight = 1.0
+            for key, annealed_val in self.kl_weights.items():
+                if key in name:
+                    weight = annealed_val
+                    break
             scaled_loss = weight * raw_loss
             kl_loss += scaled_loss
             kl_metrics[f'loss_{name}'] = scaled_loss.item()

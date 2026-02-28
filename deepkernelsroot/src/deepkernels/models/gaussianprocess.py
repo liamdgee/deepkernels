@@ -11,23 +11,26 @@ from typing import NamedTuple
 from deepkernels.models.parent import BaseGenerativeModel
 from deepkernels.kernels.keops import GenerativeKernel, ProbabilisticMixtureMean
 
-import math
-import itertools
+import os
+os.environ['CUDA_HOME'] = '/usr/local/cuda'
+os.environ['PATH'] = '/usr/local/cuda/bin:' + os.environ['PATH']
+
 import pykeops
-from gpytorch.kernels import Kernel
-import linear_operator
-from linear_operator.operators import KeOpsLinearOperator, LinearOperator
-from gpytorch.kernels.keops import RBFKernel
+#### -- pykeops.clean_pykeops()
+pykeops.config.cuda_standalone = True
 pykeops.config.use_OpenMP = False
 
-class GPOutput(NamedTuple):
-    mvn: gpytorch.distributions.MultivariateNormal
-    mu: torch.Tensor
-    var: torch.Tensor
-    covar: linear_operator.operators.LinearOperator
+import math
+import itertools
+from gpytorch.kernels import Kernel
+from pykeops.torch import LazyTensor
+import linear_operator
+from linear_operator.operators import LinearOperator
+from gpytorch.operators import KeOpsLinearOperator
+from gpytorch.kernels.keops import RBFKernel
 
 class AcceleratedKernelGP(ApproximateGP):
-    def __init__(self, inducing=None, k_atoms=30, num_latents=8, **params):
+    def __init__(self, inducing=None, likelihood=None, k_atoms=30, num_latents=8, **params):
         """
         'Physics Anchor' with KeOps Optimised Kernel
         Args:
@@ -35,9 +38,9 @@ class AcceleratedKernelGP(ApproximateGP):
         """
         self.k_atoms = k_atoms
         self.num_latents = num_latents
-        
-        #-inducing point
-        base_inducing_points = params.get("inducing_points", torch.randn(512, 16))
+        self.likelihood = likelihood if likelihood else gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.k_atoms)
+        #-inducing points-#
+        base_inducing_points = params.get("inducing_points", torch.randn(256, 16))
         base_inducing_points = inducing if inducing is not None else base_inducing_points
         num_inducing = base_inducing_points.size(0)
         
@@ -62,20 +65,11 @@ class AcceleratedKernelGP(ApproximateGP):
         and optionally 'pi' (from Dirichlet)
         """
         diag = kwargs.get("diag", False)
+
+        xc = x.contiguous()
         
-        mean_x = self.mean_module(x)
+        mean_x = self.mean_module(xc)
         
-        covar_x = self.covar_module(x, x, **kwargs)
+        covar_x = self.covar_module(xc, xc, **kwargs)
         
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-    
-    def __call__(self, x, **kwargs):
-        # This is where we wrap the result into your GPOutput for the rest of your pipeline
-        mvn = super().__call__(x, **kwargs)
-        
-        return GPOutput(
-            mvn=mvn,
-            mu=mvn.mean,
-            var=mvn.variance,
-            covar=mvn.covariance_matrix
-        )

@@ -10,10 +10,12 @@ import functools
 import mlflow
 from collections import defaultdict
 import torch.nn.functional as F
+import gpytorch
 
 from deepkernels.train.objective import EvidenceLowerBound
 from deepkernels.train.stochastic_annealer import StochasticAnnealer
 from typing import Union
+from deepkernels.train.trainer import ParameterIsolate
 #---Init logger---#
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -35,29 +37,50 @@ def tracker(experiment):
 
 #---Class Definition: Stochastic Gradient Optimiser with Adaptive Langevin Dynamics--#
 class LangevinTrainer:
-    def __init__(self, model, adam_optimiser, sgld_optimiser, device='cuda', **kwargs):
+    def __init__(self, model, device='cuda', **kwargs):
         self.model = model
         self.device = self.get_device(device)
         self.epochs = kwargs.get('total_epochs', 200)
         self.temp = kwargs.get('langevin_temp', 7.5e-6)
-        self.objective = EvidenceLowerBound(gp_model=self.model.gp, num_data=38003).to(self.device)
-        self.adam_optimiser = adam_optimiser
-        self.sgld_optimiser = sgld_optimiser
+        self.objective = EvidenceLowerBound(self.model).to(self.device)
+        self.orchestrator = ParameterIsolate(model, device=device, **kwargs)
+        self.adamw_optimiser, self.sgld_optimiser, self.adam_optimiser, self.debug = self.orchestrator.seperate_params_and_build_optimisers()
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)
+        self.kwargs = kwargs
+        self.n_data = kwargs.get('n_data', 38003.0)
+        self.adamw_params = [p for g in self.adamw_optimiser.param_groups for p in g['params']]
+        self.adam_params = [p for g in self.adam_optimiser.param_groups for p in g['params']]
+        self.langevin_params = [p for g in self.sgld_optimiser.param_groups for p in g['params']]
         
     def _inject_langevin_noise(self, temp):
-        for g in self.sgld_optimiser.param_groups:
-            noise_scale = math.sqrt(2 * g['lr'] * temp)
-            for p in g['params']:
-                if p.grad is not None:
-                    state = self.sgld_optimiser.state[p]
-                    if 'sum' in state:
-                        G = state['sum']
-                    else:
-                        G = torch.ones_like(p.grad)
-                    precond = 1.0 / (torch.sqrt(G) + 1e-8)
-                    langevin_noise = torch.randn_like(p.grad) * noise_scale * torch.sqrt(precond)
-                    p.grad.add_(langevin_noise)
+        with torch.no_grad():
+            for g in self.sgld_optimiser.param_groups:
+                lr = g['lr']
+                noise_scale = math.sqrt((2 * lr * temp) / self.n_data)
+                for p in g['params']:
+                    if p.grad is not None:
+                        state = self.sgld_optimiser.state[p]
+                        if 'square_avg' in state:
+                            G = state['square_avg']
+                            precond = 1.0 / (torch.sqrt(G) + 1e-8)
+                        else:
+                            precond = torch.ones_like(p.data)
+                        step_noise = torch.randn_like(p.data) * noise_scale * precond
+                        p.add_(step_noise)
+        return self
+    
+    def save_checkpoint(self, filepath="langevin_generative_kernel_v1.pth"):
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'likelihood_state_dict': self.model.gp.likelihood.state_dict(), # Fixed path
+            'sgld_optimiser_state_dict': self.sgld_optimiser.state_dict(),
+            'adam_optimiser_state_dict': self.adam_optimiser.state_dict(),
+            'adamw_optimiser_state_dict': self.adamw_optimiser.state_dict(),
+        }, filepath)
+        if mlflow.active_run():
+            mlflow.log_artifact(filepath, artifact_path="model_checkpoints")
+        logger.info(f"\n[+] Checkpoint safely saved to {filepath}")
+        return self
     
     def get_device(self, device_request: Union[str, torch.device, None] = None) -> torch.device:
 
@@ -95,27 +118,33 @@ class LangevinTrainer:
     def step(self, x, targets):
         self.model.train()
         
+        self.adamw_optimiser.zero_grad()
         self.adam_optimiser.zero_grad()
         self.sgld_optimiser.zero_grad()
         
-        model_out = self.model(x)
-
-        loss, metrics = self.objective(
-            model=self.model,
-            x_target=x,
-            ss_history=model_out.history,
-            gp_output=model_out.gp_out.mvn,
-            gp_target=targets
-        )
+        cholesky_jitter_val = self.kwargs.get('cholesky_jitter', 2e-6)
+        with gpytorch.settings.cholesky_jitter(float(cholesky_jitter_val)):
+            model_out = self.model(x)
+            loss, metrics = self.objective(
+                model=self.model,
+                x_target=x,
+                ss_history=model_out.history,
+                gp_output=model_out.gp_out,
+                gp_target=targets
+            )
 
         loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
-
-        self._inject_langevin_noise(temp=self.temp)
+        torch.nn.utils.clip_grad_norm_(self.adamw_params + self.adam_params, max_norm=self.max_grad_norm)
+        langevin_clip_norm = self.kwargs.get('langevin_clip_norm', 1.0)
+        torch.nn.utils.clip_grad_norm_(self.langevin_params, max_norm=langevin_clip_norm)
 
         self.adam_optimiser.step()
+        self.adamw_optimiser.step()
         self.sgld_optimiser.step()
+
+
+        self._inject_langevin_noise(temp=self.temp)
         
         return metrics
     
@@ -132,9 +161,9 @@ class LangevinTrainer:
         n_batches = len(test_loader)
 
         t_preds, t_targets, t_vars = [], [], []
-
+        cholesky_jitter_val = self.kwargs.get('cholesky_jitter', 2e-6)
         logger.info(f"---Running test eval for epoch: {epoch}---")
-        with torch.no_grad():
+        with torch.no_grad(), gpytorch.settings.cholesky_jitter(float(cholesky_jitter_val)):
             for x, y, ind in test_loader:
                 x, y = x.to(self.device), y.to(self.device)
                 
@@ -144,16 +173,16 @@ class LangevinTrainer:
                     model=self.model,
                     x_target=x,
                     ss_history=out.history,
-                    gp_output=out.gp_out.mvn,
+                    gp_output=out.gp_out,
                     gp_target=y
                 )
                 
                 for k, v in metrics.items():
                     test_stats[k] += v
                 
-                t_preds.append(out.gp_out.mu)
+                t_preds.append(out.gp_out.mean)
                 t_targets.append(y)
-                t_vars.append(out.gp_out.var)
+                t_vars.append(out.gp_out.variance)
         
         mean_test_stats = {k: v / n_batches for k, v in test_stats.items()}
 
@@ -189,7 +218,7 @@ class LangevinTrainer:
             train_stats = defaultdict(float)
             n_batches = len(train_loader)
             
-            for batch_idx, (x, y, ind) in enumerate(train_loader):
+            for batch_idx, (x, y) in enumerate(train_loader):
                 x, y = x.to(self.device), y.to(self.device)
                 current_kl_weights = {name: annealer(global_step) for name, annealer in annealers.items()}
                 self.objective.kl_weights = current_kl_weights
@@ -208,5 +237,5 @@ class LangevinTrainer:
             
             if test_loader:
                 self.evaluate(test_loader, epoch)
-        
+        self.save_checkpoint("deepkernels_model.pth")
         mlflow.pytorch.log_model(self.model, "deepkernels_model")

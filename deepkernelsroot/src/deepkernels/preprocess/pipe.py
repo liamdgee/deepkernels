@@ -12,6 +12,10 @@ from typing import Union, Optional
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 
+import os
+os.environ['CUDA_HOME'] = '/usr/local/cuda'
+os.environ['PATH'] = '/usr/local/cuda/bin:' + os.environ['PATH']
+
 #---Init logger---#
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -30,8 +34,7 @@ class DataOrchestrator:
         self.collector = Collector()
     
     def collect(self, df1, df2):
-        dfs = self.collector.collect(df1, df2)
-        return dfs
+        return self.collector.collect(df1, df2)
 
     def build_pipe(self, **overrides):
 
@@ -90,36 +93,43 @@ class DataOrchestrator:
             tensor_y = tensor_y.unsqueeze(-1)
         seq_y = tensor_y.unfold(dimension=0, size=seq_len, step=1).transpose(1, 2)
         
-        return seq_x, seq_y
+        return seq_x.contiguous(), seq_y.contiguous()
+    
     
     @staticmethod
-    def to_numpy(X):
-        return X.to_numpy()
-    
-    @staticmethod
-    def prepare_data(seq_x, seq_y, test_pct=0.2, batch_size=128):
+    def prepare_data(seq_x, seq_y, test_pct=0.2, batch_size=128, num_workers=4):
         """
         Splits the sequence blocks and packages them into DataLoaders.
         Note: shuffle=False for time series chronological splitting!
         """
-        X_train, X_test, y_train, y_test = train_test_split(
-            seq_x.numpy(), seq_y.numpy(), 
-            test_size=test_pct, 
-            random_state=42, 
-            shuffle=False  #-Chronological split
+        total_seqs = seq_x.size(0)
+        split_idx = int(total_seqs * (1 - test_pct))
+        
+        train_x, test_x = seq_x[:split_idx], seq_x[split_idx:]
+        train_y, test_y = seq_y[:split_idx], seq_y[split_idx:]
+        
+        # pin_memory=True and num_workers are essential for cloud GPU saturation
+        train_loader = DataLoader(
+            TensorDataset(train_x, train_y), 
+            batch_size=batch_size, 
+            shuffle=True, 
+            pin_memory=True, 
+            num_workers=num_workers,
+            prefetch_factor=2 if num_workers > 0 else None
         )
         
-        train_x = torch.tensor(X_train, dtype=torch.float32)
-        train_y = torch.tensor(y_train, dtype=torch.float32)
-        test_x = torch.tensor(X_test, dtype=torch.float32)
-        test_y = torch.tensor(y_test, dtype=torch.float32)
-        
-        train_loader = DataLoader(TensorDataset(train_x, train_y), batch_size=batch_size, shuffle=True)
-        test_loader = DataLoader(TensorDataset(test_x, test_y), batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(
+            TensorDataset(test_x, test_y), 
+            batch_size=batch_size, 
+            shuffle=False, 
+            pin_memory=True, 
+            num_workers=num_workers,
+            prefetch_factor=2 if num_workers > 0 else None
+        )
         
         return train_loader, test_loader
     
-    def run_pipeline(self, df1: pd.DataFrame, df2:pd.DataFrame, target_col: str, seq_len: int = 64, batch_size:int = 128):
+    def run_pipeline(self, df1: pd.DataFrame, df2:pd.DataFrame, test_pct:float=0.2, target_col: str='lmean_rejected', drop_cols: Optional[list[str]]=None, seq_len: int = 64, batch_size:int = 128, num_workers: int = 4):
         """Runs the entire pipeline end-to-end smoothly."""
         df1_clean = self.cleaner_df1.fit_transform(df1)
         df2_clean = self.cleaner_df2.fit_transform(df2)
@@ -127,11 +137,16 @@ class DataOrchestrator:
         pipe = self.build_pipe()
         df_processed = pipe.fit_transform(dfs_in)
         X_sorted, y_sorted = self.sort_by_time(df_processed, y_col=target_col, time_col='time')
+        drop_id_and_target = ["lender_id", "lmean_rejected"]
+        drops = [col for col in drop_id_and_target if col in X_sorted.columns]
+        X_sorted = X_sorted.drop(columns=drops, errors='ignore')
         X_norm = self.normalise_time(X_sorted)
-        X_tensor = torch.tensor(X_norm.to_numpy(), dtype=torch.float32)
-        y_tensor = torch.tensor(y_sorted.to_numpy(), dtype=torch.float32)
+
+        X_tensor = torch.tensor(X_norm.to_numpy(), dtype=torch.float64)
+        y_tensor = torch.tensor(y_sorted.to_numpy(), dtype=torch.float64)
+        
         seq_x, seq_y = self.to_seq_data(X_tensor, y_tensor, seq_len=seq_len)
-        train_loader, test_loader = self.prepare_data(seq_x, seq_y, batch_size=batch_size)
+        train_loader, test_loader = self.prepare_data(seq_x, seq_y, test_pct=test_pct, batch_size=batch_size, num_workers=num_workers)
         
         logger.info("Pipeline execution complete. DataLoaders ready for training.")
         return train_loader, test_loader

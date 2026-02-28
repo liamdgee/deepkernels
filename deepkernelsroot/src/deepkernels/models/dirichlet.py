@@ -35,6 +35,8 @@ class DirichletOutput(NamedTuple):
     conc_prior: torch.Tensor
     conc_post: torch.Tensor
     ls_logvar: torch.Tensor
+    mu_z: torch.Tensor
+    logvar_z: torch.Tensor
     gp_params: GPParams
 
 class LossTerm(gpytorch.mlls.AddedLossTerm):
@@ -143,6 +145,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
             pi = None
         
         mualpha, factoralpha, diagalpha = vae_out.alpha_mu, vae_out.alpha_factor, vae_out.alpha_diag
+        mu_z, logvar_z = vae_out.mu_z, vae_out.logvar_z
         
         ls = params.get('ls')
         if ls is None and vae_out is not None:
@@ -182,7 +185,9 @@ class AmortisedDirichlet(BaseGenerativeModel):
             conc_prior=gamma_conc,
             conc_post=local_conc,
             ls_logvar=ls_logvar,
-            gp_params=gp_params
+            gp_params=gp_params,
+            mu_z=mu_z,
+            logvar_z=logvar_z
         )
     
     def log_global_kl(self, log_pv, log_qv):

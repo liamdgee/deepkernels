@@ -5,7 +5,8 @@ os.environ['CUDA_HOME'] = '/usr/local/cuda'
 os.environ['PATH'] = '/usr/local/cuda/bin:' + os.environ['PATH']
 
 import pykeops
-pykeops.clean_pykeops()
+
+##--pykeops.clean_pykeops()
 pykeops.config.cuda_standalone = True
 pykeops.config.use_OpenMP = False
 
@@ -140,12 +141,7 @@ class GenerativeKernel(Kernel):
 
         #-batch aware output scale-#
         outputscale = torch.nn.functional.softplus(self.raw_outputscale)
-        batch_dims = x1.shape[:-2] 
-        pad_dims = len(batch_dims) - len(self.batch_shape)
-        for _ in range(pad_dims):
-            outputscale = outputscale.unsqueeze(0)
-            
-        outputscale = outputscale.unsqueeze(-1).unsqueeze(-1)
+        outputscale = outputscale.view(*self.batch_shape, 1, 1)
         
         return keops_op * outputscale
 
@@ -190,29 +186,25 @@ class GenerativeKernel(Kernel):
             
         outputscale = torch.nn.functional.softplus(self.raw_outputscale)
         
-        while outputscale.dim() < k_final_diag.dim():
-            outputscale = outputscale.unsqueeze(0)        
-        # 3. Final multiplication
+        outputscale = outputscale.view(*self.batch_shape, 1)
+        
         return k_final_diag * outputscale
 
 class ProbabilisticMixtureMean(gpytorch.means.Mean):
-    def __init__(self, k_atoms=30, batch_shape=torch.Size([])):
+    def __init__(self, k_atoms=30, num_experts=8, batch_shape=torch.Size([])):
         super().__init__(batch_shape=batch_shape)
+        self.num_experts = num_experts
         self.register_parameter(
             name="cluster_constants", 
             parameter=torch.nn.Parameter(torch.randn(k_atoms, *batch_shape) * 0.1)
         )
 
     def forward(self, x, **params):
-        target_shape = x.shape[:-1]
-        expert_means = params.get("mixture_means_per_expert", None)
-        
-        # THE SHIELD: Are we evaluating Data or Inducing Points?
-        # Data target_shape = [Batch, Experts, SeqLen] (Length 3)
-        # Inducing target_shape = [Experts, Num_Inducing] (Length 2)
-        if expert_means is not None and len(target_shape) > 2:
-            # It's the data! Expand the means over the sequence length.
-            return expert_means.unsqueeze(-1).expand(target_shape)
+        target_shape = x.shape[:-1] 
+        pi = params.get("pi", None)
+
+        if pi is not None and len(target_shape) > 2:
+            latent_means = pi @ self.cluster_constants
+            return latent_means.movedim(-1, 0)
         else:
-            # It's the inducing points! Just return 0 to bypass the batch collision.
             return torch.zeros(target_shape, device=x.device)

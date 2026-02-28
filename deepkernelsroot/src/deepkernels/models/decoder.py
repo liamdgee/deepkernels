@@ -116,6 +116,7 @@ class SpectralDecoder(BaseGenerativeModel):
 
         self.register_added_loss_term("lengthscale_kl")
         self.register_added_loss_term("alpha_kl")
+        self.register_added_loss_term("recon_kl")
 
         self._init_weights()
     
@@ -136,12 +137,22 @@ class SpectralDecoder(BaseGenerativeModel):
         ls_pred_prior = getattr(vae_out, 'ls_pred', None)
 
         ls_logvar_prior = getattr(vae_out, 'ls_logvar', None)
+
+        mu_z = getattr(vae_out, 'mu_z', None)
+
+        logvar_z = getattr(vae_out, 'logvar_z', None)
+
+        real_x = getattr(vae_out, 'real_x', None)
+
+        beta = params.get("beta", 1.0)
         
         spectral_bottleneck = self.compression_network(x)
         
         bottleneck = torch.tanh(spectral_bottleneck)
 
         recon, trend, amp, residuals = self.disentangle(bottleneck)
+
+        self.log_recon_kl(real_x, recon, mu_z, logvar_z, beta=beta)
 
         latent_expert_functions = [variational(bottleneck) for variational in self.expert_variational_heads]
 
@@ -198,6 +209,13 @@ class SpectralDecoder(BaseGenerativeModel):
         factor = self.factor_alpha(bottleneck).view(-1, self.k_atoms, self.rank)
         diag = F.softplus(self.diag_alpha(bottleneck)) + 1e-6
         return mu, factor, diag
+
+    def log_recon_kl(self, x, recon, mu_z, logvar_z, beta=1.0):
+        loss = F.mse_loss(recon, x, reduction='sum')
+        kl = -0.5 * torch.sum(1 + logvar_z - mu_z.pow(2) - logvar_z.exp())
+        lossterm = loss + (beta * kl)
+        self.update_added_loss_term(LossTerm(lossterm))
+        return self
     
     
     def disentangle(self, bottleneck):

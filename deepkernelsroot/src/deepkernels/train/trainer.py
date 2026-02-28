@@ -72,6 +72,7 @@ class ParameterIsolate:
         gp_lmc_params = [] #-e.g. 0.015
         gp_mean_params = [] #-e.g. 0.01
         gp_kernel_hyperparams = [] #-limit outputscale learning-# -- set kernel lr to approx 0.005
+        likelihood_params = []
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
@@ -131,12 +132,12 @@ class ParameterIsolate:
                 elif 'covar_module' in name:
                     gp_kernel_hyperparams.append(param)
                     all_gp_params.append(param)
+                elif 'likelihood' in name:
+                    likelihood_params.append(param)
+                    all_gp_params.append(param)
                 else:
                     gp_kernel_hyperparams.append(param)
                     all_gp_params.append(param)
-            elif 'likelihood' in name:
-                gp_kernel_hyperparams.append(param)
-                all_gp_params.append(param)
             elif 'vae.dirichlet' in name:
                 if 'mu_atom' in name or 'log_sigma_atom' in name:
                     dirichlet_atom_params.append(param)
@@ -168,55 +169,51 @@ class ParameterIsolate:
         slow_lr = (base_lr_adamw / 10) * 4.77    #~-5e-4
         very_slow_lr = (base_lr_adamw / 250) * 2.77 #~1.3e-5
 
-        adamw_optimiser = torch.optim.AdamW([
-            {'params': conv_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
-            {'params': fusion_params, 'lr': base_lr_adamw, 'weight_decay': base_lr_adamw},
-            {'params': latent_params, 'lr': slow_lr, 'weight_decay': very_slow_lr},
-            
-            {'params': deterministic_recon_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
-            {'params': probabilistic_nn_params, 'lr': slow_lr, 'weight_decay': very_slow_lr},
-            
-            {'params': dirichlet_all_nn_params, 'lr': base_lr_adamw},
-            {'params': primitive_params, 'lr': base_lr_adamw},
-            {'params': combinatorics_params, 'lr': slow_lr},
-        ])
-
         #-for SGLD optimiser-#
-        fast_dir = self.kwargs.get('fast_dir', 1e-2)
-        med_dir = self.kwargs.get('med_dir', 2e-3)
-        slow_dir = self.kwargs.get('slow_dir', 3.5e-4)
-        gamma_lr = self.kwargs.get('gamma_lr', 1e-4)
-
-        langevin_temp = self.kwargs.get('langevin_temp', 7.5e-6)
+        fast_dir = self.kwargs.get('fast_dir', 1e-3)
+        med_dir = self.kwargs.get('med_dir', 5e-4)
+        slow_dir = self.kwargs.get('slow_dir', 1e-4)
+        gamma_lr = self.kwargs.get('gamma_lr', 1e-5)
         
-        ultrasensitive_lr = self.kwargs.get('ultrasensitive_lr', 1e-6)
-        sensitive_lr = self.kwargs.get('sensitive_lr', 5e-5)
+        ultrasensitive_lr = self.kwargs.get('ultrasensitive_lr', 5e-5)
+        sensitive_lr = self.kwargs.get('sensitive_lr', 1e-4)
 
-        gp_variational_lr = self.kwargs.get('gp_variational_lr', 0.045)
+        gp_variational_lr = self.kwargs.get('gp_variational_lr', 0.03)
         gp_lmc_lr = self.kwargs.get('gp_lmc_lr', 0.01277)
         gp_mean_lr = self.kwargs.get('gp_mean_lr', 7.77e-3)
         gp_likelihood_lr = self.kwargs.get('gp_likelihood_lr', 1.77e-2)
         gp_hyper_lr = self.kwargs.get("gp_hyper_lr", 3.5e-3)
 
-        langevin_optimiser = torch.optim.Adagrad([
-            {'params': gp_variational_params, 'lr': gp_variational_lr},
-            {'params': gp_lmc_params, 'lr': gp_lmc_lr},
-            {'params': gp_mean_params, 'lr': gp_mean_lr},
-            {'params': gp_kernel_hyperparams, 'lr': gp_hyper_lr},
-            
-            {'params': self.objective.likelihood.parameters(), 'lr': gp_likelihood_lr},
-            
-            {'params': sensitive_ls_params, 'lr': sensitive_lr},
-            {'params': ultrasensitive_spectral_params, 'lr': ultrasensitive_lr}, 
-            
+        adamw_optimiser = torch.optim.AdamW([
+            {'params': conv_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
+            {'params': fusion_params, 'lr': base_lr_adamw, 'weight_decay': base_lr_adamw},
+            {'params': latent_params, 'lr': slow_lr, 'weight_decay': very_slow_lr},
+            {'params': deterministic_recon_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
+        ])
+
+        langevin_optimiser = torch.optim.RMSprop([
             {'params': dirichlet_atom_params, 'lr': med_dir},
             {'params': dirichlet_global_dist_params, 'lr': slow_dir},
             {'params': dirichlet_gamma_params, 'lr': gamma_lr},
-            {'params': dirichlet_ls_params, 'lr': sensitive_lr},
+            {'params': dirichlet_ls_params, 'lr': ultrasensitive_lr},
+            {'params': dirichlet_all_nn_params, 'lr': med_dir},
             {'params': dirichlet_variational_params, 'lr': fast_dir},
-        ])
+            {'params': probabilistic_nn_params, 'lr': med_dir}
+        ], alpha=0.975, eps=1e-7)
 
-        return adamw_optimiser, langevin_optimiser
+        adam_optimiser = torch.optim.Adam([
+            {'params': gp_variational_params, 'lr': gp_variational_lr},
+            {'params': likelihood_params, 'lr': gp_likelihood_lr},
+            {'params': gp_lmc_params, 'lr': gp_lmc_lr},
+            {'params': gp_mean_params, 'lr': gp_mean_lr},
+            {'params': gp_kernel_hyperparams, 'lr': gp_hyper_lr},
+            {'params': sensitive_ls_params, 'lr': sensitive_lr},
+            {'params': ultrasensitive_spectral_params, 'lr': ultrasensitive_lr},
+            {'params': primitive_params, 'lr': base_lr_adamw},
+            {'params': combinatorics_params, 'lr': slow_lr},
+        ], weight_decay=0.0)
+
+        return adamw_optimiser, langevin_optimiser, adam_optimiser
     
     def get_device(self, device_request: Union[str, torch.device, None] = None) -> torch.device:
 

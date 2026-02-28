@@ -86,6 +86,7 @@ class EncoderOutput(NamedTuple):
     mu_z: torch.Tensor
     logvar_z: torch.Tensor
     ls: torch.Tensor
+    real_x: torch.Tensor
 
 class ConvolutionalLoopEncoder(BaseGenerativeModel):
     """
@@ -147,9 +148,9 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
     def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         """
         Args:
-            x: Input features [Batch, 30] or recon_x
-            pi: Dirichlet mixture weights [Batch, 30]. 
-            spectral_bottleneck: [Batch, 64]
+            x: Input features [Batch, seq_len, 30] or recon_x
+            pi: Dirichlet mixture weights [Batch, seq_len, 30]. 
+            spectral_bottleneck: [Batch, seq_len, 64]
         """
         #-for first iter: Handle missing args and scale by 2.1x-#
         batch_size = x.size(0)
@@ -225,7 +226,8 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
             z=z,
             mu_z=mu_z,
             logvar_z=logvar_z,
-            ls=ls
+            ls=ls,
+            real_x=x
         )
 
         return encoder_out

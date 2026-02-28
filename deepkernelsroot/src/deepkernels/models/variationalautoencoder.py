@@ -34,6 +34,9 @@ class HistoryOutput(NamedTuple):
     bw_mods: torch.Tensor
     ls: torch.Tensor
     gate_weights: torch.Tensor
+    mu_z: torch.Tensor
+    logvar_z: torch.Tensor
+
 
 class DecoderStateOutput(NamedTuple):
     """Structured output for the SpectralDecoder."""
@@ -65,6 +68,55 @@ class SpectralVAE(BaseGenerativeModel):
         self.encoder = ConvolutionalLoopEncoder()
         self.eps = 1e-4
     
+    def get_zero_state(self, device, batch_size=64):
+        # Standard dimensions from your architecture
+        k = 30 # k_atoms
+        e = 8  # num_experts / num_latents
+        f = 16 # latent_dim / features
+        x_in = 30
+        fact = k * 30
+        
+        init_pi = self.init_pi_value(batch_size=batch_size, device=device)
+        spread = torch.linspace(0.05, 0.15, 4, device=device)
+        init_sms = spread.unsqueeze(0).expand(batch_size, -1).to(device)
+
+        return DecoderStateOutput(
+            recon=torch.zeros(batch_size, x_in, device=device),
+            gp_features=torch.zeros(batch_size, e, f, device=device),
+            pi=init_pi,
+            alpha=torch.zeros(batch_size, k, device=device),
+            alpha_mu=torch.zeros(batch_size, k, device=device),
+            alpha_factor=torch.ones(batch_size, fact, device=device),
+            alpha_diag=torch.eye(batch_size, k, device=device),
+            bottleneck=torch.zeros(batch_size, batch_size, device=device),
+            parameters_per_expert=torch.zeros(batch_size, e, f, device=device),
+            bandwidth_mod=torch.ones(batch_size, e, device=device),
+            amp=torch.ones(batch_size, x_in, device=device),
+            trend=torch.zeros(batch_size, x_in, device=device),
+            res=torch.zeros(batch_size, x_in, device=device),
+            ls=torch.ones(batch_size, k, device=device),
+            mu_z = torch.zeros(batch_size, f, device=device),
+            logvar_z = torch.ones(batch_size, f, device=device) * 0.1,
+            
+            gp_params=GPParams(
+                gates=torch.zeros(batch_size, 16, device=device),
+                ls_rbf=torch.ones(batch_size, 1, device=device),
+                ls_per=torch.ones(batch_size, 1, device=device),
+                p_per=torch.ones(batch_size, 1, device=device),
+                ls_mat=torch.ones(batch_size, 1, device=device),
+                w_sm=init_sms.clone(),
+                mu_sm=init_sms.clone(),
+                v_sm=torch.ones(batch_size, 4, device=device) * 0.1
+            )
+        )
+
+    def init_pi_value(self, batch_size, device, k_atoms=30):
+        device = self.get_device()
+        pi = torch.full((batch_size, k_atoms), 1.0/k_atoms, device=device)
+        pi = pi + (torch.randn_like(pi) * 0.01)
+        pi = F.softmax(pi, dim=-1)
+        return pi
+
     def refinement_loop(self, x, steps, initial_state=None, generative_mode:bool=False):
         current_state = initial_state #-this is vae_out-#
 
@@ -72,6 +124,7 @@ class SpectralVAE(BaseGenerativeModel):
         hist_gp_features, hist_bottlenecks, hist_expert_params = [], [], []
         hist_frequencies, hist_trends, hist_bw_mods = [], [], []
         hist_ls, hist_gate_weights, hist_params_nkn = [], [], []
+        hist_mu_z, hist_logvar_z = [], []
         
         batch_size, seq_len, features = x.shape
         
@@ -115,13 +168,15 @@ class SpectralVAE(BaseGenerativeModel):
             hist_pis.append(dirichlet_out.pi)
             hist_latents.append(encoder_out.z)
             hist_bottlenecks.append(decoder_out.bottleneck)
-            hist_frequencies.append(dirichlet_out.frequencies) # FIX 3: frequencies, not omega
+            hist_frequencies.append(dirichlet_out.frequencies)
             hist_expert_params.append(decoder_out.parameters_per_expert)
             hist_gp_features.append(decoder_out.gp_features)
             hist_trends.append(decoder_out.trend)
             hist_ls.append(decoder_out.ls)
             hist_bw_mods.append(decoder_out.bandwidth_mod)
             hist_gate_weights.append(dirichlet_out.gated_weights)
+            hist_mu_z.append(encoder_out.mu_z)
+            hist_logvar_z.append(encoder_out.logvar_z)
         
         stacked_gp_params = GPParams(
             gates=torch.stack([p.gates for p in hist_params_nkn], dim=1).unsqueeze(1),
@@ -147,6 +202,8 @@ class SpectralVAE(BaseGenerativeModel):
             bw_mods=torch.stack(hist_bw_mods, dim=1),
             ls=torch.stack(hist_ls, dim=1),
             gate_weights=torch.stack(hist_gate_weights, dim=1)
+            mu_z = torch.stack(hist_mu_z, dim=1),
+            logvar_z = torch.stack(hist_logvar_z, dim=1)
         )
             
         return current_state, history

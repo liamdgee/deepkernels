@@ -16,7 +16,10 @@ from deepkernels.train.trainer import ParameterIsolate
 from deepkernels.train.langevin_trainer import LangevinTrainer
 from deepkernels.preprocess.pipe import DataOrchestrator
 
-# Optional: Set up root logging for the main script
+import os
+os.environ['CUDA_HOME'] = '/usr/local/cuda'
+os.environ['PATH'] = '/usr/local/cuda/bin:' + os.environ['PATH']
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
