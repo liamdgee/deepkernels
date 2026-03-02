@@ -144,7 +144,7 @@ class SpectralDecoder(BaseGenerativeModel):
 
         real_x = getattr(vae_out, 'real_x', None)
 
-        beta = params.get("beta", 1.0)
+        beta = params.get("beta_override", 1.0)
         
         spectral_bottleneck = self.compression_network(x)
         

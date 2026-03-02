@@ -9,16 +9,21 @@ import torch.nn as nn
 import functools
 import mlflow
 
+from torch.optim import Adam, RMSprop, AdamW
+from torch.optim.lr_scheduler import LinearLR
+
 from deepkernels.train.stochastic_annealer import StochasticAnnealer
 from deepkernels.models.model import StateSpaceKernelProcess
 from deepkernels.train.objective import EvidenceLowerBound
 from deepkernels.train.langevin_trainer import LangevinTrainer
-from typing import Union, Optional
-
+from typing import Union, Optional, Iterable
+import gpytorch
 from tqdm import tqdm
 
-import torch
-from tqdm import tqdm
+#---Init logger---#
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class ParameterIsolate:
     def __init__(self, model, objective=None, device='cuda', **kwargs):
@@ -26,13 +31,20 @@ class ParameterIsolate:
         self.device = self.get_device(device)
         self.kwargs = kwargs
         self.objective = objective if objective is not None else EvidenceLowerBound(self.model)
+        
+        self.adam_optimiser = None
+        self.adamw_optimiser = None
+        self.langevin_optimiser = None
+
+        self.encoder_module = self.model.vae.encoder
+        self.decoder_module = self.model.vae.decoder
+        self.dirichlet_module = self.model.vae.dirichlet
 
     def seperate_params_and_build_optimisers(self):
         """Executes the massive parameter routing and returns the two optimizers."""
         model = self.model.to(self.device)
         
         model.train()
-        self.objective.likelihood.train()
         
         #-GROUP MODEL PARAMS-#
         
@@ -73,10 +85,16 @@ class ParameterIsolate:
         gp_mean_params = [] #-e.g. 0.01
         gp_kernel_hyperparams = [] #-limit outputscale learning-# -- set kernel lr to approx 0.005
         likelihood_params = []
+        
+        
+        total_trainable_params = 0
+        routed_params = 0
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
+                
+            total_trainable_params += 1
             if 'vae.dirichlet.kernel_network' in name or 'kernel_network' in name:
                 if any(k in name for k in ['param_heads.p_per', 'param_heads.mu_sm', 'param_heads.v_sm']):
                     ultrasensitive_spectral_params.append(param)
@@ -160,7 +178,14 @@ class ParameterIsolate:
                 else:
                     dirichlet_all_params.append(param)
                     dirichlet_all_nn_params.append(param)
-        
+            else:
+                logger.warning(f"[!] Parameter unrouted: '{name}'. Defaulting to AdamW fusion_params.")
+                fusion_params.append(param)
+                
+            routed_params += 1
+
+        if total_trainable_params != routed_params:
+            logger.error(f"Parameter mismatch! Trainable: {total_trainable_params}, Routed: {routed_params}")
         #-build adamW optimiser-#
         #-fdr adam optimiser-#
         base_lr_adamw = self.kwargs.get('base_lr_adamw', 1.175e-3)
@@ -184,14 +209,14 @@ class ParameterIsolate:
         gp_likelihood_lr = self.kwargs.get('gp_likelihood_lr', 1.77e-2)
         gp_hyper_lr = self.kwargs.get("gp_hyper_lr", 3.5e-3)
 
-        adamw_optimiser = torch.optim.AdamW([
+        self.adamw_optimiser = torch.optim.AdamW([
             {'params': conv_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
             {'params': fusion_params, 'lr': base_lr_adamw, 'weight_decay': base_lr_adamw},
             {'params': latent_params, 'lr': slow_lr, 'weight_decay': very_slow_lr},
             {'params': deterministic_recon_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
         ])
 
-        langevin_optimiser = torch.optim.RMSprop([
+        self.langevin_optimiser = torch.optim.RMSprop([
             {'params': dirichlet_atom_params, 'lr': med_dir},
             {'params': dirichlet_global_dist_params, 'lr': slow_dir},
             {'params': dirichlet_gamma_params, 'lr': gamma_lr},
@@ -201,7 +226,7 @@ class ParameterIsolate:
             {'params': probabilistic_nn_params, 'lr': med_dir}
         ], alpha=0.975, eps=1e-7)
 
-        adam_optimiser = torch.optim.Adam([
+        self.adam_optimiser = torch.optim.Adam([
             {'params': gp_variational_params, 'lr': gp_variational_lr},
             {'params': likelihood_params, 'lr': gp_likelihood_lr},
             {'params': gp_lmc_params, 'lr': gp_lmc_lr},
@@ -212,9 +237,68 @@ class ParameterIsolate:
             {'params': primitive_params, 'lr': base_lr_adamw},
             {'params': combinatorics_params, 'lr': slow_lr},
         ], weight_decay=0.0)
+        total_opt_params = sum(len(group['params']) for opt in [adamw_optimiser, langevin_optimiser, adam_optimiser] for group in opt.param_groups)
+        logger.info(f"Parameter Isolation Complete. {total_opt_params}/{total_trainable_params} tensors strictly routed into 3 Optimizers.")
+        
+        self.module_groups = {
+            "encoder_total": all_encoder_params,
+            "decoder_total": all_decoder_params,
+            "dirichlet_total": dirichlet_all_params,
+            "hypernetwork_total": all_hypernetwork_params,
+            "gp_total": all_gp_params
+        }
 
-        return adamw_optimiser, langevin_optimiser, adam_optimiser
+        return self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser, self.module_groups
     
+    def train_vae_only(self):
+        for module in self.module_groups:
+            for param in module.parameters():
+                param.requires_grad = False
+        
+
+    
+    def train_vae_and_dirichlet(self):
+
+    def train_gp_only(self):
+    
+    def train_cyclically(self)
+
+
+    def set_requires_grad(self, modules: Union[gpytorch.Module, Iterable[gpytorch.Module]], requires_grad: bool) -> None:
+        """
+        Freezes or unfreezes the computational graph for specified PyTorch modules.
+
+        Args:
+            modules: A single instantiated torch.nn.Module, or an iterable (list/tuple) 
+                    of torch.nn.Module objects (e.g., [encoder, decoder]).
+            requires_grad: True to unfreeze (enable gradient tracking), False to freeze.
+            
+        Raises:
+            TypeError: If an item in 'modules' is not a valid torch.nn.Module object.
+        """
+        if isinstance(modules, gpytorch.Module):
+            modules = [modules]
+            
+        for module in modules:
+            for param in module.parameters():
+                param.requires_grad = requires_grad
+        
+        return None
+
+    def get_warm_start_optimizer(self, active_modules, lr=1e-3, warmup_epochs=5):
+        """
+        Creates a fresh optimizer to clear stale momentum states, 
+        paired with a linear warmup scheduler for a smooth start.
+        """
+        params = []
+        for module in active_modules:
+            params += list(module.parameters())
+        
+        optimizer = Adam(params, lr=lr)
+        # Ramps LR from a small fraction up to the target lr over warmup_epochs
+        scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+        return optimizer, scheduler
+
     def get_device(self, device_request: Union[str, torch.device, None] = None) -> torch.device:
 
             """
@@ -247,3 +331,19 @@ class ParameterIsolate:
             if torch.backends.mps.is_available() and torch.backends.mps.is_built():
                 return torch.device('mps')
             return torch.device('cpu')
+    
+    def check_dead_gradients(self, debug_groups):
+        for group_name, params in debug_groups.items():
+            zero_grads = sum(1 for p in params if p.grad is None or torch.all(p.grad == 0))
+            if zero_grads > 0:
+                logger.warning(f"{group_name} has {zero_grads} tensors with zero/None gradients!")
+    
+    def log_macro_gradients(self, debug_groups, step):
+        for group_name, params in debug_groups.items():
+            total_norm = 0.0
+            for p in params:
+                if p.grad is not None:
+                    total_norm += p.grad.data.norm(2).item() ** 2
+            
+            total_norm = total_norm ** 0.5
+            mlflow.log_metric(f"grad_norm_{group_name}", total_norm, step=step)

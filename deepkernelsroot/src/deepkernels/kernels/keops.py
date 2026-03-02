@@ -5,11 +5,13 @@ os.environ['CUDA_HOME'] = '/usr/local/cuda'
 os.environ['PATH'] = '/usr/local/cuda/bin:' + os.environ['PATH']
 
 import pykeops
+import torch.nn.functional as F
 
 ##--pykeops.clean_pykeops()
 pykeops.config.cuda_standalone = True
 pykeops.config.use_OpenMP = False
 
+import torch.nn as nn
 import math
 import itertools
 import gpytorch
@@ -20,21 +22,101 @@ from linear_operator.operators import LinearOperator
 from gpytorch.operators import KeOpsLinearOperator
 from gpytorch.kernels.keops import RBFKernel
 
-
-
 class GenerativeKernel(Kernel):
     has_lengthscale = False
 
     def __init__(self, batch_shape=torch.Size([]), **kwargs):
         super().__init__(batch_shape=batch_shape, **kwargs)
-        self.num_primitives = 4     #--> 4 Primitives + 6 Pairs + 4 Self-Squared + 2 Triples = 16 Kernels-#
+        
+        self.num_primitives = 6     #--> 4 Primitives + 6 Pairs + 4 Self-Squared + 2 Triples = 16 Kernels-#
         self.kernels_out = 16
+        self.individual_kernel_input_dim = 32
         self.base_kernel = RBFKernel(batch_shape=batch_shape)
+        self.batch_shape = batch_shape
 
-        self.register_parameter(
-            name="raw_outputscale",
-            parameter=torch.nn.Parameter(torch.zeros(*batch_shape))
-        )
+        self.SQRT3 = math.sqrt(3.0)
+        self.SQRT5 = math.sqrt(5.0)
+        scale_constraint = gpytorch.constraints.GreaterThan(1e-4)
+        positive_constraint = gpytorch.constraints.Positive()
+
+        #-- register hyperparams-#
+        self.register_parameter(name="raw_scale_12", parameter=nn.Parameter(torch.zeros(1)))
+        self.register_parameter(name="raw_scale_32", parameter=nn.Parameter(torch.zeros(1)))
+        self.register_parameter(name="raw_scale_52", parameter=nn.Parameter(torch.zeros(1)))
+        self.register_parameter(name="raw_rq_alpha", parameter=nn.Parameter(torch.zeros(1)))
+        self.register_parameter(name="raw_poly_offset", parameter=nn.Parameter(torch.zeros(1)))
+        self.register_parameter(name="raw_linear_scale", parameter=nn.Parameter(torch.zeros(1)))
+        
+        #-global hyperparams
+        self.register_parameter(name="raw_outputscale", parameter=torch.nn.Parameter(torch.zeros(*batch_shape)))
+        self.register_parameter(name="raw_latent_amplitude", parameter=torch.nn.Parameter(torch.zeros(*batch_shape)))
+        self.register_parameter(name="raw_inv_bandwidth", parameter=nn.Parameter(torch.zeros(1, self.individual_kernel_input_dim)))
+        
+        #-register weight params-#
+        self.register_parameter(name="raw_nkn_weights", parameter=nn.Parameter(torch.empty(4, 8)))
+
+        # -- register_constraints ---
+        self.register_constraint("raw_scale_12", scale_constraint)
+        self.register_constraint("raw_scale_32", scale_constraint)
+        self.register_constraint("raw_scale_52", scale_constraint)
+        self.register_constraint("raw_rq_alpha", scale_constraint)
+        self.register_constraint("raw_linear_scale", scale_constraint)
+        self.register_constraint("raw_poly_offset", positive_constraint)
+        self.register_constraint("raw_latent_amplitude", positive_constraint)
+        self.register_constraint("raw_outputscale", positive_constraint)
+        self.register_constraint("raw_inv_bandwidth", positive_constraint)
+        self.register_constraint("raw_nkn_weights", positive_constraint)
+
+        #-initialising values-#
+        self.raw_scale_12.data.fill_(self.raw_scale_12_constraint.inverse_transform(torch.tensor(1.6)).item())
+        self.raw_scale_32.data.fill_(self.raw_scale_32_constraint.inverse_transform(torch.tensor(0.7)).item())
+        self.raw_scale_52.data.fill_(self.raw_scale_52_constraint.inverse_transform(torch.tensor(0.1)).item())
+        self.raw_rq_alpha.data.fill_(self.raw_rq_alpha_constraint.inverse_transform(torch.tensor(1.0)).item())
+        self.raw_linear_scale.data.fill_(self.raw_linear_scale_constraint.inverse_transform(torch.tensor(0.5)).item())
+        self.raw_poly_offset.data.fill_(self.raw_poly_offset_constraint.inverse_transform(torch.tensor(0.2)).item())
+        self.raw_inv_bandwidth.data.fill_(self.raw_inv_bandwidth_constraint.inverse_transform(torch.tensor(1.0)).item())
+        self.raw_outputscale.data.fill_(self.raw_outputscale_constraint.inverse_transform(torch.tensor(1.0)).item())
+        self.raw_latent_amplitude.data.fill_(self.raw_latent_amplitude_constraint.inverse_transform(torch.tensor(1.0)).item())
+        
+        with torch.no_grad():
+            self.raw_nkn_weights.fill_(self.raw_nkn_weights_constraint.inverse_transform(torch.tensor(1.0 / 8.0)).item())
+            self.raw_nkn_weights.add_(torch.randn(4, 8) * 0.005)
+        
+        #-register priors-#
+        self.register_prior("scale_12_prior", gpytorch.priors.GammaPrior(4.0, 0.6), "raw_scale_12")
+        self.register_prior("scale_32_prior", gpytorch.priors.GammaPrior(4.0, 3.0), "raw_scale_32")
+        self.register_prior("scale_52_prior", gpytorch.priors.GammaPrior(4.0, 15.0), "raw_scale_52")
+        self.register_prior("rq_alpha_prior", gpytorch.priors.GammaPrior(3.0, 0.75), "raw_rq_alpha")
+        self.register_prior("linear_scale_prior", gpytorch.priors.HalfCauchyPrior(2.0), "raw_linear_scale")
+        self.register_prior("poly_offset_prior", gpytorch.priors.HalfCauchyPrior(1.0), "raw_poly_offset")
+        
+        self.register_prior("outputscale_prior", gpytorch.priors.GammaPrior(2.0, 0.15), "raw_outputscale")
+        self.register_prior("latent_amplitude_prior", gpytorch.priors.GammaPrior(2.0, 0.15), "raw_latent_amplitude")
+        self.register_prior("inv_bandwidth_prior", gpytorch.priors.GammaPrior(3.0, 1.0), "raw_inv_bandwidth")
+       
+        self.register_prior("nkn_weights_prior", gpytorch.priors.HorseshoePrior(scale=0.1), "nkn_weights")
+    
+    
+    @property
+    def nkn_weights(self): return self.raw_nkn_weights_constraint.transform(self.raw_nkn_weights)
+    @property
+    def scale_12(self): return self.raw_scale_12_constraint.transform(self.raw_scale_12)
+    @property
+    def scale_32(self): return self.raw_scale_32_constraint.transform(self.raw_scale_32)
+    @property
+    def scale_52(self): return self.raw_scale_52_constraint.transform(self.raw_scale_52)
+    @property
+    def rq_alpha(self): return self.raw_rq_alpha_constraint.transform(self.raw_rq_alpha)
+    @property
+    def linear_scale(self): return self.raw_linear_scale_constraint.transform(self.raw_linear_scale)
+    @property
+    def poly_offset(self): return self.raw_poly_offset_constraint.transform(self.raw_poly_offset)
+    @property
+    def outputscale(self): return self.raw_outputscale_constraint.transform(self.raw_outputscale)
+    @property
+    def latent_amplitude(self): return self.raw_latent_amplitude_constraint.transform(self.raw_latent_amplitude)
+    @property
+    def inv_bandwidth(self): return self.raw_inv_bandwidth_constraint.transform(self.raw_inv_bandwidth)
 
     def forward(self, x1, x2, diag=False, **params) -> LinearOperator:
         if diag:
@@ -44,151 +126,241 @@ class GenerativeKernel(Kernel):
         if hyperparams is None:
             raise ValueError("Missing Kernel hyperparameters")
         
-        # --- THE TEMPORAL SHIELD ---
-        param_keys = ['ls_rbf', 'ls_per', 'p_per', 'ls_mat', 'w_sm', 'mu_sm', 'v_sm', 'gates']
+        test_hyperparams = params.get("gp_params_eval", None)
         
-        pooled_params = {}
+        if test_hyperparams is None:
+            test_hyperparams = hyperparams
+            is_same = True
+        else:
+            is_same = False
+        
+        param_keys = ['gates', 'linear', 'periodic', 'rational', 'polynomial', 'matern']
+        
+        pooled_params_train = {}
+        pooled_params_test = {}
+
         for k in param_keys:
-            val = getattr(hyperparams, k)
-            if val.dim() == 4:
-                val = val.mean(dim=2)
-            pooled_params[k] = val
+            train_val = getattr(hyperparams, k)
+            if train_val.dim() == 4:
+                train_val = train_val.mean(dim=2)
+            pooled_params_train[k] = train_val
+            if is_same:
+                pooled_params_test = pooled_params_train
+            if not is_same:
+                test_val = getattr(test_hyperparams, k)
+                if test_val.dim() == 4:
+                    test_val = test_val.mean(dim=2)
+                pooled_params_test[k] = test_val
+            
+
                 
-        ls_rbf = pooled_params['ls_rbf']
-        ls_per = pooled_params['ls_per']
-        p_per = pooled_params['p_per']
-        ls_mat = pooled_params['ls_mat']
-        w_sm = pooled_params['w_sm']
-        mu_sm = pooled_params['mu_sm']
-        v_sm = pooled_params['v_sm']
-        gates = pooled_params['gates']
+        gates_i = pooled_params_train['gates']
+        linear_i = pooled_params_train['linear']
+        periodic_i = pooled_params_train['periodic']
+        rational_i = pooled_params_train['rational']
+        polynomial_i = pooled_params_train['polynomial']
+        matern_i = pooled_params_train['matern']
 
-        # --- THE RECIPE FOR GPYTORCH ---
-        def covar_func(x1_, x2_, **inner_params):
-            ls_rbf_in = inner_params['ls_rbf']
-            ls_per_in = inner_params['ls_per']
-            p_per_in = inner_params['p_per']
-            ls_mat_in = inner_params['ls_mat']
-            w_sm_in = inner_params['w_sm']
-            mu_sm_in = inner_params['mu_sm']
-            v_sm_in = inner_params['v_sm']
-            gates_in = inner_params['gates']
-
-            x_i = LazyTensor(x1_.unsqueeze(-2))
-            x_j = LazyTensor(x2_.unsqueeze(-3))
-
-            x_diff = x_i - x_j
-            d2 = (x_diff ** 2).sum(-1) 
-            d = d2.sqrt()
-
-            prims = []
-
-            #-RBF
-            ls_rbf_lazy = LazyTensor(ls_rbf_in.unsqueeze(-2).unsqueeze(-2))
-            k_rbf = (-0.5 * d2 / (ls_rbf_lazy ** 2)).exp()
-            prims.append(k_rbf)
-
-            #-Spectral Mixture
-            w_sm_lazy = LazyTensor(w_sm_in.unsqueeze(-2).unsqueeze(-2))
-            mu_sm_lazy = LazyTensor(mu_sm_in.unsqueeze(-2).unsqueeze(-2))
-            v_sm_lazy = LazyTensor(v_sm_in.unsqueeze(-2).unsqueeze(-2))
-            
-            arg = d * mu_sm_lazy * (2 * math.pi)
-            cos_term = arg.cos()
-            exp_arg = (d2 * v_sm_lazy) * (-2 * (math.pi ** 2))
-            exp_term = exp_arg.exp()
-            k_sm = (w_sm_lazy * cos_term * exp_term).sum(-1) 
-            prims.append(k_sm)
-
-            #-Periodic
-            p_per_lazy = LazyTensor(p_per_in.unsqueeze(-2).unsqueeze(-2))
-            ls_per_lazy = LazyTensor(ls_per_in.unsqueeze(-2).unsqueeze(-2))
-            sine_term = (math.pi * d / p_per_lazy).sin() ** 2
-            k_per = (-2.0 * sine_term / (ls_per_lazy ** 2)).exp()
-            prims.append(k_per)
-
-            #-Matern-1/2
-            ls_mat_lazy = LazyTensor(ls_mat_in.unsqueeze(-2).unsqueeze(-2))
-            k_mat = (-d / ls_mat_lazy).exp()
-            prims.append(k_mat)
-
-            # ---KERNEL COMBINATORICS---
-            interactions = []
-            for k_a, k_b in itertools.combinations(prims, 2):
-                interactions.append(k_a * k_b)
-            for k in prims:
-                interactions.append(k * k)
-            
-            interactions.append(prims[0] * prims[1] * prims[2])
-            interactions.append(prims[0] * prims[1] * prims[3])
-            
-            kernels = prims + interactions 
-
-            # --- GATED ROUTING ---
-            gates_lazy = gates_in.unsqueeze(-2).unsqueeze(-2)
-            weighted_kernels = [
-                LazyTensor(gates_lazy[..., i:i+1]) * kernels[i] 
-                for i in range(self.kernels_out)
-            ]
-
-            return sum(weighted_kernels)
+        if not is_same:
+            gates_j = pooled_params_test['gates']
+            linear_j = pooled_params_test['linear']
+            periodic_j = pooled_params_test['periodic']
+            rational_j = pooled_params_test['rational']
+            polynomial_j = pooled_params_test['polynomial']
+            matern_j = pooled_params_test['matern']
         
-        keops_op = KeOpsLinearOperator(
-            x1.contiguous(), x2.contiguous(), covar_func,
-            ls_rbf=ls_rbf, ls_per=ls_per, p_per=p_per, ls_mat=ls_mat,
-            w_sm=w_sm, mu_sm=mu_sm, v_sm=v_sm, gates=gates
-        )
-
-        #-batch aware output scale-#
-        outputscale = torch.nn.functional.softplus(self.raw_outputscale)
-        outputscale = outputscale.view(*self.batch_shape, 1, 1)
+        else:
+            gates_j, linear_j, periodic_j = gates_i, linear_i, periodic_i
+            rational_j, polynomial_j, matern_j = rational_i, polynomial_i, matern_i
         
-        return keops_op * outputscale
 
+        def covar_func(x1_params, x2_params, **inner_params):
+            mat_i = LazyTensor(pooled_params_train['matern'].unsqueeze(1))
+            rat_i = LazyTensor(pooled_params_train['rational'].unsqueeze(1))
+            lin_i = LazyTensor(pooled_params_train['linear'].unsqueeze(1))
+            poly_i = LazyTensor(pooled_params_train['polynomial'].unsqueeze(1))
+            per_i = LazyTensor(pooled_params_train['periodic'].unsqueeze(1))
+            gate_i = LazyTensor(pooled_params_train['gates'].unsqueeze(1))
+            
+            if is_same:
+                mat_j, rat_j, lin_j, poly_j, per_j, gate_j = mat_i, rat_i, lin_i, poly_i, per_i, gate_i
+            else:
+                mat_j = LazyTensor(pooled_params_test['matern'].unsqueeze(0))
+                rat_j = LazyTensor(pooled_params_test['rational'].unsqueeze(0))
+                lin_j = LazyTensor(pooled_params_test['linear'].unsqueeze(0))
+                poly_j = LazyTensor(pooled_params_test['polynomial'].unsqueeze(0))
+                per_j = LazyTensor(pooled_params_test['periodic'].unsqueeze(0))
+                gate_j = LazyTensor(pooled_params_test['gates'].unsqueeze(0))
+            
+            # ==========================================
+            #-Symbolic Metrics and primitives
+            # ==========================================
+            inv_bw = LazyTensor(self.inv_bandwidth.view(1, 1, 32))
+            #-metrics-#
+            #-for matern family-#-
+            diff_mat = (mat_i - mat_j) * inv_bw
+            dist_sq_mat = ((diff_mat) ** 2).sum(-1)
+            dist_mat = dist_sq_mat.sqrt()
+
+            #-for rational & rbf-#
+            diff_rat = (rat_i - rat_j) * inv_bw
+            dist_sq_rat = ((diff_rat) ** 2).sum(-1)
+            
+            #- linear
+            lin_i_scaled = lin_i * inv_bw
+            lin_j_scaled = lin_j * inv_bw
+            inner_lin = (lin_i_scaled * lin_j_scaled).sum(-1)
+
+            #-poly
+            poly_i_scaled = poly_i * inv_bw
+            poly_j_scaled = poly_j * inv_bw
+            inner_poly = (poly_i_scaled * poly_j_scaled).sum(-1)
+
+            #-periodic
+            diff_per = (per_i - per_j) * inv_bw
+            dist_per = ((diff_per) ** 2).sum(-1).sqrt()
+
+            #-primitive kernels-#
+            #-linear-#
+            k_lin = inner_lin * LazyTensor(self.linear_scale.view(1, 1, 1))
+            #-poly-
+            k_poly = (LazyTensor(self.poly_offset.view(1, 1, 1)) + inner_poly).square()
+            #-periodic
+            k_per = (-2.0 * (math.pi * dist_per).sin().square()).exp()
+            
+            #materns-#
+            #-matern 1/2
+            s_12 = LazyTensor(self.scale_12.view(1, 1, 1))
+            k_mat12 = (-(dist_mat * s_12)).exp()
+            
+            #-matern 3/2
+            s_32 = LazyTensor(self.scale_32.view(1, 1, 1))
+            sqrt3_d = self.SQRT3 * (dist_mat * s_32)
+            k_mat32 = (1.0 + sqrt3_d) * (-sqrt3_d).exp()
+            
+            #-matern 5/2-#
+            s_52 = LazyTensor(self.scale_52.view(1, 1, 1))
+            sqrt5_d = self.SQRT5 * (dist_mat * s_52)
+            k_mat52 = (1.0 + sqrt5_d + (5.0 / 3.0) * (dist_sq_mat * (s_52 ** 2))) * (-sqrt5_d).exp()
+            
+            #-rational quadratic-#
+            alpha = LazyTensor(self.rq_alpha.view(1, 1, 1))
+            k_rq = (1.0 + dist_sq_rat / (2.0 * alpha)) ** (-alpha)
+            
+            #-RBF-#
+            k_rbf = (-dist_sq_rat).exp()
+
+            primitives = [k_lin, k_poly, k_per, k_mat12, k_mat32, k_mat52, k_rq, k_rbf]
+            gate_0i = gate_i[:, :, 0].unsqueeze(-1)
+            gate_1i = gate_i[:, :, 1].unsqueeze(-1)
+            gate_2i = gate_i[:, :, 2].unsqueeze(-1)
+            gate_3i = gate_i[:, :, 3].unsqueeze(-1)
+            gate_4i = gate_i[:, :, 4].unsqueeze(-1)
+            gate_5i = gate_i[:, :, 5].unsqueeze(-1)
+            gate_6i = gate_i[:, :, 6].unsqueeze(-1)
+            gate_7i = gate_i[:, :, 7].unsqueeze(-1)
+
+            if not is_same:
+                gate_0j = gate_j[:, :, 0].unsqueeze(-1)
+                gate_1j = gate_j[:, :, 1].unsqueeze(-1)
+                gate_2j = gate_j[:, :, 2].unsqueeze(-1)
+                gate_3j = gate_j[:, :, 3].unsqueeze(-1)
+                gate_4j = gate_j[:, :, 4].unsqueeze(-1)
+                gate_5j = gate_j[:, :, 5].unsqueeze(-1)
+                gate_6j = gate_j[:, :, 6].unsqueeze(-1)
+                gate_7j = gate_j[:, :, 7].unsqueeze(-1)    
+            
+            else:
+                gate_0j, gate_1j, gate_2j, gate_3j = gate_0i, gate_1i, gate_2i, gate_3i
+                gate_4j, gate_5j, gate_6j, gate_7j = gate_4i, gate_5i, gate_6i, gate_7i
+            
+            ws = self.nkn_weights
+           
+            w0 = LazyTensor(ws[:, 0].view(1, 1, 4))
+            w1 = LazyTensor(ws[:, 1].view(1, 1, 4))
+            w2 = LazyTensor(ws[:, 2].view(1, 1, 4))
+            w3 = LazyTensor(ws[:, 3].view(1, 1, 4))
+            w4 = LazyTensor(ws[:, 4].view(1, 1, 4))
+            w5 = LazyTensor(ws[:, 5].view(1, 1, 4))
+            w6 = LazyTensor(ws[:, 6].view(1, 1, 4))
+            w7 = LazyTensor(ws[:, 7].view(1, 1, 4))
+
+            combined = 0
+            gated_prim0 = gate_0i * gate_0j * primitives[0] * w0
+            combined = gated_prim0
+            gated_prim1 = gate_1i * gate_1j * primitives[1] * w1
+            combined = combined + gated_prim1
+            gated_prim2 = gate_2i * gate_2j * primitives[2] * w2
+            combined = combined + gated_prim2
+            gated_prim3 = gate_3i * gate_3j * primitives[3] * w3
+            combined = combined + gated_prim3
+            gated_prim4 = gate_4i * gate_4j * primitives[4] * w4
+            combined = combined + gated_prim4
+            gated_prim5 = gate_5i * gate_5j * primitives[5] * w5
+            combined = combined + gated_prim5
+            gated_prim6 = gate_6i * gate_6j * primitives[6] * w6
+            combined = combined + gated_prim6
+            gated_prim7 = gate_7i * gate_7j * primitives[7] * w7
+            combined = combined + gated_prim7
+
+            node0 = combined[:, :, 0]
+            node1 = combined[:, :, 1]
+            node2 = combined[:, :, 2]
+            node3 = combined[:, :, 3]
+            
+            interaction_1 = node0 * node1
+            interaction_2 = node2 * node3
+        
+            return interaction_1 + interaction_2
+        
+        base_covar = KeOpsLinearOperator(x1.contiguous(), x2.contiguous(), covar_func)
+
+        global_scale = self.outputscale.view(*self.batch_shape, 1, 1)
+        num_latents = self.latent_amplitude.size(0)
+        multitask_amp = self.latent_amplitude.view(num_latents, 1, 1)
+        return base_covar * global_scale * multitask_amp
+    
     def _forward_diag_fallback(self, x1, x2, **params):
-        target_shape = x1.shape[:-1]
-        device = x1.device
-        
-        hyperparams = params.get("gp_params", params)
-        pooled_params = {}
-        param_keys = ['w_sm', 'gates']
-        for k in param_keys:
-            val = getattr(hyperparams, k)
-            if val.dim() == 4:
-                val = val.mean(dim=2)
-            pooled_params[k] = val
-        
-        # --- SHIELD FOR DIAG FALLBACK ---
-        w_sm = pooled_params['w_sm']
-        gates = pooled_params['gates']
-        if w_sm.dim() == 4:
-            w_sm = w_sm.mean(dim=2)
-            gates = gates.mean(dim=2)
+        """Pure PyTorch implementation of the NKN diagonal (distance = 0)"""
+        hyperparams = params.get("gp_params", None)
+        if hyperparams is None:
+            raise ValueError("Missing Kernel hyperparameters for diagonal")
             
-        diag_ones = torch.ones(*target_shape, device=device)
-        diag_sm = w_sm.sum(-1).unsqueeze(-1).expand(*target_shape)
+        N = hyperparams.gates.shape[0]
+        device = hyperparams.gates.device
+        ones = torch.ones(N, device=device)
+        k_per_diag = ones
+        k_mat12_diag = ones
+        k_mat32_diag = ones
+        k_mat52_diag = ones
+        k_rq_diag = ones
+        k_rbf_diag = ones
+        inv_bw = self.inv_bandwidth.view(1, 32)
         
-        prims_diag = [diag_ones, diag_sm, diag_ones, diag_ones]
+        lin_scaled = hyperparams.linear * inv_bw
+        inner_lin = (lin_scaled * lin_scaled).sum(-1)
+        k_lin_diag = inner_lin * self.linear_scale.view(1)
         
-        interactions_diag = []
-        for k_a, k_b in itertools.combinations(prims_diag, 2):
-            interactions_diag.append(k_a * k_b)
-        for k in prims_diag:
-            interactions_diag.append(k * k)
-        interactions_diag.append(prims_diag[0] * prims_diag[1] * prims_diag[2])
-        interactions_diag.append(prims_diag[0] * prims_diag[1] * prims_diag[3])
-        
-        all_diag = prims_diag + interactions_diag
-        
-        k_final_diag = gates[..., 0:1] * all_diag[0]
-        for i in range(1, self.kernels_out):
-            k_final_diag += gates[..., i:i+1] * all_diag[i]
-            
-        outputscale = torch.nn.functional.softplus(self.raw_outputscale)
-        
-        outputscale = outputscale.view(*self.batch_shape, 1)
-        
-        return k_final_diag * outputscale
+        poly_scaled = hyperparams.polynomial * inv_bw
+        inner_poly = (poly_scaled * poly_scaled).sum(-1)
+        k_poly_diag = (self.poly_offset.view(1) + inner_poly).square()
+        primitives_diag = torch.stack([
+            k_lin_diag, k_poly_diag, k_per_diag, 
+            k_mat12_diag, k_mat32_diag, k_mat52_diag, k_rq_diag, k_rbf_diag
+        ], dim=-1)
+        g_squared = hyperparams.gates.square() # [N, 8]
+        gated_primitives = g_squared * primitives_diag
+        w_nkn = self.nkn_weights # [4, 8]
+        nodes = torch.matmul(gated_primitives, w_nkn.t()) 
+        interaction_1 = nodes[:, 0] * nodes[:, 1]
+        interaction_2 = nodes[:, 2] * nodes[:, 3]
+        base_diag = interaction_1 + interaction_2
+        global_scale = self.outputscale.view(-1)
+        multitask_amp = self.latent_amplitude.view(-1, 1)
+        return base_diag * global_scale * multitask_amp
+
+
+
 
 class ProbabilisticMixtureMean(gpytorch.means.Mean):
     def __init__(self, k_atoms=30, num_experts=8, batch_shape=torch.Size([])):
