@@ -80,8 +80,6 @@ class ParameterIsolate:
         
         #-gp params include:
         all_gp_params = []
-        gp_variational_params = [] #-fast: e.g. 0.04
-        gp_lmc_params = [] #-e.g. 0.015
         gp_mean_params = [] #-e.g. 0.01
         gp_kernel_hyperparams = [] #-limit outputscale learning-# -- set kernel lr to approx 0.005
         likelihood_params = []
@@ -138,13 +136,7 @@ class ParameterIsolate:
                     deterministic_recon_params.append(param)
                     all_decoder_params.append(param)
             elif 'gp' in name:
-                if 'variational_distribution' in name:
-                    gp_variational_params.append(param)
-                    all_gp_params.append(param)
-                elif 'lmc_coefficients' in name:
-                    gp_lmc_params.append(param)
-                    all_gp_params.append(param)
-                elif 'mean_module' in name:
+                if 'mean_module' in name:
                     gp_mean_params.append(param)
                     all_gp_params.append(param)
                 elif 'covar_module' in name:
@@ -227,9 +219,7 @@ class ParameterIsolate:
         ], alpha=0.975, eps=1e-7)
 
         self.adam_optimiser = torch.optim.Adam([
-            {'params': gp_variational_params, 'lr': gp_variational_lr},
             {'params': likelihood_params, 'lr': gp_likelihood_lr},
-            {'params': gp_lmc_params, 'lr': gp_lmc_lr},
             {'params': gp_mean_params, 'lr': gp_mean_lr},
             {'params': gp_kernel_hyperparams, 'lr': gp_hyper_lr},
             {'params': sensitive_ls_params, 'lr': sensitive_lr},
@@ -237,7 +227,8 @@ class ParameterIsolate:
             {'params': primitive_params, 'lr': base_lr_adamw},
             {'params': combinatorics_params, 'lr': slow_lr},
         ], weight_decay=0.0)
-        total_opt_params = sum(len(group['params']) for opt in [adamw_optimiser, langevin_optimiser, adam_optimiser] for group in opt.param_groups)
+        
+        total_opt_params = sum(len(group['params']) for opt in [self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser] for group in opt.param_groups)
         logger.info(f"Parameter Isolation Complete. {total_opt_params}/{total_trainable_params} tensors strictly routed into 3 Optimizers.")
         
         self.module_groups = {
@@ -250,40 +241,57 @@ class ParameterIsolate:
 
         return self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser, self.module_groups
     
-    def train_vae_only(self):
-        for module in self.module_groups:
-            for param in module.parameters():
-                param.requires_grad = False
-        
+    def _set_group_grad(self, group_name: str, requires_grad: bool):
+        """Helper to cleanly flip gradients for a specific parameter list."""
+        for param in self.module_groups[group_name]:
+            param.requires_grad = requires_grad
 
-    
+    def train_vae_only(self):
+        """
+        Stage 1: Standard Mini-Batch Training.
+        Unfreezes the VAE. Freezes the Dirichlet mixing, NKN Hypernetwork, and GP.
+        """
+        self._set_group_grad("encoder_total", True)
+        self._set_group_grad("decoder_total", True)
+        self._set_group_grad("dirichlet_total", False)
+        self._set_group_grad("hypernetwork_total", False)
+        self._set_group_grad("gp_total", False)
+        logger.info("Mode: VAE Only. (Use standard mini-batches)")
+
     def train_vae_and_dirichlet(self):
+        """
+        Stage 1.5: Joint representation and cluster mixing.
+        """
+        self._set_group_grad("encoder_total", True)
+        self._set_group_grad("decoder_total", True)
+        self._set_group_grad("dirichlet_total", True)
+        self._set_group_grad("hypernetwork_total", False)
+        self._set_group_grad("gp_total", False)
+        logger.info("Mode: VAE + Dirichlet. (Use standard mini-batches)")
 
     def train_gp_only(self):
+        """
+        Stage 2: Full-Batch KeOps ExactGP Training.
+        Freezes the entire VAE to save VRAM. Unfreezes the Neural Kernel Network and GP.
+        """
+        self._set_group_grad("encoder_total", False)
+        self._set_group_grad("decoder_total", False)
+        self._set_group_grad("dirichlet_total", False)    
+        self._set_group_grad("hypernetwork_total", True)
+        self._set_group_grad("gp_total", True)
+        logger.info("Mode: GP Only. (Requires passing the FULL dataset at once)")
     
-    def train_cyclically(self)
-
-
-    def set_requires_grad(self, modules: Union[gpytorch.Module, Iterable[gpytorch.Module]], requires_grad: bool) -> None:
+    def train_cyclically(self):
         """
-        Freezes or unfreezes the computational graph for specified PyTorch modules.
-
-        Args:
-            modules: A single instantiated torch.nn.Module, or an iterable (list/tuple) 
-                    of torch.nn.Module objects (e.g., [encoder, decoder]).
-            requires_grad: True to unfreeze (enable gradient tracking), False to freeze.
-            
-        Raises:
-            TypeError: If an item in 'modules' is not a valid torch.nn.Module object.
+        Unfreezes everything. Warning: Only use if the dataset is small enough 
+        that full-batch ExactGP + full VAE backprop fits in VRAM.
         """
-        if isinstance(modules, gpytorch.Module):
-            modules = [modules]
-            
-        for module in modules:
-            for param in module.parameters():
-                param.requires_grad = requires_grad
-        
-        return None
+        self._set_group_grad("encoder_total", True)
+        self._set_group_grad("decoder_total", True)
+        self._set_group_grad("dirichlet_total", True)
+        self._set_group_grad("hypernetwork_total", True)
+        self._set_group_grad("gp_total", True)
+        logger.info("Mode: Fully Unfrozen / Cyclical.")
 
     def get_warm_start_optimizer(self, active_modules, lr=1e-3, warmup_epochs=5):
         """
@@ -295,7 +303,6 @@ class ParameterIsolate:
             params += list(module.parameters())
         
         optimizer = Adam(params, lr=lr)
-        # Ramps LR from a small fraction up to the target lr over warmup_epochs
         scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
         return optimizer, scheduler
 

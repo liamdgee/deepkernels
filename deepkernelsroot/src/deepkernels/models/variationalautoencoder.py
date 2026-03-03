@@ -6,7 +6,7 @@ from deepkernels.models.encoder import ConvolutionalLoopEncoder, ConvolutionalNe
 from deepkernels.models.decoder import SpectralDecoder, DecoderOutput
 from deepkernels.models.dirichlet import AmortisedDirichlet, DirichletOutput
 from typing import Tuple, Optional, TypeAlias, Tuple, Union, NamedTuple
-
+import torch.nn.functional as F
 import numpy as np
 import logging
 from gpytorch.mlls import AddedLossTerm
@@ -20,6 +20,17 @@ if not logger.handlers:
 
 from deepkernels.models.parent import BaseGenerativeModel
 from deepkernels.models.NKN import GPParams
+
+class LossTerm(gpytorch.mlls.AddedLossTerm):
+    """
+    A concrete implementation of an AddedLossTerm that simply 
+    returns a pre-calculated scalar tensor.
+    """
+    def __init__(self, loss_tensor):
+        self.loss_tensor = loss_tensor
+        
+    def loss(self):
+        return self.loss_tensor
 
 class HistoryOutput(NamedTuple):
     gp_params: GPParams
@@ -36,10 +47,10 @@ class HistoryOutput(NamedTuple):
     gate_weights: torch.Tensor
     mu_z: torch.Tensor
     logvar_z: torch.Tensor
+    lmc_matrices: torch.Tensor
 
 
 class DecoderStateOutput(NamedTuple):
-    """Structured output for the SpectralDecoder."""
     gp_params: GPParams
     bottleneck: torch.Tensor
     alpha: torch.Tensor
@@ -55,6 +66,10 @@ class DecoderStateOutput(NamedTuple):
     trend: torch.Tensor
     res: torch.Tensor
     ls: torch.Tensor
+    mu_z: torch.Tensor
+    logvar_z: torch.Tensor
+    lmc_matrices: torch.Tensor
+
 
 class StateSpaceOutput(NamedTuple):
     state: DecoderStateOutput
@@ -97,16 +112,15 @@ class SpectralVAE(BaseGenerativeModel):
             ls=torch.ones(batch_size, k, device=device),
             mu_z = torch.zeros(batch_size, f, device=device),
             logvar_z = torch.ones(batch_size, f, device=device) * 0.1,
+            lmc_matrices=torch.zeros(batch_size, k, e, device=device),
             
             gp_params=GPParams(
-                gates=torch.zeros(batch_size, 16, device=device),
-                ls_rbf=torch.ones(batch_size, 1, device=device),
-                ls_per=torch.ones(batch_size, 1, device=device),
-                p_per=torch.ones(batch_size, 1, device=device),
-                ls_mat=torch.ones(batch_size, 1, device=device),
-                w_sm=init_sms.clone(),
-                mu_sm=init_sms.clone(),
-                v_sm=torch.ones(batch_size, 4, device=device) * 0.1
+                gates=torch.ones(batch_size, 8, device=device) * 1/8,
+                periodic=torch.randn(batch_size, 32, device=device) * 0.01,
+                linear=torch.randn(batch_size, 32, device=device) * 0.01,
+                matern=torch.randn(batch_size, 32, device=device) * 0.01,
+                rational=torch.randn(batch_size, 32, device=device) * 0.01,
+                polynomial=torch.randn(batch_size, 32, device=device) * 0.01
             )
         )
 
@@ -124,7 +138,7 @@ class SpectralVAE(BaseGenerativeModel):
         hist_gp_features, hist_bottlenecks, hist_expert_params = [], [], []
         hist_frequencies, hist_trends, hist_bw_mods = [], [], []
         hist_ls, hist_gate_weights, hist_params_nkn = [], [], []
-        hist_mu_z, hist_logvar_z = [], []
+        hist_mu_z, hist_logvar_z, hist_lmcs = [], [], []
         
         batch_size, seq_len, features = x.shape
         
@@ -177,16 +191,15 @@ class SpectralVAE(BaseGenerativeModel):
             hist_gate_weights.append(dirichlet_out.gated_weights)
             hist_mu_z.append(encoder_out.mu_z)
             hist_logvar_z.append(encoder_out.logvar_z)
+            hist_lmcs.append(dirichlet_out.lmc_matrices)
         
         stacked_gp_params = GPParams(
             gates=torch.stack([p.gates for p in hist_params_nkn], dim=1).unsqueeze(1),
-            ls_rbf=torch.stack([p.ls_rbf for p in hist_params_nkn], dim=1).unsqueeze(1),
-            ls_per=torch.stack([p.ls_per for p in hist_params_nkn], dim=1).unsqueeze(1),
-            p_per=torch.stack([p.p_per for p in hist_params_nkn], dim=1).unsqueeze(1),
-            ls_mat=torch.stack([p.ls_mat for p in hist_params_nkn], dim=1).unsqueeze(1),
-            w_sm=torch.stack([p.w_sm for p in hist_params_nkn], dim=1).unsqueeze(1),
-            mu_sm=torch.stack([p.mu_sm for p in hist_params_nkn], dim=1).unsqueeze(1),
-            v_sm=torch.stack([p.v_sm for p in hist_params_nkn], dim=1).unsqueeze(1)
+            linear=torch.stack([p.linear for p in hist_params_nkn], dim=1).unsqueeze(1),
+            periodic=torch.stack([p.periodic for p in hist_params_nkn], dim=1).unsqueeze(1),
+            rational=torch.stack([p.rational for p in hist_params_nkn], dim=1).unsqueeze(1),
+            polynomial=torch.stack([p.polynomial for p in hist_params_nkn], dim=1).unsqueeze(1),
+            matern=torch.stack([p.matern for p in hist_params_nkn], dim=1).unsqueeze(1)
         )
         
         history = HistoryOutput(
@@ -201,9 +214,10 @@ class SpectralVAE(BaseGenerativeModel):
             trends=torch.stack(hist_trends, dim=1),
             bw_mods=torch.stack(hist_bw_mods, dim=1),
             ls=torch.stack(hist_ls, dim=1),
-            gate_weights=torch.stack(hist_gate_weights, dim=1)
+            gate_weights=torch.stack(hist_gate_weights, dim=1),
             mu_z = torch.stack(hist_mu_z, dim=1),
-            logvar_z = torch.stack(hist_logvar_z, dim=1)
+            logvar_z = torch.stack(hist_logvar_z, dim=1),
+            lmc_matrices = torch.stack(hist_lmcs, dim=1)
         )
             
         return current_state, history

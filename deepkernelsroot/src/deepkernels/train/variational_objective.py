@@ -33,40 +33,51 @@ class EvidenceLowerBound(nn.Module):
             gp_output: The MultivariateNormal returned by your GP.
             gp_target: The sequence the GP is supposed to be predicting.
         """
+        device = self.get_device()
         kl_metrics = {}
         
+        recon_loss = torch.tensor(0.0, device=device)
         kl_loss = 0.0
-        
-        recon_loss = F.l1_loss(ss_history.recons, x_target, reduction='mean')
+        total_vae_loss = 0.0
         
         for name, added_loss_term in model.named_added_loss_terms():
-            if 'gp' in name or isinstance(added_loss_term, gpytorch.mlls.AddedLossTerm):
+            if 'gp' in name:
                 continue
-                
+            
             raw_loss = added_loss_term.loss()
+
+            if 'recon' in name:
+                recon_loss = raw_loss
+                total_vae_loss += recon_loss
+                kl_metrics[f'loss_{name}'] = recon_loss.item()
+                continue
+            
             weight = 1.0
             for key, annealed_val in self.kl_weights.items():
                 if key in name:
                     weight = annealed_val
                     break
+            
             scaled_loss = weight * raw_loss
             kl_loss += scaled_loss
+            total_vae_loss += scaled_loss
             kl_metrics[f'loss_{name}'] = scaled_loss.item()
         
         # --- GP Marginal Log Likelihood (Variational ELBO)-- negative for gradient descent --- #
-        gp_loss = -self.mll(gp_output, gp_target)
+        elbo = self.mll(gp_output, gp_target) #-gp loss-#
 
         # --- Loss function ---
-        total_loss = recon_loss + kl_loss + gp_loss
+        total_loss = kl_loss -elbo
         
         def to_item(val):
             return val.item() if isinstance(val, torch.Tensor) else val
         
         metrics = {
             'loss_total': to_item(total_loss),
-            'loss_recon': to_item(recon_loss),
+            'loss_vae': to_item(total_vae_loss), 
             'loss_kls': to_item(kl_loss),
-            'loss_gp': to_item(gp_loss),
+            'loss_gp': to_item(elbo),
+            'loss_recon': to_item(recon_loss),
             **kl_metrics
         }
         

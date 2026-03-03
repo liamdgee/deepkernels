@@ -60,7 +60,6 @@ class KernelNetwork(BaseGenerativeModel):
             SafeSoftplus()                  
         )
         
-        
 
         self.init_weights_nkn()
     

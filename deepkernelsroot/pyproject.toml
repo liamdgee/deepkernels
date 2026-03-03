@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "deepkernels"
 version = "0.1.0"
-description = "An end-to-end modular framework for probabilstic inference (deep kernel learning) and uncertainty quantification (Gaussian Processes) in Stricly Linear computational efficiency [O(N)]"
+description = "An end-to-end modular framework for probabilistic inference (deep kernel learning) and uncertainty quantification (Gaussian Processes) in Stricly Linear computational efficiency [O(N)]"
 requires-python = ">=3.10"
 
 dependencies = [
@@ -21,7 +21,10 @@ dependencies = [
     "gpytorch>=1.11",
     "mlflow",
     "linear-operator",
-    "pykeops"
+    "pykeops",
+    "tqdm",
+    "ninja",
+    "pyarrow",
 ]
 
 [project.optional-dependencies]
@@ -29,7 +32,8 @@ dev = [
     "pytest",
     "jupyterlab",
     "black",
-    "isort"
+    "isort",
+    "safety"
 ]
 
 [tool.setuptools.packages.find]

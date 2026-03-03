@@ -38,6 +38,8 @@ class DirichletOutput(NamedTuple):
     mu_z: torch.Tensor
     logvar_z: torch.Tensor
     gp_params: GPParams
+    real_x: torch.Tensor
+    lmc_matrices: torch.Tensor
 
 class LossTerm(gpytorch.mlls.AddedLossTerm):
     """
@@ -75,6 +77,8 @@ class AmortisedDirichlet(BaseGenerativeModel):
         self.K = k_atoms
         self.M = fourier_dim
         self.D = latent_dim
+        self.k_atoms = k_atoms
+        self.num_latents = num_latents
         self.eps = 1e-3
 
         #-hypernetworks
@@ -87,6 +91,12 @@ class AmortisedDirichlet(BaseGenerativeModel):
         )
         
         self.kernel_network = KernelNetwork()
+
+        self.pi_to_latents_head = nn.Linear(k_atoms, num_latents * k_atoms)
+
+        with torch.no_grad():
+            self.pi_to_latents_head.weight.normal_(0.0, 0.01)
+            self.pi_to_latents_head.bias.zero_()
 
         #-params-#
         self.q_mu_global = nn.Parameter(torch.zeros(k_atoms - 1))
@@ -136,7 +146,8 @@ class AmortisedDirichlet(BaseGenerativeModel):
         Args:
             latent z (param: x) -- dim 16
         """
-        
+
+        batch_size = x.size(0)
         pi = params.get('pi')
         if pi is None and vae_out is not None:
             pi = getattr(vae_out, 'pi', None)
@@ -145,7 +156,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
             pi = None
         
         mualpha, factoralpha, diagalpha = vae_out.alpha_mu, vae_out.alpha_factor, vae_out.alpha_diag
-        mu_z, logvar_z = vae_out.mu_z, vae_out.logvar_z
+        mu_z, logvar_z, real_x = vae_out.mu_z, vae_out.logvar_z, vae_out.real_x
         
         ls = params.get('ls')
         if ls is None and vae_out is not None:
@@ -163,6 +174,10 @@ class AmortisedDirichlet(BaseGenerativeModel):
         local_conc = self.get_local_evidence(mualpha, factoralpha, diagalpha)
 
         pi = self.dirichlet_posterior_inference_and_log_local_loss(x, gamma_conc, beta, local_conc)
+        
+        pis_per_expert = self.pi_to_latents_head(pi)
+
+        lmc_matrices = pis_per_expert.view(batch_shape, self.k_atoms, self.num_latents)
         
         ls_pred, bw_learned, ls_logvar = self.predict_kernel_lengthscales(ls)
         
@@ -187,7 +202,9 @@ class AmortisedDirichlet(BaseGenerativeModel):
             ls_logvar=ls_logvar,
             gp_params=gp_params,
             mu_z=mu_z,
-            logvar_z=logvar_z
+            logvar_z=logvar_z,
+            real_x=real_x,
+            lmc_matrices=lmc_matrices
         )
     
     def log_global_kl(self, log_pv, log_qv):

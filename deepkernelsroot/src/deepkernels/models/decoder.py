@@ -28,13 +28,13 @@ class LossTerm(gpytorch.mlls.AddedLossTerm):
 
 class DecoderOutput(NamedTuple):
     """Structured output for the SpectralDecoder."""
+    gp_params: GPParams
     bottleneck: torch.Tensor
     alpha: torch.Tensor
     alpha_mu: torch.Tensor
     alpha_factor: torch.Tensor
     alpha_diag: torch.Tensor
     gp_features: torch.Tensor
-    gp_params: GPParams
     parameters_per_expert: torch.Tensor
     recon: torch.Tensor
     bandwidth_mod: torch.Tensor
@@ -43,6 +43,10 @@ class DecoderOutput(NamedTuple):
     trend: torch.Tensor
     res: torch.Tensor
     ls: torch.Tensor
+    mu_z: torch.Tensor
+    logvar_z: torch.Tensor
+    lmc_matrices: torch.Tensor
+
 
 class SpectralDecoder(BaseGenerativeModel):
     def __init__(self, 
@@ -175,13 +179,13 @@ class SpectralDecoder(BaseGenerativeModel):
         gp_features = torch.stack(latent_features_per_expert, dim=1)
 
         vae_out = DecoderOutput(
+            gp_params=vae_out.gp_params,
             bottleneck=bottleneck,
             alpha=alpha_logits,
             alpha_mu=mu,
             alpha_factor=factor,
             alpha_diag=diag,
             gp_features=gp_features,
-            gp_params=vae_out.gp_params,
             parameters_per_expert=variational_parameters,
             recon=recon,
             bandwidth_mod=bandwidth_mod,
@@ -189,7 +193,10 @@ class SpectralDecoder(BaseGenerativeModel):
             amp=amp,
             trend=trend,
             res=residuals,
-            ls=ls_sample
+            ls=ls_sample,
+            mu_z=mu_z,
+            logvar_z=logvar_z,
+            lmc_matrices=vae_out.lmc_matrices
         )
         
         return vae_out
