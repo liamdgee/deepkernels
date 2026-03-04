@@ -48,7 +48,7 @@ class LangevinTrainer:
         self.orchestrator = ParameterIsolate(model, device=device, **kwargs)
         self.adamw_optimiser, self.sgld_optimiser, self.adam_optimiser, self.debug = self.orchestrator.seperate_params_and_build_optimisers()
         self.kl_weights = self.objective.kl_weights
-        self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)
+        self.max_grad_norm = kwargs.get('max_grad_norm', 2.0)
         self.kwargs = kwargs
         self.n_data = kwargs.get('n_data', 38003.0)
         
@@ -132,7 +132,7 @@ class LangevinTrainer:
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.adamw_params, max_norm=self.max_grad_norm)
-        torch.nn.utils.clip_grad_norm_(self.langevin_params, max_norm=self.kwargs.get('langevin_clip_norm', 1.0))
+        torch.nn.utils.clip_grad_norm_(self.langevin_params, max_norm=self.kwargs.get('langevin_clip_norm', 15.0))
 
         self.adamw_optimiser.step()
         self.sgld_optimiser.step()
@@ -144,7 +144,7 @@ class LangevinTrainer:
         """Full-batch exact step for Stage 2."""
         self.adam_optimiser.zero_grad()
         
-        cholesky_jitter_val = self.kwargs.get('cholesky_jitter', 1e-4)
+        cholesky_jitter_val = self.kwargs.get('cholesky_jitter', 1e-3)
         
         # The GPyTorch Speed Hacks + Jitter
         with gpytorch.settings.cholesky_jitter(float(cholesky_jitter_val)), \
@@ -177,7 +177,7 @@ class LangevinTrainer:
         n_batches = len(test_loader)
 
         t_preds, t_targets, t_vars = [], [], []
-        cholesky_jitter_val = self.kwargs.get('cholesky_jitter', 1e-4)
+        cholesky_jitter_val = self.kwargs.get('cholesky_jitter', 1e-3)
         logger.info(f"---Running test eval for epoch: {epoch}---")
         
         with torch.no_grad(), \
@@ -270,10 +270,8 @@ class LangevinTrainer:
             mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()}
             self._log_metrics(epoch, mean_train_stats, prefix="warmup")
             logger.info(f"Warmup Epoch {epoch}/{warmup_vae_epochs} | Recon Loss: {mean_train_stats.get('loss_recon', 0.0):.4f}")
-
-
-        self.save_checkpoint("deepkernels_model.pth")
-        mlflow.pytorch.log_model(self.model, "deepkernels_model")
+        
+        mlflow.pytorch.log_model(self.model, "model_stage1_vae_warmup")
         # ==========================================
         # STAGE 2: Train the VAE (Mini-Batches) with dirichlet module
         # ==========================================
@@ -301,12 +299,10 @@ class LangevinTrainer:
                 global_step += 1
             
             mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()}
-            self._log_metrics(epoch, mean_train_stats, prefix="vae_train")
+            self._log_metrics(epoch + warmup_vae_epochs, mean_train_stats, prefix="vae_train")
             logger.info(f"VAE Epoch {epoch}/{vae_epochs} | Recon Loss: {mean_train_stats.get('loss_recon', 0.0):.4f}")
         
-
-        self.save_checkpoint("deepkernels_model.pth")
-        mlflow.pytorch.log_model(self.model, "deepkernels_model")
+        mlflow.pytorch.log_model(self.model, "model_stage2_vae_full")
 
         # ==========================================
         # STAGE 3: ExactGP Warmup (Mean & Noise Calibration)
@@ -316,24 +312,21 @@ class LangevinTrainer:
         
         logger.info(f"--- Entering Stage 2: GP Warmup ({warmup_gp_epochs} Epochs) ---")
         for epoch in range(1, warmup_gp_epochs + 1):
-            self.kwargs['cholesky_jitter'] = 1e-3
+            self.kwargs['cholesky_jitter'] = 1e-2
             metrics = self.step_gp(full_x, full_y)
             
             epoch_idx = epoch + warmup_vae_epochs + vae_epochs
             self._log_metrics(epoch_idx, metrics, prefix="gp_warmup")
             logger.info(f"GP Warmup Epoch {epoch}/{warmup_gp_epochs} | Exact MLL: {metrics.get('loss_gp', 0.0):.4f}")
-
-
-        self.save_checkpoint("deepkernels_model.pth")
-        mlflow.pytorch.log_model(self.model, "deepkernels_model")
+        mlflow.pytorch.log_model(self.model, "model_stage3_warmup")
         # ==========================================
-        # STAGE 4: Full KeOps ExactGP (Hypernetwork Unfrozen)
+        # STAGE 3: Full KeOps ExactGP (Hypernetwork Unfrozen)
         # ==========================================
         self.orchestrator.train_gp_only() #-nkn is now unfrozen-#
         
         logger.info(f"--- Entering Stage 3: Full ExactGP ({gp_epochs} Epochs) ---")
         for epoch in range(1, gp_epochs + 1):
-            self.kwargs['cholesky_jitter'] = 5e-5
+            self.kwargs['cholesky_jitter'] = 2e-4
             metrics = self.step_gp(full_x, full_y)     
             epoch_idx = epoch + warmup_vae_epochs + vae_epochs + warmup_gp_epochs
             self._log_metrics(epoch_idx, metrics, prefix="gp_train")
@@ -341,90 +334,88 @@ class LangevinTrainer:
             
             if test_loader and epoch % 10 == 0:
                 self.evaluate(test_loader, epoch_idx)
-        
-        self.save_checkpoint("deepkernels_model.pth")
-        mlflow.pytorch.log_model(self.model, "deepkernels_model")
 
+        mlflow.pytorch.log_model(self.model, "model_stage3_full")
         # ==========================================
         # STAGE 4: Deterministic E-M Alternating Refinement
         # ==========================================
-        logger.info(f"--- Entering Stage 4: E-M Cyclical Refinement ({em_macro_cycles} Macro-Cycles) ---")
-        
-        self.objective.kl_weights = {
-            "global_divergence": 0.1, "local_divergence": 0.1, "alpha_kl": 1.0, "lengthscale_kl": 1.0
-        }
+        if em_macro_cycles > 0:
+            logger.info(f"--- Entering Stage 4: E-M Cyclical Refinement ({em_macro_cycles} Macro-Cycles) ---")
+            
+            self.objective.kl_weights = {
+                "global_divergence": 0.1, "local_divergence": 0.1, "alpha_kl": 1.0, "lengthscale_kl": 1.0
+            }
 
-        for cycle in range(1, em_macro_cycles + 1):
-            logger.info(f"=== E-M Macro-Cycle {cycle}/{em_macro_cycles} ===")
-            
-            # --------------------------------------------------
-            # E-Step: Refine Latent Representations (Mini-Batches)
-            # --------------------------------------------------
-            self.orchestrator.train_vae_and_dirichlet() # GP Frozen
-            
-            for e_epoch in range(1, e_epochs_per_cycle + 1):
-                train_stats = defaultdict(float)
-                for x, y in train_loader:
-                    metrics = self.step_vae(x.to(self.device)) 
-                    for k, v in metrics.items(): train_stats[k] += v
+            for cycle in range(1, em_macro_cycles + 1):
+                logger.info(f"=== E-M Macro-Cycle {cycle}/{em_macro_cycles} ===")
                 
-                logger.info(f"  [E-Step] VAE Epoch {e_epoch} | Recon: {train_stats['loss_recon']/len(train_loader):.4f}")
+                # --------------------------------------------------
+                # E-Step: Refine Latent Representations (Mini-Batches)
+                # --------------------------------------------------
+                self.orchestrator.train_vae_and_dirichlet() # GP Frozen
+                
+                for e_epoch in range(1, e_epochs_per_cycle + 1):
+                    train_stats = defaultdict(float)
+                    for x, y in train_loader:
+                        metrics = self.step_vae(x.to(self.device)) 
+                        for k, v in metrics.items(): train_stats[k] += v
+                    
+                    logger.info(f"  [E-Step] VAE Epoch {e_epoch} | Recon: {train_stats['loss_recon']/len(train_loader):.4f}")
 
-            # --------------------------------------------------
-            # M-Step: Maximize Marginal Likelihood (Full-Batch)
-            # --------------------------------------------------
-            self.orchestrator.train_gp_only() # VAE Frozen
+                # --------------------------------------------------
+                # M-Step: Maximize Marginal Likelihood (Full-Batch)
+                # --------------------------------------------------
+                self.orchestrator.train_gp_only() # VAE Frozen
+                
+                for m_epoch in range(1, m_epochs_per_cycle + 1):
+                    self.kwargs['cholesky_jitter'] = 1e-3
+                    metrics = self.step_gp(full_x, full_y)
+                    logger.info(f"  [M-Step] GP Epoch {m_epoch} | Exact MLL: {metrics.get('loss_gp', 0.0):.4f}")
+                
+            # Calculate continuous MLflow epoch index
+                    current_epoch = warmup_vae_epochs + vae_epochs + warmup_gp_epochs + gp_epochs + (cycle * (e_epochs_per_cycle + m_epochs_per_cycle))
+                    self._log_metrics(current_epoch, metrics, prefix="em_stage")
             
-            for m_epoch in range(1, m_epochs_per_cycle + 1):
-                self.kwargs['cholesky_jitter'] = 1e-4
-                metrics = self.step_gp(full_x, full_y)
-                logger.info(f"  [M-Step] GP Epoch {m_epoch} | Exact MLL: {metrics.get('loss_gp', 0.0):.4f}")
-            
-        # Calculate continuous MLflow epoch index
-            current_epoch = warmup_vae_epochs + vae_epochs + warmup_gp_epochs + gp_epochs + (cycle * (e_epochs_per_cycle + m_epochs_per_cycle))
-            self._log_metrics(current_epoch, metrics, prefix="em_stage")
-        
-        self.save_checkpoint("deepkernels_model.pth")
-        mlflow.pytorch.log_model(self.model, "deepkernels_model")
+            mlflow.pytorch.log_model(self.model, "model_stage4_em")
 
         # ==========================================
         # STAGE 5: End-to-End Joint Fine-Tuning 
         # ==========================================
-        joint_epochs = 10
-        self.orchestrator.train_cyclically() # EVERYTHING UNFROZEN
-        
-        logger.info(f"--- Entering Stage 5: Fully Unfrozen Joint Training ({joint_epochs} Epochs) ---")
-        
-        self.kwargs['cholesky_jitter'] = 1e-2
-        
-        for epoch in range(1, joint_epochs + 1):
-            joint_stats = defaultdict(float)
-            for x, y in train_loader:
-                x, y = x.to(self.device), y.to(self.device)
-                self.adam_optimiser.zero_grad()
-                self.adamw_optimiser.zero_grad()
-                self.sgld_optimiser.zero_grad()
-                with gpytorch.settings.cholesky_jitter(float(self.kwargs['cholesky_jitter'])):
-                    model_out = self.model(x, run_gp=True)
-                    batch_y = y.t().contiguous() if y.dim() == 2 else y
-                    
-                    loss, metrics = self.objective(
-                        model=self.model, x_target=x, ss_history=model_out.history, 
-                        gp_output=model_out.gp_out, gp_target=batch_y
-                    )
-                
-                loss.backward()
-                
-                torch.nn.utils.clip_grad_norm_(self.adamw_params + self.adam_params + self.langevin_params, 1.0)
-                
-                self.adam_optimiser.step()
-                self.adamw_optimiser.step()
-                self.sgld_optimiser.step()
-                
-                for k, v in metrics.items(): joint_stats[k] += v
+        if joint_epochs > 0:
+            self.orchestrator.train_cyclically() # EVERYTHING UNFROZEN
             
-            mean_joint_stats = {k: v / len(train_loader) for k, v in joint_stats.items()}
-            logger.info(f"Joint Epoch {epoch}/{joint_epochs} | Total Joint Loss: {mean_joint_stats['loss_total']:.4f}")
+            logger.info(f"--- Entering Stage 5: Fully Unfrozen Joint Training ({joint_epochs} Epochs) ---")
+            
+            self.kwargs['cholesky_jitter'] = 1e-2
+            
+            for epoch in range(1, joint_epochs + 1):
+                joint_stats = defaultdict(float)
+                for x, y in train_loader:
+                    x, y = x.to(self.device), y.to(self.device)
+                    self.adam_optimiser.zero_grad()
+                    self.adamw_optimiser.zero_grad()
+                    self.sgld_optimiser.zero_grad()
+                    with gpytorch.settings.cholesky_jitter(float(self.kwargs['cholesky_jitter'])):
+                        model_out = self.model(x, run_gp=True)
+                        batch_y = y.t().contiguous() if y.dim() == 2 else y
+                        
+                        loss, metrics = self.objective(
+                            model=self.model, x_target=x, ss_history=model_out.history, 
+                            gp_output=model_out.gp_out, gp_target=batch_y
+                        )
+                    
+                    loss.backward()
+                    
+                    torch.nn.utils.clip_grad_norm_(self.adamw_params + self.adam_params + self.langevin_params, 1.0)
+                    
+                    self.adam_optimiser.step()
+                    self.adamw_optimiser.step()
+                    self.sgld_optimiser.step()
+                    
+                    for k, v in metrics.items(): joint_stats[k] += v
+                
+                mean_joint_stats = {k: v / len(train_loader) for k, v in joint_stats.items()}
+                logger.info(f"Joint Epoch {epoch}/{joint_epochs} | Total Joint Loss: {mean_joint_stats['loss_total']:.4f}")
         
         self.save_checkpoint("deepkernels_model.pth")
         mlflow.pytorch.log_model(self.model, "deepkernels_model")

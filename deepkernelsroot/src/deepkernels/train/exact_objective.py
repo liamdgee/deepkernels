@@ -8,7 +8,6 @@ from typing import Union, Optional
 from tqdm import tqdm
 
 import linear_operator
-from linear_operator.operators import MatmulLinearOperator, RootLinearOperator
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
@@ -31,73 +30,71 @@ class ExactObjective(nn.Module):
             likelihood=model.gp.likelihood, 
             model=model.gp
         )
-        self.kl_weights = kl_weights or {}
-        
+        self.kl_weights = kl_weights or {
+            "lengthscale_kl": 1.0,
+            "alpha_kl": 1.0,
+            "global_divergence": 0.1,
+            "local_divergence": 0.1
+        }
     
     def forward(self, model, x_target, ss_history, gp_output, gp_target):
-        """
-        Args:
-            model: overarching SpectralVAE model (to pull added loss terms).
-            x_target: ground-truth data sequence [Batch, SeqLen, Features].
-            ss_history: VAE state space history namedtuple
-            gp_output: The MultivariateNormal returned by your GP.
-            gp_target: The sequence the GP is supposed to be predicting.
-        """
         device = self.get_device()
         kl_metrics = {}
         
-        recon_loss = torch.tensor(0.0, device=device)
-        kl_loss = 0.0
-        total_vae_loss = 0.0
+        if gp_output is not None and gp_target is not None:
+            if hasattr(ss_history, 'lmc_matrices'):
+                lmc = ss_history.lmc_matrices
+                batch_lmcs = lmc.mean(dim=1)
+                B_mat = batch_lmcs.mean(dim=0)
+                lmc_pseudo_inv = torch.linalg.pinv(B_mat) # [8, 30]
+                latent_target = torch.matmul(lmc_pseudo_inv, gp_target)
+                exact_mll = self.mll(gp_output, latent_target)
+                gp_loss = -exact_mll
+            else:
+                gp_loss = -self.mll(gp_output, gp_target)
+        else:
+            gp_loss = torch.tensor(0.0, device=device)
+
+        kl_metrics["loss_gp"] = gp_loss.item()
         
+        total_vae_loss = torch.tensor(0.0, device=device)
+        kl_sum = torch.tensor(0.0, device=device)
+        recon_loss_val = torch.tensor(0.0, device=device)
+
         for name, added_loss_term in model.named_added_loss_terms():
-            if 'gp' in name:
-                continue
+            if 'gp' in name: continue
             
-            raw_loss = added_loss_term.loss()
+            raw_loss = added_loss_term.loss().sum()
 
             if 'recon' in name:
-                recon_loss = raw_loss
-                total_vae_loss += recon_loss
-                kl_metrics[f'loss_{name}'] = recon_loss.item()
-                continue
+                recon_loss_val = raw_loss
+                total_vae_loss = total_vae_loss + recon_loss_val
+            else:
+                weight = self.kl_weights.get(name, 1.0)
+                for key, val in self.kl_weights.items():
+                    if key in name:
+                        weight = val
+                        break
+                
+                scaled_kl = weight * raw_loss
+                kl_sum = kl_sum + scaled_kl
+                total_vae_loss = total_vae_loss + scaled_kl
             
-            weight = 1.0
-            for key, annealed_val in self.kl_weights.items():
-                if key in name:
-                    weight = annealed_val
-                    break
-            
-            scaled_loss = weight * raw_loss
-            kl_loss += scaled_loss
-            total_vae_loss += scaled_loss
-            kl_metrics[f'loss_{name}'] = scaled_loss.item()
+            kl_metrics[f'loss_{name}'] = raw_loss.item()
         
-        # --- GP Exact Marginal Log-Likelihood ---
-        exact_mll = torch.tensor(0.0, device=device)
-        gp_loss = torch.tensor(0.0, device=device)
         
-        if gp_output is not None and gp_target is not None:
-            lmc = ss_history.lmc_matrices
-            batch_lmcs = lmc.mean(dim=1)
-            B_mat = batch_lmcs.mean(dim=0)
-            lmc_pseudo_inv = torch.linalg.pinv(B_mat) # [8, 30]
-            latent_target = torch.matmul(lmc_pseudo_inv, gp_target)
-            exact_mll = self.mll(gp_output, latent_target)
-            gp_loss = -exact_mll
-
-        # --- Loss function ---
         total_loss = total_vae_loss + gp_loss
 
+        
         def to_item(val):
             return val.item() if isinstance(val, torch.Tensor) else val
         
         metrics = {
             'loss_total': to_item(total_loss),
             'loss_vae': to_item(total_vae_loss), 
-            'loss_kls': to_item(kl_loss),
-            'loss_gp': to_item(exact_mll),
-            'loss_recon': to_item(recon_loss),
+            'loss_kls': to_item(kl_sum),
+            'loss_gp': to_item(gp_loss),
+            'loss_recon': to_item(recon_loss_val),
             **kl_metrics
         }
         

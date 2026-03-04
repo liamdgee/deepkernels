@@ -83,13 +83,14 @@ class SpectralVAE(BaseGenerativeModel):
         self.encoder = ConvolutionalLoopEncoder()
         self.eps = 1e-4
     
-    def get_zero_state(self, device, batch_size=64):
+    def get_zero_state(self, device, batch_size=128):
         # Standard dimensions from your architecture
         k = 30 # k_atoms
         e = 8  # num_experts / num_latents
         f = 16 # latent_dim / features
         x_in = 30
         fact = k * 30
+        bottleneck = 64
         
         init_pi = self.init_pi_value(batch_size=batch_size, device=device)
         spread = torch.linspace(0.05, 0.15, 4, device=device)
@@ -103,7 +104,7 @@ class SpectralVAE(BaseGenerativeModel):
             alpha_mu=torch.zeros(batch_size, k, device=device),
             alpha_factor=torch.ones(batch_size, fact, device=device),
             alpha_diag=torch.eye(batch_size, k, device=device),
-            bottleneck=torch.zeros(batch_size, batch_size, device=device),
+            bottleneck=torch.zeros(batch_size, bottleneck, device=device),
             parameters_per_expert=torch.zeros(batch_size, e, f, device=device),
             bandwidth_mod=torch.ones(batch_size, e, device=device),
             amp=torch.ones(batch_size, x_in, device=device),
@@ -191,7 +192,7 @@ class SpectralVAE(BaseGenerativeModel):
             hist_gate_weights.append(dirichlet_out.gated_weights)
             hist_mu_z.append(encoder_out.mu_z)
             hist_logvar_z.append(encoder_out.logvar_z)
-            hist_lmcs.append(dirichlet_out.lmc_matrices)
+            hist_lmcs.append(decoder_out.lmc_matrices)
         
         stacked_gp_params = GPParams(
             gates=torch.stack([p.gates for p in hist_params_nkn], dim=1).unsqueeze(1),

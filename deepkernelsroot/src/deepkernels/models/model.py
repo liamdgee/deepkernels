@@ -2,16 +2,12 @@ import torch
 import gpytorch
 import torch.nn as nn
 
-from deepkernels.losses import kl
 from deepkernels.models.parent import BaseGenerativeModel
 
 from tqdm import tqdm
 
 from deepkernels.models.variationalautoencoder import SpectralVAE, StateSpaceOutput, DecoderStateOutput, HistoryOutput
-
-from deepkernels.models.gaussianprocess import AcceleratedKernelGP
 from deepkernels.models.exactgp import Simple
-
 from deepkernels.models.NKN import GPParams
 from typing import NamedTuple, Optional
 

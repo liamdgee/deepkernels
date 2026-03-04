@@ -137,8 +137,10 @@ class DataOrchestrator:
         pipe = self.build_pipe()
         df_processed = pipe.fit_transform(dfs_in)
         X_sorted, y_sorted = self.sort_by_time(df_processed, y_col=target_col, time_col='time')
-        drop_id_and_target = ["lender_id", "lmean_rejected"]
-        drops = [col for col in drop_id_and_target if col in X_sorted.columns]
+        
+        drops = drop_cols if drop_cols is not None else ["lender_id", "lmean_rejected"]
+        drops = [col for col in drops if col in X_sorted.columns]
+        
         X_sorted = X_sorted.drop(columns=drops, errors='ignore')
         X_norm = self.normalise_time(X_sorted)
 

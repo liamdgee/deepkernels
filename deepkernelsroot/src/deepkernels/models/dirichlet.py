@@ -39,7 +39,6 @@ class DirichletOutput(NamedTuple):
     logvar_z: torch.Tensor
     gp_params: GPParams
     real_x: torch.Tensor
-    lmc_matrices: torch.Tensor
 
 class LossTerm(gpytorch.mlls.AddedLossTerm):
     """
@@ -91,12 +90,6 @@ class AmortisedDirichlet(BaseGenerativeModel):
         )
         
         self.kernel_network = KernelNetwork()
-
-        self.pi_to_latents_head = nn.Linear(k_atoms, num_latents * k_atoms)
-
-        with torch.no_grad():
-            self.pi_to_latents_head.weight.normal_(0.0, 0.01)
-            self.pi_to_latents_head.bias.zero_()
 
         #-params-#
         self.q_mu_global = nn.Parameter(torch.zeros(k_atoms - 1))
@@ -167,17 +160,15 @@ class AmortisedDirichlet(BaseGenerativeModel):
         
         beta, log_pv, log_qv, gamma_conc = self.global_stick_breaking()
 
-        self.log_global_kl(log_pv, log_qv)
+        self.update_added_loss_term("global_divergence", LossTerm(log_qv - log_pv))
     
         bottleneck, gate, gp_params = self.run_neural_nets_dirichlet(x)
         
         local_conc = self.get_local_evidence(mualpha, factoralpha, diagalpha)
 
-        pi = self.dirichlet_posterior_inference_and_log_local_loss(x, gamma_conc, beta, local_conc)
-        
-        pis_per_expert = self.pi_to_latents_head(pi)
+        pi, local_kl = self.dirichlet_posterior_inference_and_log_local_loss(x, gamma_conc, beta, local_conc)
 
-        lmc_matrices = pis_per_expert.view(batch_shape, self.k_atoms, self.num_latents)
+        self.update_added_loss_term("local_divergence", LossTerm(local_kl.sum()))
         
         ls_pred, bw_learned, ls_logvar = self.predict_kernel_lengthscales(ls)
         
@@ -203,12 +194,9 @@ class AmortisedDirichlet(BaseGenerativeModel):
             gp_params=gp_params,
             mu_z=mu_z,
             logvar_z=logvar_z,
-            real_x=real_x,
-            lmc_matrices=lmc_matrices
+            real_x=real_x
         )
     
-    def log_global_kl(self, log_pv, log_qv):
-        self.update_added_loss_term("global_divergence", LossTerm(log_qv - log_pv))
     
     def numerically_stable_gamma(self, gamma_concentration_init):
         raw = float(gamma_concentration_init)
@@ -318,9 +306,8 @@ class AmortisedDirichlet(BaseGenerativeModel):
         dist_post = dist.Dirichlet(post_conc)
         pi_posterior = dist_post.rsample()
         local_divergence = torch.distributions.kl_divergence(dist_post, dist_prior)
-        self.update_added_loss_term("local_divergence", LossTerm(local_divergence.sum()))
         
-        return pi_posterior
+        return pi_posterior, local_divergence
     
     def get_local_evidence(self, mualpha, factoralpha, diagalpha):
         alpha_logits = self.lowrankmultivariatenorm(mualpha, factoralpha, diagalpha)

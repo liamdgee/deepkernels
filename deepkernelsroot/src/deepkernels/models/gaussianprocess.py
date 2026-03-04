@@ -1,6 +1,5 @@
 import torch
 import gpytorch
-from gpytorch.kernels.keops import RBFKernel
 import torch.nn as nn
 from gpytorch.models import ApproximateGP
 import torch.nn.functional as F
@@ -16,6 +15,7 @@ os.environ['CUDA_HOME'] = '/usr/local/cuda'
 os.environ['PATH'] = '/usr/local/cuda/bin:' + os.environ['PATH']
 
 import pykeops
+from pykeops.torch import LazyTensor
 #### -- pykeops.clean_pykeops()
 pykeops.config.cuda_standalone = True
 pykeops.config.use_OpenMP = False
@@ -23,10 +23,9 @@ pykeops.config.use_OpenMP = False
 import math
 import itertools
 from gpytorch.kernels import Kernel
-from pykeops.torch import LazyTensor
+
 import linear_operator
-from linear_operator.operators import LinearOperator
-from gpytorch.operators import KeOpsLinearOperator
+from linear_operator.operators import LinearOperator, KeOpsLinearOperator
 from gpytorch.kernels.keops import RBFKernel
 
 class AcceleratedKernelGP(ApproximateGP):

@@ -48,6 +48,11 @@ def parse_args():
         default=["lender_id", "rejected", "lmean_rejected"], 
         help="List of column names to drop before processing features (we drop y as we already have y seperate)"
     )
+
+    parser.add_argument(
+        "--kl_weights",
+        nargs='*'
+    )
     
     #-model tweaks
     parser.add_argument("--run_gp", type=bool, default=False, help="boolean to skip complex keops math")
@@ -94,9 +99,6 @@ def main():
     
     orchestrator = DataOrchestrator()
 
-    # ---------------------------------------------------------
-    #-- Extract batched data for VAE-#
-    # ---------------------------------------------------------
     train_loader, test_loader = orchestrator.run_pipeline(
         df1=df1,
         df2=df2,
@@ -113,9 +115,9 @@ def main():
     # ---------------------------------------------------------
     logger.info("Extracting full dataset into memory for KeOps ExactGP...")
     all_x, all_y = [], []
-    for x_batch, y_batch in train_loader:
-        all_x.append(x_batch)
-        all_y.append(y_batch)
+    for batch_idx, (x, y) in enumerate(train_loader):
+        all_x.append(x)
+        all_y.append(y)
         
     full_x = torch.cat(all_x, dim=0) #- [N, SeqLen, Features]
     full_y = torch.cat(all_y, dim=0) #-[N, 30]
@@ -132,13 +134,13 @@ def main():
     logger.info("Building KeOps ExactGP and StateSpaceKernelProcess...")
     dummy_x = torch.arange(N, dtype=torch.float32)
     
+
     gp = Simple(
         train_x=dummy_x, 
         train_y=full_y, 
         likelihood=None,
-        k_atoms=30, 
         num_latents=8
-    ) 
+    )
     #-could argparse atoms and latents obviously, but this will break the entire model
     
     model = StateSpaceKernelProcess(gp=gp, run_gp=args.run_gp)
@@ -149,7 +151,7 @@ def main():
         total_epochs=(args.vae_epochs + args.gp_epochs),
         base_lr_adamw=args.base_lr,
         langevin_temp=args.langevin_temp,
-        max_grad_norm=1.0,
+        max_grad_norm=args.max_grad_norm,
         n_data=N 
     )
 
@@ -157,14 +159,27 @@ def main():
     #- route params -#
     # ---------------------------------------------------------
     logger.info("Isolating parameters and building split-brain optimizers...")
+    
+    objective = ExactObjective(model=model, kl_weights=args.kl_weights)
+
     setup = ParameterIsolate(
         model=model, 
         device=device,
-        base_lr_adamw=1.175e-3,
-        langevin_temp=7.5e-6
+        objective=objective,
+        base_lr_adamw=args.base_lr_adamw,
+        langevin_temp=args.langevin_temp,
+        fast_dir=args.fast_dir
+        med_dir=args.med_dir
+        slow_dir=args.slow_dir
+        gamma_dir=args.gamma_dir
+        ultrasensitive_lr=args.ultrasensitive_lr,
+        sensitive_lr=args.sensitive_lr,
+        gp_mean_lr=args.gp_mean_lr,
+        gp_likelihood_lr=args.gp_likelihood_lr,
+        gp_hyper_lr=args.gp_hyper_lr
     )
     
-    adam_opt, sgld_opt = setup.seperate_params_and_build_optimisers()
+    adam_w_opt, langevin_opt, adam_opt, groups = setup.seperate_params_and_build_optimisers()
 
     # ---------------------------------------------------------
     #-- init trainer --#

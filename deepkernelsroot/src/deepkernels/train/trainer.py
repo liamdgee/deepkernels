@@ -14,8 +14,7 @@ from torch.optim.lr_scheduler import LinearLR
 
 from deepkernels.train.stochastic_annealer import StochasticAnnealer
 from deepkernels.models.model import StateSpaceKernelProcess
-from deepkernels.train.objective import EvidenceLowerBound
-from deepkernels.train.langevin_trainer import LangevinTrainer
+from deepkernels.train.exact_objective import ExactObjective
 from typing import Union, Optional, Iterable
 import gpytorch
 from tqdm import tqdm
@@ -30,7 +29,7 @@ class ParameterIsolate:
         self.model = model
         self.device = self.get_device(device)
         self.kwargs = kwargs
-        self.objective = objective if objective is not None else EvidenceLowerBound(self.model)
+        self.objective = objective if objective is not None else ExactObjective(self.model)
         
         self.adam_optimiser = None
         self.adamw_optimiser = None
@@ -195,8 +194,6 @@ class ParameterIsolate:
         ultrasensitive_lr = self.kwargs.get('ultrasensitive_lr', 5e-5)
         sensitive_lr = self.kwargs.get('sensitive_lr', 1e-4)
 
-        gp_variational_lr = self.kwargs.get('gp_variational_lr', 0.03)
-        gp_lmc_lr = self.kwargs.get('gp_lmc_lr', 0.01277)
         gp_mean_lr = self.kwargs.get('gp_mean_lr', 7.77e-3)
         gp_likelihood_lr = self.kwargs.get('gp_likelihood_lr', 1.77e-2)
         gp_hyper_lr = self.kwargs.get("gp_hyper_lr", 3.5e-3)
@@ -269,6 +266,20 @@ class ParameterIsolate:
         self._set_group_grad("gp_total", False)
         logger.info("Mode: VAE + Dirichlet. (Use standard mini-batches)")
 
+    def train_gp_warmup(self):
+        """
+        Stage 2: GP Warmup.
+        Freezes the VAE and the complex NKN Hypernetwork. 
+        Only trains the GP's core parameters (Mean and Likelihood noise) 
+        to stabilize the exact MLL before full covariance learning.
+        """
+        self._set_group_grad("encoder_total", False)
+        self._set_group_grad("decoder_total", False)
+        self._set_group_grad("dirichlet_total", False)    
+        self._set_group_grad("hypernetwork_total", False) # <-- FROZEN
+        self._set_group_grad("gp_total", True)
+        logger.info("Mode: GP Warmup. (Calibrating Mean and Likelihood Noise)")
+    
     def train_gp_only(self):
         """
         Stage 2: Full-Batch KeOps ExactGP Training.
@@ -293,7 +304,7 @@ class ParameterIsolate:
         self._set_group_grad("gp_total", True)
         logger.info("Mode: Fully Unfrozen / Cyclical.")
 
-    def get_warm_start_optimizer(self, active_modules, lr=1e-3, warmup_epochs=5):
+    def get_warm_start_optimiser(self, active_modules, lr=1e-3, warmup_epochs=5):
         """
         Creates a fresh optimizer to clear stale momentum states, 
         paired with a linear warmup scheduler for a smooth start.

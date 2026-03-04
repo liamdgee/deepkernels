@@ -69,6 +69,7 @@ class SpectralDecoder(BaseGenerativeModel):
         current_dim = spectral_emb_dim
         self.latent_dim = latent_dim
         layers = []
+        self.num_latents = 8
         
         for compression in spectral_compressions:
             layers.append(torch.nn.utils.spectral_norm(nn.Linear(current_dim, compression)))
@@ -112,8 +113,13 @@ class SpectralDecoder(BaseGenerativeModel):
         self.mu_alpha = nn.Linear(bottleneck_dim, k_atoms)
         self.factor_alpha = nn.Linear(bottleneck_dim, k_atoms * self.rank)
         self.diag_alpha = nn.Linear(bottleneck_dim, k_atoms)
-       
 
+        self.pi_to_latents_head = nn.Linear(k_atoms, self.num_latents * k_atoms)
+       
+        with torch.no_grad():
+            self.pi_to_latents_head.weight.normal_(0.0, 0.01)
+            self.pi_to_latents_head.bias.zero_()
+        
         self.lengthscale_mu = nn.Linear(bottleneck_dim, k_atoms)
         self.lengthscale_logvar = nn.Linear(bottleneck_dim, k_atoms)
         self.scale_head_per_expert = torch.nn.utils.spectral_norm(nn.Linear(k_atoms, num_experts))
@@ -149,14 +155,22 @@ class SpectralDecoder(BaseGenerativeModel):
         real_x = getattr(vae_out, 'real_x', None)
 
         beta = params.get("beta_override", 1.0)
+
+        pi = getattr(vae_out, 'pi', None)
         
         spectral_bottleneck = self.compression_network(x)
+
+        pis_per_expert = self.pi_to_latents_head(pi)
+
+        lmc_matrices = pis_per_expert.view(-1, self.k_atoms, self.num_latents)
         
         bottleneck = torch.tanh(spectral_bottleneck)
 
         recon, trend, amp, residuals = self.disentangle(bottleneck)
 
-        self.log_recon_kl(real_x, recon, mu_z, logvar_z, beta=beta)
+        lossterm = self.log_recon_kl(real_x, recon, mu_z, logvar_z, beta=beta)
+
+        self.update_added_loss_term("recon_kl", LossTerm(lossterm))
 
         latent_expert_functions = [variational(bottleneck) for variational in self.expert_variational_heads]
 
@@ -166,11 +180,15 @@ class SpectralDecoder(BaseGenerativeModel):
 
         alpha_logits = self.lowrankmultivariatenorm(mu, factor, diag)
 
-        self.log_alpha_kl_low_rank(mu, factor, diag)
+        kl = self.log_alpha_kl_low_rank(mu, factor, diag)
+
+        self.update_added_loss_term("alpha_kl", LossTerm(kl))
 
         pi_sample = self.dirichlet_sample(alpha_logits)
         
-        ls_sample = self.predict_lengthscale_and_log_kl(bottleneck, ls_pred_prior, ls_logvar_prior)
+        ls_sample, kl_div = self.predict_lengthscale_and_log_kl(bottleneck, ls_pred_prior, ls_logvar_prior)
+
+        self.update_added_loss_term("lengthscale_kl", LossTerm(kl_div.sum()))
 
         bandwidth_mod = torch.sigmoid(self.scale_head_per_expert(ls_sample)) * 2.0
 
@@ -196,7 +214,7 @@ class SpectralDecoder(BaseGenerativeModel):
             ls=ls_sample,
             mu_z=mu_z,
             logvar_z=logvar_z,
-            lmc_matrices=vae_out.lmc_matrices
+            lmc_matrices=lmc_matrices
         )
         
         return vae_out
@@ -221,8 +239,7 @@ class SpectralDecoder(BaseGenerativeModel):
         loss = F.mse_loss(recon, x, reduction='sum')
         kl = -0.5 * torch.sum(1 + logvar_z - mu_z.pow(2) - logvar_z.exp())
         lossterm = loss + (beta * kl)
-        self.update_added_loss_term(LossTerm(lossterm))
-        return self
+        return lossterm
     
     
     def disentangle(self, bottleneck):
@@ -268,9 +285,8 @@ class SpectralDecoder(BaseGenerativeModel):
         )
         
         kl = kl_divergence(q_dist, p_dist)
-        self.update_added_loss_term("alpha_kl", LossTerm(kl))
 
-        return self
+        return kl
 
     def predict_lengthscale_and_log_kl(self, bottleneck, ls_pred_prior=None, ls_logvar_prior=None, eps=1e-4):
         """
@@ -296,11 +312,9 @@ class SpectralDecoder(BaseGenerativeModel):
         
         kl_div = dist.kl_divergence(q_log_ls, p_log_ls)
         
-        self.update_added_loss_term("lengthscale_kl", LossTerm(kl_div.sum()))
-        
         #-transform to lengthscale space-#
         ls_sample = torch.exp(log_ls_sample)
         
         ls_sample = torch.clamp(ls_sample, min=eps, max=100.0)
         
-        return ls_sample
+        return ls_sample, kl_div

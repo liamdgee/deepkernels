@@ -6,6 +6,10 @@ os.environ['PATH'] = '/usr/local/cuda/bin:' + os.environ['PATH']
 
 import pykeops
 import torch.nn.functional as F
+from pykeops.torch import LazyTensor
+import linear_operator
+from linear_operator.operators import LinearOperator, KeOpsLinearOperator
+from gpytorch.kernels.keops import RBFKernel
 
 ##--pykeops.clean_pykeops()
 pykeops.config.cuda_standalone = True
@@ -13,14 +17,9 @@ pykeops.config.use_OpenMP = False
 
 import torch.nn as nn
 import math
-import itertools
 import gpytorch
 from gpytorch.kernels import Kernel
-from pykeops.torch import LazyTensor
-import linear_operator
-from linear_operator.operators import LinearOperator
-from gpytorch.operators import KeOpsLinearOperator
-from gpytorch.kernels.keops import RBFKernel
+
 
 class GenerativeKernel(Kernel):
     has_lengthscale = False
@@ -358,8 +357,6 @@ class GenerativeKernel(Kernel):
         global_scale = self.outputscale.view(-1)
         multitask_amp = self.latent_amplitude.view(-1, 1)
         return base_diag * global_scale * multitask_amp
-
-
 
 
 class ProbabilisticMixtureMean(gpytorch.means.Mean):
