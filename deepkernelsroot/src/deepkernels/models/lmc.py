@@ -24,7 +24,7 @@ class LinearCoregionalisation(gpytorch.Module):
         self.lmc_w = nn.Parameter(torch.randn(num_tasks, rank) * 0.1)
         self.lmc_var = nn.Parameter(torch.zeros(num_tasks)) # softplus(0) = 0.69
         
-        # --- 2. Inverse Wishart Prior Buffers (psi: mean 0 (tasks are indepenjdent, nu: degrees freedom)) ---
+        # --- Inverse Wishart Prior Buffers (psi: mean 0 (tasks are indepenjdent, nu: degrees freedom)) ---
         self.register_buffer("pr_psi", torch.eye(num_tasks))
         self.register_buffer("pr_nu", torch.tensor(num_tasks + 2.0))
     

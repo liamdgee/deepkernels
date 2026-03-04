@@ -69,6 +69,7 @@ class ParameterIsolate:
         dirichlet_variational_params = []
         dirichlet_gamma_params = []
         dirichlet_ls_params = []
+        lmc_params = []
         
         #-kernel hypernetwork params include:
         all_hypernetwork_params = []
@@ -163,6 +164,9 @@ class ParameterIsolate:
                 elif 'q_mu' in name or 'q_log_sigma' in name:
                     dirichlet_variational_params.append(param)
                     dirichlet_all_params.append(param)
+                elif 'lmc' in name:
+                    lmc_params.append(param)
+                    dirichlet_all_params.append(param)
                 elif 'compress' in name or 'mixer' in name or 'head' in name:
                     dirichlet_all_nn_params.append(param)
                     dirichlet_all_params.append(param)
@@ -212,7 +216,8 @@ class ParameterIsolate:
             {'params': dirichlet_ls_params, 'lr': ultrasensitive_lr},
             {'params': dirichlet_all_nn_params, 'lr': med_dir},
             {'params': dirichlet_variational_params, 'lr': fast_dir},
-            {'params': probabilistic_nn_params, 'lr': med_dir}
+            {'params': probabilistic_nn_params, 'lr': med_dir},
+            {'params': lmc_params, 'lr': med_dir}
         ], alpha=0.975, eps=1e-7)
 
         self.adam_optimiser = torch.optim.Adam([
@@ -313,9 +318,9 @@ class ParameterIsolate:
         for module in active_modules:
             params += list(module.parameters())
         
-        optimizer = Adam(params, lr=lr)
-        scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
-        return optimizer, scheduler
+        optimiser = Adam(params, lr=lr)
+        scheduler = LinearLR(optimiser, start_factor=0.1, total_iters=warmup_epochs)
+        return optimiser, scheduler
 
     def get_device(self, device_request: Union[str, torch.device, None] = None) -> torch.device:
 

@@ -93,8 +93,6 @@ class SpectralVAE(BaseGenerativeModel):
         bottleneck = 64
         
         init_pi = self.init_pi_value(batch_size=batch_size, device=device)
-        spread = torch.linspace(0.05, 0.15, 4, device=device)
-        init_sms = spread.unsqueeze(0).expand(batch_size, -1).to(device)
 
         return DecoderStateOutput(
             recon=torch.zeros(batch_size, x_in, device=device),

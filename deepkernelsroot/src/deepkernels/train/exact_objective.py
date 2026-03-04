@@ -8,6 +8,7 @@ from typing import Union, Optional
 from tqdm import tqdm
 
 import linear_operator
+from linear_operator import DenseLinearOperator, MatmulLinearOperator, 
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
@@ -43,11 +44,18 @@ class ExactObjective(nn.Module):
         
         if gp_output is not None and gp_target is not None:
             if hasattr(ss_history, 'lmc_matrices'):
-                lmc = ss_history.lmc_matrices
-                batch_lmcs = lmc.mean(dim=1)
-                B_mat = batch_lmcs.mean(dim=0)
-                lmc_pseudo_inv = torch.linalg.pinv(B_mat) # [8, 30]
-                latent_target = torch.matmul(lmc_pseudo_inv, gp_target)
+                # --- Inside ExactObjective.forward() ---
+        
+        if gp_output is not None and gp_target is not None:
+            if hasattr(ss_history, 'W_current_state'): # Ensure you export W!
+                W_mat = ss_history.lmc_matrices
+                gp_target_batched = gp_target.t().unsqueeze(-1)
+                W_pinv = torch.linalg.pinv(W_mat)
+                latent_target = torch.bmm(W_pinv, gp_target_batched).squeeze(-1) # -> [N, 8]
+                latent_target = latent_target.t().contiguous()
+                if torch.isnan(latent_target).any():
+                    logger.warning("NaNs detected in batched pseudo-inverse. Falling back to zeros.")
+                    latent_target = torch.nan_to_num(latent_target)
                 exact_mll = self.mll(gp_output, latent_target)
                 gp_loss = -exact_mll
             else:

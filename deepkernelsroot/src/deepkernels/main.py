@@ -168,10 +168,10 @@ def main():
         objective=objective,
         base_lr_adamw=args.base_lr_adamw,
         langevin_temp=args.langevin_temp,
-        fast_dir=args.fast_dir
-        med_dir=args.med_dir
-        slow_dir=args.slow_dir
-        gamma_dir=args.gamma_dir
+        fast_dir=args.fast_dir,
+        med_dir=args.med_dir,
+        slow_dir=args.slow_dir,
+        gamma_dir=args.gamma_dir,
         ultrasensitive_lr=args.ultrasensitive_lr,
         sensitive_lr=args.sensitive_lr,
         gp_mean_lr=args.gp_mean_lr,
@@ -188,7 +188,8 @@ def main():
     trainer = LangevinTrainer(
         model=model,
         adam_optimiser=adam_opt,
-        sgld_optimiser=sgld_opt,
+        sgld_optimiser=langevin_opt,
+        adamw_optimiser=adam_w_opt,
         device=device,
         total_epochs=100,
         langevin_temp=7.5e-6,

@@ -13,7 +13,7 @@ import torch
 from torch.distributions import LowRankMultivariateNormal, Independent, Normal, kl_divergence
 from deepkernels.models.NKN import GPParams
 
-from typing import NamedTuple
+from typing import NamedTuple, List, Union, Optional
 
 class LossTerm(gpytorch.mlls.AddedLossTerm):
     """
@@ -49,33 +49,37 @@ class DecoderOutput(NamedTuple):
 
 
 class SpectralDecoder(BaseGenerativeModel):
-    def __init__(self, 
-                 input_dim=30,       # Output shape (reconstruction)
-                 spectral_dim=256,   # Features per cluster (M*2)
-                 num_clusters=30,
-                 spectral_emb_dim=2048,
-                 input_dim_data=30,
-                 bottleneck_dim=64,
-                 num_experts=8,
-                 k_atoms=30,
-                 latent_dim=16,
-                 hidden_dims=None,
-                 dropout=0.1):
+    def __init__(self,
+                 config=None,
+                 hidden_dims: Optional[Union[int, list[int]]]=None,
+                 **kwargs
+):
         super().__init__()
-        
+
+        self.config = config if config else None
+        self.kwargs = kwargs
+        self.jitter = self.kwargs.get("jitter", 1e-6)
+        self.dropout = self.kwargs.get("dropout", 0.05)
+        self.latent_dim = self.kwargs.get("latent_dim", 16)
+        self.input_dim = self.kwargs.get("input_dim", 30) ## -- or self.kwargs.get("num_features_real_x", 30)
+        self.bottleneck_dim = self.kwargs.get("bottleneck_dim", 64)
+        self.k_atoms = self.kwargs.get("k_atoms", 30)
+        self.rank = self.kwargs.get("alpha_factor_rank", 3)
+        self.M = self.kwargs.get("num_fourier_features", 128)
+        self.spectral_emb_dim = self.kwargs.get("spectral_emb_dim", 2048)
+        self.num_latents = self.kwargs.get("num_latents", 8)
         spectral_compressions = [1024, 512, 128, 64]
-        self.num_experts = num_experts
-        self.k_atoms = k_atoms
-        current_dim = spectral_emb_dim
-        self.latent_dim = latent_dim
-        layers = []
-        self.num_latents = 8
         
+        self.hidden_dims = self.kwargs.get("hidden_compression_dims", [1024, 512, 128, 64])
+
+        layers = []
+        current_dim = self.spectral_emb_dim
+
         for compression in spectral_compressions:
             layers.append(torch.nn.utils.spectral_norm(nn.Linear(current_dim, compression)))
             layers.append(nn.LayerNorm(compression))
             layers.append(nn.SiLU())
-            layers.append(nn.Dropout(dropout))
+            layers.append(nn.Dropout(self.dropout))
             current_dim = compression
         
 
@@ -83,46 +87,40 @@ class SpectralDecoder(BaseGenerativeModel):
         self.compression_network = nn.Sequential(*layers)
 
         self.ls_head_recon = nn.Sequential(
-            nn.Linear(4, input_dim_data),
+            nn.Linear(4, self.input_dim), #-where input dim is input to the encoder i.e. num_features in real_x
             nn.Tanh()            
         )
         self.pi_head_recon = nn.Sequential(
-            nn.Linear(30, input_dim_data),
-            nn.LayerNorm(input_dim_data),
+            nn.Linear(30, self.input_dim),
+            nn.LayerNorm(self.input_dim),
             nn.Sigmoid()
         )
         self.data_head_recon = nn.Sequential(
             nn.LayerNorm(30),
-            nn.utils.spectral_norm(nn.Linear(30, input_dim_data))
+            nn.utils.spectral_norm(nn.Linear(30, self.input_dim))
         )
 
         self.expert_variational_heads = nn.ModuleList([
             torch.nn.utils.spectral_norm(
-                nn.Linear(bottleneck_dim, k_atoms)
+                nn.Linear(self.bottleneck_dim, self.k_atoms)
             ) 
-            for _ in range(num_experts)
+            for _ in range(self.num_experts)
         ])
         
         #-roughly equates to prior assertion that 50% of explanatory power comes from mixture weights
         self.expert_logit_heads = nn.ModuleList([
-            nn.Linear(k_atoms, latent_dim)
-            for _ in range(num_experts)
+            nn.Linear(self.k_atoms, self.latent_dim)
+            for _ in range(self.num_experts)
         ])
 
         self.rank=3
-        self.mu_alpha = nn.Linear(bottleneck_dim, k_atoms)
-        self.factor_alpha = nn.Linear(bottleneck_dim, k_atoms * self.rank)
-        self.diag_alpha = nn.Linear(bottleneck_dim, k_atoms)
 
-        self.pi_to_latents_head = nn.Linear(k_atoms, self.num_latents * k_atoms)
-       
-        with torch.no_grad():
-            self.pi_to_latents_head.weight.normal_(0.0, 0.01)
-            self.pi_to_latents_head.bias.zero_()
+        self.mu_alpha = nn.Linear(self.bottleneck_dim, self.k_atoms)
+        self.factor_alpha = nn.Linear(self.bottleneck_dim, self.k_atoms * self.rank)
+        self.diag_alpha = nn.Linear(self.bottleneck_dim, self.k_atoms)
         
-        self.lengthscale_mu = nn.Linear(bottleneck_dim, k_atoms)
-        self.lengthscale_logvar = nn.Linear(bottleneck_dim, k_atoms)
-        self.scale_head_per_expert = torch.nn.utils.spectral_norm(nn.Linear(k_atoms, num_experts))
+        self.lengthscale_mu = nn.Linear(self.bottleneck_dim, self.k_atoms)
+        self.lengthscale_logvar = nn.Linear(self.bottleneck_dim, self.k_atoms)
 
         self.register_added_loss_term("lengthscale_kl")
         self.register_added_loss_term("alpha_kl")
@@ -155,14 +153,8 @@ class SpectralDecoder(BaseGenerativeModel):
         real_x = getattr(vae_out, 'real_x', None)
 
         beta = params.get("beta_override", 1.0)
-
-        pi = getattr(vae_out, 'pi', None)
         
         spectral_bottleneck = self.compression_network(x)
-
-        pis_per_expert = self.pi_to_latents_head(pi)
-
-        lmc_matrices = pis_per_expert.view(-1, self.k_atoms, self.num_latents)
         
         bottleneck = torch.tanh(spectral_bottleneck)
 
@@ -178,13 +170,9 @@ class SpectralDecoder(BaseGenerativeModel):
 
         mu, factor, diag = self.get_alpha_mvn_heads_decoder(bottleneck)
 
-        alpha_logits = self.lowrankmultivariatenorm(mu, factor, diag)
-
         kl = self.log_alpha_kl_low_rank(mu, factor, diag)
 
         self.update_added_loss_term("alpha_kl", LossTerm(kl))
-
-        pi_sample = self.dirichlet_sample(alpha_logits)
         
         ls_sample, kl_div = self.predict_lengthscale_and_log_kl(bottleneck, ls_pred_prior, ls_logvar_prior)
 
@@ -199,7 +187,7 @@ class SpectralDecoder(BaseGenerativeModel):
         vae_out = DecoderOutput(
             gp_params=vae_out.gp_params,
             bottleneck=bottleneck,
-            alpha=alpha_logits,
+            alpha=vae_out.local_conc,
             alpha_mu=mu,
             alpha_factor=factor,
             alpha_diag=diag,
@@ -207,14 +195,14 @@ class SpectralDecoder(BaseGenerativeModel):
             parameters_per_expert=variational_parameters,
             recon=recon,
             bandwidth_mod=bandwidth_mod,
-            pi=pi_sample,
+            pi=vae_out.pi,
             amp=amp,
             trend=trend,
             res=residuals,
             ls=ls_sample,
             mu_z=mu_z,
             logvar_z=logvar_z,
-            lmc_matrices=lmc_matrices
+            lmc_matrices=vae_out.lmc_matrices
         )
         
         return vae_out
@@ -287,6 +275,13 @@ class SpectralDecoder(BaseGenerativeModel):
         kl = kl_divergence(q_dist, p_dist)
 
         return kl
+    
+    def dirichlet_sample(self, alpha):
+        alpha = F.softplus(alpha)
+        alpha = torch.clamp(alpha, min=4e-2)
+        q_alpha= torch.distributions.Dirichlet(alpha)
+        pi_sample = q_alpha.rsample()
+        return pi_sample
 
     def predict_lengthscale_and_log_kl(self, bottleneck, ls_pred_prior=None, ls_logvar_prior=None, eps=1e-4):
         """

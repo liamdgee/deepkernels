@@ -199,21 +199,16 @@ class LangevinTrainer:
                 
                 for k, v in metrics.items():
                     test_stats[k] += v
-                
                 if out.gp_out is not None:
-                    batch_lmcs = out.history.hist_lmcs.mean(dim=1)
-                    B_mat = batch_lmcs.mean(dim=0)
-                    
-                    # Mean Projection: [30, 8] @ [8, BatchSize] -> [30, BatchSize]
-                    latent_mean = out.gp_out.mean
-                    projected_mean = torch.matmul(B_mat, latent_mean)
-                    
-                    # Variance Projection: var(Ay) = A^2 var(y) (assuming independent latents)
-                    latent_var = out.gp_out.variance
-                    projected_var = torch.matmul(B_mat**2, latent_var)
-                    
+                    W_mat = out.history.lmc_matrices 
+                    latent_mean = out.gp_out.mean.t().unsqueeze(-1)
+                    projected_mean = torch.bmm(W_mat, latent_mean).squeeze(-1)
+                    latent_var = out.gp_out.variance.t().unsqueeze(-1)
+                    W_mat_squared = W_mat ** 2
+                    projected_var = torch.bmm(W_mat_squared, latent_var).squeeze(-1)
+                    batch_y = y.t() if (y.dim() == 2 and y.size(0) == self.model.k_atoms) else y
                     t_preds.append(projected_mean)
-                    t_targets.append(y) #-y is [30, BatchSize]
+                    t_targets.append(batch_y)
                     t_vars.append(projected_var)
         
         mean_test_stats = {k: v / n_batches for k, v in test_stats.items()}
@@ -261,7 +256,8 @@ class LangevinTrainer:
                     "global_divergence": 2e-5, 
                     "local_divergence": 1e-5, 
                     "alpha_kl": 2e-3, 
-                    "lengthscale_kl": 1e-3
+                    "lengthscale_kl": 1e-3,
+                    "inverse_wishart": 1e-4
                 }
                 
                 metrics = self.step_vae(x) 
@@ -277,12 +273,14 @@ class LangevinTrainer:
         # ==========================================
         self.orchestrator.train_vae_and_dirichlet()
         total_steps = vae_epochs * len(train_loader)
-        
+        iw_stop_beta = self.kwargs.get('iw_stop_beta', 0.1) # Get from argparse!
+
         annealers = {
             "global_divergence": StochasticAnnealer(total_steps, n_cycles=4, ratio=0.5, stop_beta=0.1, noise_scale=0.01),
             "local_divergence": StochasticAnnealer(total_steps, n_cycles=4, ratio=0.5, stop_beta=0.1, noise_scale=0.01),
             "alpha_kl": StochasticAnnealer(total_steps, n_cycles=1, ratio=0.2, stop_beta=1.0, noise_scale=0.0),
-            "lengthscale_kl": StochasticAnnealer(total_steps, n_cycles=1, ratio=0.2, stop_beta=1.0, noise_scale=0.0)
+            "lengthscale_kl": StochasticAnnealer(total_steps, n_cycles=1, ratio=0.2, stop_beta=1.0, noise_scale=0.0),
+            "inverse_wishart": StochasticAnnealer(total_steps, n_cycles=1, ratio=0.2, stop_beta=iw_stop_beta, noise_scale=0.0)
         }
 
         logger.info("--- Entering Stage 1 (Full): VAE Training ---")
@@ -342,8 +340,13 @@ class LangevinTrainer:
         if em_macro_cycles > 0:
             logger.info(f"--- Entering Stage 4: E-M Cyclical Refinement ({em_macro_cycles} Macro-Cycles) ---")
             
+
             self.objective.kl_weights = {
-                "global_divergence": 0.1, "local_divergence": 0.1, "alpha_kl": 1.0, "lengthscale_kl": 1.0
+                "global_divergence": 0.1, 
+                "local_divergence": 0.1, 
+                "alpha_kl": 1.0, 
+                "lengthscale_kl": 1.0,
+                "inverse_wishart": self.kwargs.get('iw_stop_beta', 0.1)
             }
 
             for cycle in range(1, em_macro_cycles + 1):

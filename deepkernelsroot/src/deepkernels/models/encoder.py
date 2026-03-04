@@ -14,7 +14,6 @@ from deepkernels.losses.simple import SimpleLoss
 from deepkernels.models.parent import BaseGenerativeModel
 
 class EncoderOutput(NamedTuple):
-    alpha: torch.Tensor
     alpha_mu: torch.Tensor
     alpha_factor: torch.Tensor
     alpha_diag: torch.Tensor
@@ -33,10 +32,12 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
     bottleneck_dim: The exact dimension your KernelNetwork expects (64)
     """
     def __init__(self,
+                 config=None,
                  **kwargs
         ):
         super().__init__()
         self.kwargs = kwargs
+        self.config = config if config else None
         self.jitter = self.kwargs.get("jitter", 1e-6)
         self.dropout = self.kwargs.get("dropout", 0.05)
         self.latent_dim = self.kwargs.get("latent_dim", 16)
@@ -133,12 +134,6 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         if ls is None:
             ls = empty_tensor
         
-        alpha = params.get('alpha', None)
-        if alpha is None and vae_out is not None:
-            alpha = getattr(vae_out, 'alpha', None)
-        
-        if alpha is None:
-            alpha = empty_tensor
         
         jitter = self.jitter or 1e-6
         
@@ -161,7 +156,6 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         z = self.reparameterise(mu_z, logvar_z)
         
         return EncoderOutput(
-            alpha=alpha, #-this is passed and never calc'd here-#
             alpha_mu=alpha_mu,
             alpha_factor=alpha_factor,
             alpha_diag=alpha_diag,
