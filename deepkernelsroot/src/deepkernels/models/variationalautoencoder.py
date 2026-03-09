@@ -78,7 +78,7 @@ class SpectralVAE(BaseGenerativeModel):
         alpha_factor += torch.randn_like(alpha_factor) * 0.001
         #-pi init-#
         init_pi = self.init_pi_value(batch_size=batch_size, device=device)
-        initial_lmc = torch.eye(k, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+        initial_lmc = torch.zeros(k, e, device=device).unsqueeze(0).expand(batch_size, -1, -1)
         symmetry_breaker = torch.randn_like(initial_lmc) * 1e-4
         initial_lmc = initial_lmc + symmetry_breaker
 

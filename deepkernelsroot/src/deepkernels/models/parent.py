@@ -38,10 +38,6 @@ class BaseGenerativeModel(gpytorch.Module):
         self.register_parameter(name, parameter)
         self.register_constraint(name, constraint)
         return self
-    
-    def register_kernel_priors(self):
-        if hasattr(self, "covar_module"):
-            self.register_prior("sparsity_prior", HorseshoePrior(scale=0.1), lambda m: m.raw_inv_bandwidth)
 
     def log_loss(self, name, value):
         """
@@ -60,9 +56,10 @@ class BaseGenerativeModel(gpytorch.Module):
         self.update_added_loss_term("logistic_kl", SimpleLoss(kl.mean()))
 
     
-    def reparameterise(self, mu, logvar):
+    def reparameterise(self, mu, logvar, eps_min=-3.3, eps_max=3.3):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
+        eps = torch.clamp(eps,  min=eps_min, max=eps_max)
         return mu + eps * std
     
     def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):

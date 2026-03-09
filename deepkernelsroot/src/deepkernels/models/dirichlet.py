@@ -17,6 +17,7 @@ from linear_operator.operators import RootLinearOperator, MatmulLinearOperator, 
 from deepkernels.models.parent import BaseGenerativeModel
 from deepkernels.losses.simple import SimpleLoss
 from deepkernels.models.NKN import KernelNetwork, KernelNetworkOutput, GPParams
+from deepkernels.kernels.keops import CustomLaplacePrior
 from pydantic import BaseModel
 import torch.distributions as dist
 
@@ -352,7 +353,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
 
         pi, local_kl = self.dirichlet_posterior_inference_and_log_local_loss(x, gamma_conc, beta, local_conc) #-< alpha is here as local conc-#
 
-        B_mat_current_state = self.coregionalisation_matrix(pi)
+        B_mat_current_state, W_consensus = self.coregionalisation_matrix(pi)
 
         iw_loss = self.inverse_wishart_penalty(B_mat_current_state)
 
@@ -385,7 +386,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
             mu_z=mu_z,
             logvar_z=logvar_z,
             real_x=real_x,
-            lmc_matrices=B_mat_current_state
+            lmc_matrices=W_consensus
         )
     
     
@@ -408,13 +409,14 @@ class AmortisedDirichlet(BaseGenerativeModel):
         batch_size = pi.size(0)
         pi_bc = pi.unsqueeze(-1)
         W_current_state = pi_bc * self.lmc_matrix
+        W_consensus = W_current_state.mean(dim=0)
         cholesky_jitter = 1e-4 
         v = self.lmc_var + cholesky_jitter
         v_bc = v.unsqueeze(0).expand(batch_size, -1)
         lazyroot = RootLinearOperator(W_current_state)
         lazydiag = DiagLinearOperator(v_bc)
         B_lazy = AddedDiagLinearOperator(lazydiag, lazyroot)
-        return B_lazy.to_dense()
+        return B_lazy.to_dense(), W_consensus
     
     def random_fourier_features(self, z, omega, pi, **params):
         """inputs latent dim z"""
@@ -629,31 +631,7 @@ class LossTerm(gpytorch.mlls.AddedLossTerm):
         
     def loss(self):
         return self.loss_tensor
-    
 
-
-class CustomLaplacePrior(Prior):
-    def __init__(self, loc, scale, validate_args=False, **kwargs):
-        loc_tensor = torch.as_tensor(loc, dtype=torch.float32)
-        scale_tensor = torch.as_tensor(scale,  dtype=torch.float32)
-        
-        super(Prior, self).__init__(loc_tensor, scale_tensor, validate_args=validate_args)
-        
-        self._dist = Laplace(loc_tensor, scale_tensor, validate_args=validate_args)
-
-    def log_prob(self, parameter):
-        return self._dist.log_prob(parameter)
-
-    def rsample(self, sample_shape=torch.Size()):
-        return self._dist.rsample(sample_shape)
-    
-    @property
-    def loc(self):
-        return self._dist.loc
-
-    @property
-    def scale(self):
-        return self._dist.scale
     
     
    

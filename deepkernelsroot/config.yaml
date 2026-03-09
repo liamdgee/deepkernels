@@ -129,7 +129,6 @@ numericalstability:
   min_ls: 0.1
   max_ls: 8.0
   conc_clamp: 10.0
-  gamma_concentration_init: 1.4
   min_noise: 0.00015
   
 # ==========================================

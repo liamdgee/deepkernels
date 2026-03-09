@@ -121,7 +121,7 @@ class SpectralDecoder(BaseGenerativeModel):
             torch.nn.utils.spectral_norm(
                 nn.Linear(self.bottleneck_dim, self.k_atoms)
             ) 
-            for _ in range(self.num_latents)
+            for _ in range(self.num_experts)
         ])
         
         #-roughly equates to prior assertion that 50% of explanatory power comes from mixture weights
@@ -178,7 +178,7 @@ class SpectralDecoder(BaseGenerativeModel):
 
         latent_expert_functions = [variational(bottleneck) for variational in self.expert_variational_heads]
 
-        variational_parameters = self.stack_features(latent_expert_functions)
+        variational_parameters = torch.stack(latent_expert_functions)
 
         mu, factor, diag = self.get_alpha_mvn_heads_decoder(bottleneck)
 
@@ -258,7 +258,7 @@ class SpectralDecoder(BaseGenerativeModel):
     def log_alpha_kl_low_rank(self, mu, chol, diag):
         batch_size = mu.size(0)
         r = self.kwargs.get("alpha_factor_rank", 3)
-        k = self.k_atoms # Use self.k_atoms for consistency
+        k = self.k_atoms
         
         factor = chol.view(batch_size, k, r)
         
@@ -269,7 +269,7 @@ class SpectralDecoder(BaseGenerativeModel):
         
         cov_factor = factor + noise_factor 
 
-        cov_diag = torch.nn.functional.softplus(diag) + self.jitter
+        cov_diag = torch.clamp(diag + self.jitter, min=0.025)
         
         q_dist = torch.distributions.LowRankMultivariateNormal(
             loc=mu,
@@ -325,10 +325,5 @@ class SpectralDecoder(BaseGenerativeModel):
         p_log_ls = dist.Normal(prior_loc, prior_scale)
         
         kl_div = dist.kl_divergence(q_log_ls, p_log_ls)
-        
-        #-transform to lengthscale space-#
-        ls_sample = torch.exp(log_ls_sample)
-        
-        ls_sample = torch.clamp(ls_sample, min=self.min_ls, max=self.max_ls)
         
         return ls_sample, kl_div.sum(dim=-1)

@@ -48,7 +48,9 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
         if features_only:
             return state
         
-        gp_in = state.gp_features
+        gp_in = state.gp_params
+        
+        gp_features = torch.cat([gp_in.gates, gp_in.linear, gp_in.periodic, gp_in.rational, gp_in.polynomial, gp_in.matern], dim=-1)
 
         if isinstance(gp_in, tuple):
             gp_in = gp_in[0]
@@ -69,3 +71,20 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
             gp_out=mvn, 
             gp_in=gp_in
         )
+    
+    def pack_gp_features(self, hyperparams):
+        """
+        Takes the structured GPParams and flattens them into a single 
+        168-dimensional tensor for the Gaussian Process.
+        """
+        param_keys = ['gates', 'linear', 'periodic', 'rational', 'polynomial', 'matern']
+        pooled_params = []
+
+        for k in param_keys:
+            val = getattr(hyperparams, k)
+            if val.dim() == 4:
+                val = val.mean(dim=2)
+                
+            pooled_params.append(val)
+        
+        return torch.cat(pooled_params, dim=-1)

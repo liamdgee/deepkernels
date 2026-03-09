@@ -1,11 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.nn.utils.parametrizations as P
 import math
-from typing import Optional, Annotated
 import torch.nn.utils.spectral_norm as sn
-from typing import Tuple, Optional, TypeAlias, Tuple, Union, NamedTuple, Optional
+from typing import TypeAlias, Tuple, Union, NamedTuple, Optional
 import torch.nn.functional as F
 import torch.distributions as dist
 import gpytorch
@@ -40,17 +38,11 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         self.kwargs = kwargs
         self.config = config if config else None
         self.jitter = self.kwargs.get("jitter", 1e-6)
-        self.dropout = self.kwargs.get("dropout", 0.05)
         self.latent_dim = self.kwargs.get("latent_dim", 16)
         self.input_dim = self.kwargs.get("input_dim", 30)
         self.bottleneck_dim = self.kwargs.get("bottleneck_dim", 64)
         self.k_atoms = self.kwargs.get("k_atoms", 30)
         self.rank = self.kwargs.get("alpha_factor_rank", 3)
-        self.M = self.kwargs.get("num_fourier_features", 128)
-        self.spectral_emb_dim = self.kwargs.get("spectral_emb_dim", 2048)
-        
-        #--# safeguard
-        self.num_experts = self.kwargs.get("num_experts", 8)
         
         # --- Fusion Layer ---
         # conv_bottleneck (16 or 64) + Spectral_bottleneck (64) + Prev Pi (30) -> 110 or 158 or 222?
@@ -121,7 +113,7 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
             alpha_diag = getattr(vae_out, 'diag', None)
         
         if alpha_diag is None:
-            alpha_factor = torch.ones(batch_size, self.k_atoms, device=device)
+            alpha_diag = torch.ones(batch_size, self.k_atoms, device=device)
         
         alpha_factor = params.get('alpha_factor', None)
         if alpha_factor is None and vae_out is not None:
@@ -162,7 +154,7 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         mu_z = self.latent_mu(post_bottleneck)
         logvar_z = self.latent_logvar(post_bottleneck)
 
-        z = self.reparameterise(mu_z, logvar_z)
+        z = self.reparameterise(mu_z, logvar_z, eps_min=-3.3, eps_max=3.3)
         
         return EncoderOutput(
             alpha_mu=alpha_mu,
@@ -182,8 +174,12 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         """
         x: Expected shape [Batch, Seq_Len, Features] (Standard PyTorch sequence format)
         """
+       
         if x.dim() == 2:
-            x = x.unsqueeze(1) # [Batch, 1, Features]
+            if x.shape[1] == self.input_dim:
+                x = x.unsqueeze(1)
+            else:
+                x = x.unsqueeze(-1)
         
         x = x.transpose(1, 2)
         
@@ -196,8 +192,8 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         
         mu = self.fc_mu(x)
         
-        logvar = torch.clamp(self.fc_logvar(x), min=-10.0, max=4.0)
-        
+        logvar = self.fc_logvar(x)
+        logvar = torch.clamp(logvar, min=-30.0, max=20.0)
         return mu, logvar
     
 
@@ -223,11 +219,21 @@ class ConvolutionalNetwork1D(nn.Module):
             )
     def forward(self, x):
         residual = self.shortcut(x)
+        
         out = self.conv1(x)
         out = self.norm1(out)
         out = self.act1(out)
         out = self.conv2(out)
         out = self.norm2(out)
+        
+        if residual.shape[-1] != out.shape[-1]:
+            diff = out.shape[-1] - residual.shape[-1]
+            if diff > 0:
+                residual = F.pad(residual, (0, diff))
+            else:
+                out = F.pad(out, (0, -diff))
+                
         out += residual
         out = self.act2(out)
+        
         return out
