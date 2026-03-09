@@ -19,6 +19,11 @@ from typing import Union, Optional, Iterable
 import gpytorch
 from tqdm import tqdm
 
+import os
+if 'CONDA_PREFIX' in os.environ:
+    os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
+    os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
+
 #---Init logger---#
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -39,7 +44,7 @@ class ParameterIsolate:
         self.decoder_module = self.model.vae.decoder
         self.dirichlet_module = self.model.vae.dirichlet
 
-    def seperate_params_and_build_optimisers(self):
+    def seperate_params_and_build_optimisers(self, **kwargs):
         """Executes the massive parameter routing and returns the two optimizers."""
         model = self.model.to(self.device)
         
@@ -69,7 +74,7 @@ class ParameterIsolate:
         dirichlet_variational_params = []
         dirichlet_gamma_params = []
         dirichlet_ls_params = []
-        lmc_params = []
+        dirichlet_lmc_params = []
         
         #-kernel hypernetwork params include:
         all_hypernetwork_params = []
@@ -81,7 +86,10 @@ class ParameterIsolate:
         #-gp params include:
         all_gp_params = []
         gp_mean_params = [] #-e.g. 0.01
-        gp_kernel_hyperparams = [] #-limit outputscale learning-# -- set kernel lr to approx 0.005
+        all_gp_kernel_hyperparams = [] #-limit outputscale learning-# -- set kernel lr to approx 0.005
+        gp_kernel_global_params = []
+        gp_kernel_ls_params = []
+        gp_kernel_nkn_params = []
         likelihood_params = []
         
         
@@ -140,13 +148,27 @@ class ParameterIsolate:
                     gp_mean_params.append(param)
                     all_gp_params.append(param)
                 elif 'covar_module' in name:
-                    gp_kernel_hyperparams.append(param)
-                    all_gp_params.append(param)
+                    if "outputscale" in name or "amplitude" in name:
+                        gp_kernel_global_params.append(param)
+                        all_gp_kernel_hyperparams.append(param)
+                        all_gp_params.append(param)
+                    elif any(keyword in name for keyword in ["_12", "_32", "_52", "alpha", "poly", "linear", "rq", "offset", "bandwidth"]):
+                        gp_kernel_ls_params.append(param)
+                        all_gp_kernel_hyperparams.append(param)
+                        all_gp_params.append(param)
+                    elif "nkn_weights" in name:
+                        gp_kernel_nkn_params.append(param)
+                        all_gp_kernel_hyperparams.append(param)
+                        all_gp_params.append(param)
+                    else:
+                        gp_kernel_ls_params.append(param)
+                        all_gp_kernel_hyperparams.append(param)
+                        all_gp_params.append(param)
                 elif 'likelihood' in name:
                     likelihood_params.append(param)
                     all_gp_params.append(param)
                 else:
-                    gp_kernel_hyperparams.append(param)
+                    gp_mean_params.append(param)
                     all_gp_params.append(param)
             elif 'vae.dirichlet' in name:
                 if 'mu_atom' in name or 'log_sigma_atom' in name:
@@ -165,7 +187,7 @@ class ParameterIsolate:
                     dirichlet_variational_params.append(param)
                     dirichlet_all_params.append(param)
                 elif 'lmc' in name:
-                    lmc_params.append(param)
+                    dirichlet_lmc_params.append(param)
                     dirichlet_all_params.append(param)
                 elif 'compress' in name or 'mixer' in name or 'head' in name:
                     dirichlet_all_nn_params.append(param)
@@ -176,6 +198,7 @@ class ParameterIsolate:
             else:
                 logger.warning(f"[!] Parameter unrouted: '{name}'. Defaulting to AdamW fusion_params.")
                 fusion_params.append(param)
+                all_encoder_params.append(param)
                 
             routed_params += 1
 
@@ -186,27 +209,32 @@ class ParameterIsolate:
         base_lr_adamw = self.kwargs.get('base_lr_adamw', 1.175e-3)
         
         base_decay_adamw = base_lr_adamw / 10
+        slow_decay_adamw = base_decay_adamw / 10
         slow_lr = (base_lr_adamw / 10) * 4.77    #~-5e-4
         very_slow_lr = (base_lr_adamw / 250) * 2.77 #~1.3e-5
+        gp_global_hyper_lr = self.kwargs.get('gp_global_hyper_lr', 8e-3)
+        gp_mean_lr = self.kwargs.get('gp_mean_lr', 6e-3)
+        gp_likelihood_lr = self.kwargs.get('gp_likelihood_lr', 2e-2)
+        gp_lengthscale_lr = self.kwargs.get('gp_lengthscale_lr', 4e-3)
+        gp_kernel_nkn_lr = self.kwargs.get('gp_kernel_nkn_lr', 2e-3)
 
         #-for SGLD optimiser-#
         fast_dir = self.kwargs.get('fast_dir', 1e-3)
         med_dir = self.kwargs.get('med_dir', 5e-4)
         slow_dir = self.kwargs.get('slow_dir', 1e-4)
         gamma_lr = self.kwargs.get('gamma_lr', 1e-5)
-        
+        lmc_lr = self.kwargs.get('lmc_lr', 8e-4)
+
         ultrasensitive_lr = self.kwargs.get('ultrasensitive_lr', 5e-5)
         sensitive_lr = self.kwargs.get('sensitive_lr', 1e-4)
-
-        gp_mean_lr = self.kwargs.get('gp_mean_lr', 7.77e-3)
-        gp_likelihood_lr = self.kwargs.get('gp_likelihood_lr', 1.77e-2)
-        gp_hyper_lr = self.kwargs.get("gp_hyper_lr", 3.5e-3)
+        
 
         self.adamw_optimiser = torch.optim.AdamW([
             {'params': conv_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
-            {'params': fusion_params, 'lr': base_lr_adamw, 'weight_decay': base_lr_adamw},
-            {'params': latent_params, 'lr': slow_lr, 'weight_decay': very_slow_lr},
+            {'params': fusion_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
+            {'params': latent_params, 'lr': slow_lr, 'weight_decay': slow_decay_adamw},
             {'params': deterministic_recon_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
+            {'params': probabilistic_nn_params, 'lr': base_lr_adamw, 'weight_decay': slow_decay_adamw},
         ])
 
         self.langevin_optimiser = torch.optim.RMSprop([
@@ -216,14 +244,15 @@ class ParameterIsolate:
             {'params': dirichlet_ls_params, 'lr': ultrasensitive_lr},
             {'params': dirichlet_all_nn_params, 'lr': med_dir},
             {'params': dirichlet_variational_params, 'lr': fast_dir},
-            {'params': probabilistic_nn_params, 'lr': med_dir},
-            {'params': lmc_params, 'lr': med_dir}
-        ], alpha=0.975, eps=1e-7)
+            {'params': dirichlet_lmc_params, 'lr': lmc_lr},
+        ], alpha=0.97, eps=1e-6)
 
         self.adam_optimiser = torch.optim.Adam([
             {'params': likelihood_params, 'lr': gp_likelihood_lr},
             {'params': gp_mean_params, 'lr': gp_mean_lr},
-            {'params': gp_kernel_hyperparams, 'lr': gp_hyper_lr},
+            {'params': gp_kernel_global_params, 'lr': gp_global_hyper_lr},
+            {'params': gp_kernel_ls_params, 'lr': gp_lengthscale_lr},
+            {'params': gp_kernel_nkn_params, 'lr': gp_kernel_nkn_lr},
             {'params': sensitive_ls_params, 'lr': sensitive_lr},
             {'params': ultrasensitive_spectral_params, 'lr': ultrasensitive_lr},
             {'params': primitive_params, 'lr': base_lr_adamw},

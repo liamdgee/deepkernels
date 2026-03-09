@@ -27,28 +27,28 @@ class SafeSoftplus(nn.Module):
 
 
 class KernelNetwork(BaseGenerativeModel):
-    def __init__(self, 
-                 bottleneck_dim=64,
-                 spectral_emb_dim=2048):
+    def __init__(self,
+                 **kwargs):
         super().__init__()
-
-        # --- Dimensions ---
-        self.individual_kernel_dim_out = 32
+        self.kwargs = kwargs
+        self.bottleneck_dim = self.kwargs.get("bottleneck_dim", 64)
+        self.spectral_emb_dim = self.kwargs.get("spectral_emb_dim", 2048)
+        self.individual_kernel_dim_out = self.kwargs.get("individual_kernel_dim_out", 32)
+        self.num_primitives = self.kwargs.get("num_primitives", 5)
         
-        self.num_primitives = 5 # [linear, periodic, rbf, rational]
         
         self.primitives_total_dim = self.num_primitives * self.individual_kernel_dim_out # 8 * 32 = 160
         
-        self.linear = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out))
-        self.periodic = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out))
-        self.matern = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out))
-        self.rational = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out))
-        self.polynomial = nn.utils.spectral_norm(nn.Linear(bottleneck_dim, self.individual_kernel_dim_out, bias=False))
+        self.linear = nn.utils.spectral_norm(nn.Linear(self.bottleneck_dim, self.individual_kernel_dim_out))
+        self.periodic = nn.utils.spectral_norm(nn.Linear(self.bottleneck_dim, self.individual_kernel_dim_out))
+        self.matern = nn.utils.spectral_norm(nn.Linear(self.bottleneck_dim, self.individual_kernel_dim_out))
+        self.rational = nn.utils.spectral_norm(nn.Linear(self.bottleneck_dim, self.individual_kernel_dim_out))
+        self.polynomial = nn.utils.spectral_norm(nn.Linear(self.bottleneck_dim, self.individual_kernel_dim_out, bias=False))
         
 
         self.spectral_feedback_loop = nn.Sequential(
             torch.nn.utils.spectral_norm(
-                nn.Linear(self.primitives_total_dim, spectral_emb_dim)), #-160 -> 2048
+                nn.Linear(self.primitives_total_dim, self.spectral_emb_dim)), #-160 -> 2048
                 SafeSoftplus()
         )
 

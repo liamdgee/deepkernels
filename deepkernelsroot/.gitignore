@@ -11,10 +11,12 @@ __pycache__
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
-
+.DS_Store
+*.DS_Store
 .idea/
 .vscode/
 .ipynb_checkpoints/
+
 
 .env
 .venv/
@@ -45,4 +47,7 @@ Thumbs.db
 .vscode
 .vscode/*
 *.vscode
-.DS_Store
+.DS_Storedata/
+mlruns/
+*.dta
+*.pth

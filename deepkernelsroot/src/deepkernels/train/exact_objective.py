@@ -7,8 +7,10 @@ import logging
 from typing import Union, Optional
 from tqdm import tqdm
 
-import linear_operator
-from linear_operator import DenseLinearOperator, MatmulLinearOperator, 
+import os
+if 'CONDA_PREFIX' in os.environ:
+    os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
+    os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
@@ -18,7 +20,7 @@ if not logger.handlers:
 class ExactObjective(nn.Module):
     def __init__(self, 
                  model,
-                 kl_weights=None):
+                 **kwargs):
         """
         Args:
             gp_model: Your AcceleratedKernelGP instance.
@@ -31,24 +33,24 @@ class ExactObjective(nn.Module):
             likelihood=model.gp.likelihood, 
             model=model.gp
         )
-        self.kl_weights = kl_weights or {
+        base_kl_weights = {
             "lengthscale_kl": 1.0,
             "alpha_kl": 1.0,
             "global_divergence": 0.1,
             "local_divergence": 0.1
         }
+
+        self.kl_weights = kwargs.get('kl_weights', None)
+
+        if self.kl_weights is None:
+            self.kl_weights = base_kl_weights
     
-    def forward(self, model, x_target, ss_history, gp_output, gp_target):
+    def forward(self, model, x_target, state_output, gp_output, gp_target):
         device = self.get_device()
         kl_metrics = {}
-        
         if gp_output is not None and gp_target is not None:
-            if hasattr(ss_history, 'lmc_matrices'):
-                # --- Inside ExactObjective.forward() ---
-        
-        if gp_output is not None and gp_target is not None:
-            if hasattr(ss_history, 'W_current_state'): # Ensure you export W!
-                W_mat = ss_history.lmc_matrices
+            if hasattr(state_output, 'lmc_matrices'):
+                W_mat =  state_output.lmc_matrices
                 gp_target_batched = gp_target.t().unsqueeze(-1)
                 W_pinv = torch.linalg.pinv(W_mat)
                 latent_target = torch.bmm(W_pinv, gp_target_batched).squeeze(-1) # -> [N, 8]

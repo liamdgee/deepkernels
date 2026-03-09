@@ -1,8 +1,9 @@
 import torch
 
 import os
-os.environ['CUDA_HOME'] = '/usr/local/cuda'
-os.environ['PATH'] = '/usr/local/cuda/bin:' + os.environ['PATH']
+if 'CONDA_PREFIX' in os.environ:
+    os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
+    os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
 
 import pykeops
 import torch.nn.functional as F
@@ -10,6 +11,10 @@ from pykeops.torch import LazyTensor
 import linear_operator
 from linear_operator.operators import LinearOperator, KeOpsLinearOperator
 from gpytorch.kernels.keops import RBFKernel
+
+
+from gpytorch.priors import Prior
+from torch.distributions import Laplace
 
 ##--pykeops.clean_pykeops()
 pykeops.config.cuda_standalone = True
@@ -26,10 +31,9 @@ class GenerativeKernel(Kernel):
 
     def __init__(self, batch_shape=torch.Size([]), **kwargs):
         super().__init__(batch_shape=batch_shape, **kwargs)
-        
-        self.num_primitives = 6     #--> 4 Primitives + 6 Pairs + 4 Self-Squared + 2 Triples = 16 Kernels-#
-        self.kernels_out = 16
-        self.individual_kernel_input_dim = 32
+        self.kwargs = kwargs
+        self.kernels_out = self.kwargs.get('kernels_out', 32)
+        self.individual_kernel_input_dim = self.kwargs.get('individual_kernel_input_dim', 32)
         self.base_kernel = RBFKernel(batch_shape=batch_shape)
         self.batch_shape = batch_shape
 
@@ -53,7 +57,6 @@ class GenerativeKernel(Kernel):
         
         #-register weight params-#
         self.register_parameter(name="raw_nkn_weights", parameter=nn.Parameter(torch.empty(4, 8)))
-
         # -- register_constraints ---
         self.register_constraint("raw_scale_12", scale_constraint)
         self.register_constraint("raw_scale_32", scale_constraint)
@@ -73,12 +76,13 @@ class GenerativeKernel(Kernel):
         self.raw_rq_alpha.data.fill_(self.raw_rq_alpha_constraint.inverse_transform(torch.tensor(1.0)).item())
         self.raw_linear_scale.data.fill_(self.raw_linear_scale_constraint.inverse_transform(torch.tensor(0.5)).item())
         self.raw_poly_offset.data.fill_(self.raw_poly_offset_constraint.inverse_transform(torch.tensor(0.2)).item())
-        self.raw_inv_bandwidth.data.fill_(self.raw_inv_bandwidth_constraint.inverse_transform(torch.tensor(1.0)).item())
-        self.raw_outputscale.data.fill_(self.raw_outputscale_constraint.inverse_transform(torch.tensor(1.0)).item())
-        self.raw_latent_amplitude.data.fill_(self.raw_latent_amplitude_constraint.inverse_transform(torch.tensor(1.0)).item())
+        
+        self.raw_inv_bandwidth.data.copy_(self.raw_inv_bandwidth_constraint.inverse_transform(torch.exp(torch.tensor(0.025))))
+        self.raw_outputscale.data.copy_(self.raw_outputscale_constraint.inverse_transform(torch.exp(torch.tensor(0.025))))
+        self.raw_latent_amplitude.data.copy_(self.raw_latent_amplitude_constraint.inverse_transform(torch.exp(torch.tensor(0.025))))
         
         with torch.no_grad():
-            self.raw_nkn_weights.fill_(self.raw_nkn_weights_constraint.inverse_transform(torch.tensor(1.0 / 8.0)).item())
+            self.raw_nkn_weights.copy_(self.raw_nkn_weights_constraint.inverse_transform(torch.tensor(1.0 / 8)))
             self.raw_nkn_weights.add_(torch.randn(4, 8) * 0.005)
         
         #-register priors-#
@@ -86,6 +90,7 @@ class GenerativeKernel(Kernel):
         self.register_prior("scale_32_prior", gpytorch.priors.GammaPrior(4.0, 3.0), "raw_scale_32")
         self.register_prior("scale_52_prior", gpytorch.priors.GammaPrior(4.0, 15.0), "raw_scale_52")
         self.register_prior("rq_alpha_prior", gpytorch.priors.GammaPrior(3.0, 0.75), "raw_rq_alpha")
+        
         self.register_prior("linear_scale_prior", gpytorch.priors.HalfCauchyPrior(2.0), "raw_linear_scale")
         self.register_prior("poly_offset_prior", gpytorch.priors.HalfCauchyPrior(1.0), "raw_poly_offset")
         
@@ -93,8 +98,13 @@ class GenerativeKernel(Kernel):
         self.register_prior("latent_amplitude_prior", gpytorch.priors.GammaPrior(2.0, 0.15), "raw_latent_amplitude")
         self.register_prior("inv_bandwidth_prior", gpytorch.priors.GammaPrior(3.0, 1.0), "raw_inv_bandwidth")
        
-        self.register_prior("nkn_weights_prior", gpytorch.priors.HorseshoePrior(scale=0.1), "nkn_weights")
-    
+        self.register_prior(
+            "nkn_weights_prior", 
+            CustomLaplacePrior(loc=0.0, scale=0.1), 
+            lambda m: m.nkn_weights
+        )
+
+        self.initialize(scale_12=)
     
     @property
     def nkn_weights(self): return self.raw_nkn_weights_constraint.transform(self.raw_nkn_weights)
@@ -182,7 +192,12 @@ class GenerativeKernel(Kernel):
             gate_i = LazyTensor(pooled_params_train['gates'].unsqueeze(1))
             
             if is_same:
-                mat_j, rat_j, lin_j, poly_j, per_j, gate_j = mat_i, rat_i, lin_i, poly_i, per_i, gate_i
+                mat_j = LazyTensor(pooled_params_train['matern'].unsqueeze(0))
+                rat_j = LazyTensor(pooled_params_train['rational'].unsqueeze(0))
+                lin_j = LazyTensor(pooled_params_train['linear'].unsqueeze(0))
+                poly_j = LazyTensor(pooled_params_train['polynomial'].unsqueeze(0))
+                per_j = LazyTensor(pooled_params_train['periodic'].unsqueeze(0))
+                gate_j = LazyTensor(pooled_params_train['gates'].unsqueeze(0))
             else:
                 mat_j = LazyTensor(pooled_params_test['matern'].unsqueeze(0))
                 rat_j = LazyTensor(pooled_params_test['rational'].unsqueeze(0))
@@ -250,28 +265,34 @@ class GenerativeKernel(Kernel):
             k_rbf = (-dist_sq_rat).exp()
 
             primitives = [k_lin, k_poly, k_per, k_mat12, k_mat32, k_mat52, k_rq, k_rbf]
-            gate_0i = gate_i[:, :, 0].unsqueeze(-1)
-            gate_1i = gate_i[:, :, 1].unsqueeze(-1)
-            gate_2i = gate_i[:, :, 2].unsqueeze(-1)
-            gate_3i = gate_i[:, :, 3].unsqueeze(-1)
-            gate_4i = gate_i[:, :, 4].unsqueeze(-1)
-            gate_5i = gate_i[:, :, 5].unsqueeze(-1)
-            gate_6i = gate_i[:, :, 6].unsqueeze(-1)
-            gate_7i = gate_i[:, :, 7].unsqueeze(-1)
+            gate_0i = LazyTensor(pooled_params_train['gates'][:, 0].view(-1, 1, 1))
+            gate_1i = LazyTensor(pooled_params_train['gates'][:, 1].view(-1, 1, 1))
+            gate_2i = LazyTensor(pooled_params_train['gates'][:, 2].view(-1, 1, 1))
+            gate_3i = LazyTensor(pooled_params_train['gates'][:, 3].view(-1, 1, 1))
+            gate_4i = LazyTensor(pooled_params_train['gates'][:, 4].view(-1, 1, 1))
+            gate_5i = LazyTensor(pooled_params_train['gates'][:, 5].view(-1, 1, 1))
+            gate_6i = LazyTensor(pooled_params_train['gates'][:, 6].view(-1, 1, 1))
+            gate_7i = LazyTensor(pooled_params_train['gates'][:, 7].view(-1, 1, 1))
 
             if not is_same:
-                gate_0j = gate_j[:, :, 0].unsqueeze(-1)
-                gate_1j = gate_j[:, :, 1].unsqueeze(-1)
-                gate_2j = gate_j[:, :, 2].unsqueeze(-1)
-                gate_3j = gate_j[:, :, 3].unsqueeze(-1)
-                gate_4j = gate_j[:, :, 4].unsqueeze(-1)
-                gate_5j = gate_j[:, :, 5].unsqueeze(-1)
-                gate_6j = gate_j[:, :, 6].unsqueeze(-1)
-                gate_7j = gate_j[:, :, 7].unsqueeze(-1)    
+                gate_0j = LazyTensor(pooled_params_test['gates'][:, 0].view(1, -1, 1))
+                gate_1j = LazyTensor(pooled_params_test['gates'][:, 1].view(1, -1, 1))
+                gate_2j = LazyTensor(pooled_params_test['gates'][:, 2].view(1, -1, 1))
+                gate_3j = LazyTensor(pooled_params_test['gates'][:, 3].view(1, -1, 1))
+                gate_4j = LazyTensor(pooled_params_test['gates'][:, 4].view(1, -1, 1))
+                gate_5j = LazyTensor(pooled_params_test['gates'][:, 5].view(1, -1, 1))
+                gate_6j = LazyTensor(pooled_params_test['gates'][:, 6].view(1, -1, 1))
+                gate_7j = LazyTensor(pooled_params_test['gates'][:, 7].view(1, -1, 1))
             
             else:
-                gate_0j, gate_1j, gate_2j, gate_3j = gate_0i, gate_1i, gate_2i, gate_3i
-                gate_4j, gate_5j, gate_6j, gate_7j = gate_4i, gate_5i, gate_6i, gate_7i
+                gate_0j = LazyTensor(pooled_params_train['gates'][:, 0].view(1, -1, 1))
+                gate_1j = LazyTensor(pooled_params_train['gates'][:, 1].view(1, -1, 1))
+                gate_2j = LazyTensor(pooled_params_train['gates'][:, 2].view(1, -1, 1))
+                gate_3j = LazyTensor(pooled_params_train['gates'][:, 3].view(1, -1, 1))
+                gate_4j = LazyTensor(pooled_params_train['gates'][:, 4].view(1, -1, 1))
+                gate_5j = LazyTensor(pooled_params_train['gates'][:, 5].view(1, -1, 1))
+                gate_6j = LazyTensor(pooled_params_train['gates'][:, 6].view(1, -1, 1))
+                gate_7j = LazyTensor(pooled_params_train['gates'][:, 7].view(1, -1, 1))
             
             ws = self.nkn_weights
            
@@ -354,18 +375,19 @@ class GenerativeKernel(Kernel):
         interaction_1 = nodes[:, 0] * nodes[:, 1]
         interaction_2 = nodes[:, 2] * nodes[:, 3]
         base_diag = interaction_1 + interaction_2
-        global_scale = self.outputscale.view(-1)
-        multitask_amp = self.latent_amplitude.view(-1, 1)
-        return base_diag * global_scale * multitask_amp
+        global_scale = self.outputscale.view(-1, 1)        # [e, 1]
+        multitask_amp = self.latent_amplitude.view(-1, 1)  # [e, 1]
+        return base_diag.unsqueeze(0) * global_scale * multitask_amp
 
 
 class ProbabilisticMixtureMean(gpytorch.means.Mean):
-    def __init__(self, k_atoms=30, num_experts=8, batch_shape=torch.Size([])):
-        super().__init__(batch_shape=batch_shape)
-        self.num_experts = num_experts
+    def __init__(self, batch_shape=torch.Size([]), **kwargs):
+        super().__init__()
+        self.num_experts = kwargs.get("num_experts", 8)
+        self.k_atoms = kwargs.get("k_atoms", 30)
         self.register_parameter(
             name="cluster_constants", 
-            parameter=torch.nn.Parameter(torch.randn(k_atoms, *batch_shape) * 0.1)
+            parameter=torch.nn.Parameter(torch.randn(self.k_atoms, *batch_shape) * 0.1)
         )
 
     def forward(self, x, **params):
@@ -377,3 +399,26 @@ class ProbabilisticMixtureMean(gpytorch.means.Mean):
             return latent_means.movedim(-1, 0)
         else:
             return torch.zeros(target_shape, device=x.device)
+
+class CustomLaplacePrior(Prior):
+    def __init__(self, loc, scale, validate_args=False, **kwargs):
+        loc_tensor = torch.as_tensor(loc, dtype=torch.float32)
+        scale_tensor = torch.as_tensor(scale,  dtype=torch.float32)
+        
+        super(Prior, self).__init__(loc_tensor, scale_tensor, validate_args=validate_args)
+        
+        self._dist = Laplace(loc_tensor, scale_tensor, validate_args=validate_args)
+
+    def log_prob(self, parameter):
+        return self._dist.log_prob(parameter)
+
+    def rsample(self, sample_shape=torch.Size()):
+        return self._dist.rsample(sample_shape)
+    
+    @property
+    def loc(self):
+        return self._dist.loc
+
+    @property
+    def scale(self):
+        return self._dist.scale

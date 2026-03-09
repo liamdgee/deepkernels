@@ -25,6 +25,7 @@ dependencies = [
     "tqdm",
     "ninja",
     "pyarrow",
+    "pyyaml>=6.0.1"
 ]
 
 [project.optional-dependencies]

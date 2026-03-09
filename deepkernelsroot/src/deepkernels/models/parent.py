@@ -13,6 +13,11 @@ from typing import Union, Optional, Dict, Tuple, TypeAlias, Union
 import torch
 from torch.distributions import LowRankMultivariateNormal, Independent, Normal, kl_divergence
 
+import os
+if 'CONDA_PREFIX' in os.environ:
+    os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
+    os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -133,6 +138,25 @@ class BaseGenerativeModel(gpytorch.Module):
     def get_resource(self, name_string, **params):
         return getattr(self, name_string, None)
     
+    def inverse_softplus(self, target_value, min=3e-7):
+        """
+        Numerically stable mapping from concentration space (0, inf) 
+        to logit space (-inf, inf).
+        """
+        # 1. Convert to tensor so torch.clamp works
+        if not isinstance(target_value, torch.Tensor):
+            target_value = torch.tensor(target_value)
+            
+        # 2. Safety clamp to prevent log(0)
+        safe_target = torch.clamp(target_value, min=min)
+        
+        # 3. Numerical stability for large values (Softplus(x) -> x as x -> inf)
+        # If target is > 20, the inverse is basically the target itself
+        return torch.where(
+            safe_target > 20.0,
+            safe_target,
+            torch.log(torch.expm1(safe_target))
+        )
     @staticmethod
     def init_inducing_with_omega(
         omega: torch.Tensor, 

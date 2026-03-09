@@ -4,7 +4,7 @@ from pydantic import Field, BaseModel
 from deepkernels.preprocess.cleaner import DataCleaner, CleanerConfig
 from deepkernels.preprocess.harmoniser import Collector, HarmoniserConfig, SchemaHarmoniser
 from deepkernels.preprocess.novelty import FeatureTransformer, NoveltyConfig
-
+import numpy as np
 import pandas as pd
 import logging
 import torch
@@ -13,8 +13,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 
 import os
-os.environ['CUDA_HOME'] = '/usr/local/cuda'
-os.environ['PATH'] = '/usr/local/cuda/bin:' + os.environ['PATH']
+if 'CONDA_PREFIX' in os.environ:
+    os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
+    os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
+
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
@@ -95,41 +97,44 @@ class DataOrchestrator:
         
         return seq_x.contiguous(), seq_y.contiguous()
     
-    
     @staticmethod
-    def prepare_data(seq_x, seq_y, test_pct=0.2, batch_size=128, num_workers=4):
+    def prepare_data(seq_x, seq_y, seq_len: int = 64, val_pct=0.1, test_pct=0.1, batch_size=128, num_workers=4):
         """
-        Splits the sequence blocks and packages them into DataLoaders.
-        Note: shuffle=False for time series chronological splitting!
+        Splits sequence blocks chronologically into Train/Val/Test, 
+        ensuring strict boundaries to prevent sliding window leakage.
         """
         total_seqs = seq_x.size(0)
-        split_idx = int(total_seqs * (1 - test_pct))
+
+        test_size = int(total_seqs * test_pct)
+        val_size = int(total_seqs * val_pct)
+        test_start = total_seqs - test_size
+        val_end = test_start - seq_len 
+        val_start = val_end - val_size
+        train_end = val_start - seq_len
+        if train_end <= 0:
+            raise ValueError(f"Dataset too small for seq_len={seq_len} with these split percentages. "
+                             f"Total seqs: {total_seqs}, required train_end: {train_end}")
         
-        train_x, test_x = seq_x[:split_idx], seq_x[split_idx:]
-        train_y, test_y = seq_y[:split_idx], seq_y[split_idx:]
+        train_x, train_y = seq_x[:train_end], seq_y[:train_end]
+        val_x, val_y = seq_x[val_start:val_end], seq_y[val_start:val_end]
+        test_x, test_y = seq_x[test_start:], seq_y[test_start:]
         
-        # pin_memory=True and num_workers are essential for cloud GPU saturation
-        train_loader = DataLoader(
-            TensorDataset(train_x, train_y), 
-            batch_size=batch_size, 
-            shuffle=True, 
-            pin_memory=True, 
-            num_workers=num_workers,
-            prefetch_factor=2 if num_workers > 0 else None
-        )
+        logger.info(f"Chronological Split (Purged Overlaps) -> Train: {train_x.size(0)} | Val: {val_x.size(0)} | Test: {test_x.size(0)}")
+        loader_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": False,
+            "pin_memory": True,
+            "num_workers": num_workers,
+            "prefetch_factor": 2 if num_workers > 0 else None,
+            "persistent_workers": True if num_workers > 0 else False  # <--- ADD THIS
+        }
+        train_loader = DataLoader(TensorDataset(train_x, train_y), **loader_kwargs)
+        val_loader = DataLoader(TensorDataset(val_x, val_y), **loader_kwargs)
+        test_loader = DataLoader(TensorDataset(test_x, test_y), **loader_kwargs)
         
-        test_loader = DataLoader(
-            TensorDataset(test_x, test_y), 
-            batch_size=batch_size, 
-            shuffle=False, 
-            pin_memory=True, 
-            num_workers=num_workers,
-            prefetch_factor=2 if num_workers > 0 else None
-        )
-        
-        return train_loader, test_loader
+        return train_loader, val_loader, test_loader
     
-    def run_pipeline(self, df1: pd.DataFrame, df2:pd.DataFrame, test_pct:float=0.2, target_col: str='lmean_rejected', drop_cols: Optional[list[str]]=None, seq_len: int = 64, batch_size:int = 128, num_workers: int = 4):
+    def run_pipeline(self, df1: pd.DataFrame, df2:pd.DataFrame, float_64:bool=False, val_pct:float=0.1, test_pct:float=0.1, target_col: str='lmean_rejected', drop_cols: Optional[list[str]]=None, seq_len: int = 64, batch_size:int = 128, num_workers: int = 4):
         """Runs the entire pipeline end-to-end smoothly."""
         df1_clean = self.cleaner_df1.fit_transform(df1)
         df2_clean = self.cleaner_df2.fit_transform(df2)
@@ -144,11 +149,29 @@ class DataOrchestrator:
         X_sorted = X_sorted.drop(columns=drops, errors='ignore')
         X_norm = self.normalise_time(X_sorted)
 
-        X_tensor = torch.tensor(X_norm.to_numpy(), dtype=torch.float64)
-        y_tensor = torch.tensor(y_sorted.to_numpy(), dtype=torch.float64)
+        # --- ADD THIS BLOCK HERE ---
+        # Select only numeric columns to avoid the "numpy.object_" er
+        X_numeric = X_norm.select_dtypes(include=[np.number])
+        
+        if X_numeric.shape[1] < X_norm.shape[1]:
+            dropped = set(X_norm.columns) - set(X_numeric.columns)
+            logger.warning(f"Dropping non-numeric columns before tensor conversion: {dropped}")
+        # ---------------------------
+        if float_64:
+            # Change X_norm to X_numeric here
+            X_tensor = torch.tensor(X_numeric.to_numpy(), dtype=torch.float64)
+            y_tensor = torch.tensor(y_sorted.to_numpy(), dtype=torch.float64)
+        else:
+            # And change X_norm to X_numeric here
+            X_tensor = torch.tensor(X_numeric.to_numpy(), dtype=torch.float32)
+            y_tensor = torch.tensor(y_sorted.to_numpy(), dtype=torch.float32)
         
         seq_x, seq_y = self.to_seq_data(X_tensor, y_tensor, seq_len=seq_len)
-        train_loader, test_loader = self.prepare_data(seq_x, seq_y, test_pct=test_pct, batch_size=batch_size, num_workers=num_workers)
+        
+        train_loader, val_loader, test_loader = self.prepare_data(
+            seq_x, seq_y, seq_len=seq_len, val_pct=val_pct, test_pct=test_pct, 
+            batch_size=batch_size, num_workers=num_workers
+        )
         
         logger.info("Pipeline execution complete. DataLoaders ready for training.")
-        return train_loader, test_loader
+        return train_loader, val_loader, test_loader

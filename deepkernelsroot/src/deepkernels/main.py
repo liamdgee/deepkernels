@@ -1,15 +1,18 @@
 
 import yaml
 from pathlib import Path
-
 import torch
-
-from torch.utils.data import DataLoader, TensorDataset
-import os
+import gpytorch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset, Subset
 import pandas as pd
-import torch
 import logging
 import argparse
+import mlflow
+
+torch.set_default_dtype(torch.float64)
+import sys
+
 
 # --- Internal imports ---
 from deepkernels.models.model import StateSpaceKernelProcess
@@ -21,50 +24,88 @@ from deepkernels.models.variationalautoencoder import SpectralVAE
 from deepkernels.train.exact_objective import ExactObjective
 
 import os
-os.environ['CUDA_HOME'] = '/usr/local/cuda'
-os.environ['PATH'] = '/usr/local/cuda/bin:' + os.environ['PATH']
+if 'CONDA_PREFIX' in os.environ:
+    os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
+    os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="DeepKernels: Two-Stage Spectral VAE & ExactGP Trainer")
+def get_device_settings(config):
+    mode = config['environment']['mode']
     
-    # Data Paths
+    # Simple auto-detect based on platform or GPU availability
+    if mode == "auto":
+        mode = "remote" if torch.cuda.is_available() else "local"
+    
+    settings = config['environment'][mode]
+    print(f"Running in {mode} mode on {settings['device']}")
+    return settings
+
+
+def load_config(config_path):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+def merge_args_and_yaml(args, parser, config):
+    """
+    Overwrites 'args' with YAML values UNLESS the user explicitly typed 
+    the flag in the command line.
+    """
+    # Get a list of flags the user actually typed in the terminal
+    user_provided_flags = [arg.strip('--') for arg in sys.argv if arg.startswith('--')]
+    
+    # Flatten the YAML config for easy lookup
+    flat_config = {}
+    for section, values in config.items():
+        if isinstance(values, dict):
+            flat_config.update(values)
+
+    args_dict = vars(args)
+    for key in args_dict.keys():
+        # If the key is in the YAML, AND the user didn't explicitly override it in CLI
+        if key in flat_config and key not in user_provided_flags:
+            args_dict[key] = flat_config[key] # Override argparse default with YAML
+            
+    return args
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="DeepKernels: A generative state space process")
+    parser.add_argument("--config", type=str, default="config.yaml", help="Path to base config")
+
+    # ==========================================
+    # --- Data & Pipeline Execution ---
+    # ==========================================
     parser.add_argument("--data_path1", type=str, default="/home/liam/deepkernels/data/lendio_all_methods_sociocorr_lender.dta", help="Path to the primary lender data")
     parser.add_argument("--data_path2", type=str, default="/home/liam/deepkernels/data/appr_reg_data.dta", help="Path to the secondary regression data")
-    
-    # Pipeline Dimensions
     parser.add_argument("--target_col", type=str, default="lmean_rejected", help="The ground truth target variable")
     parser.add_argument("--seq_len", type=int, default=32, help="Sequence length for the state-space model")
     parser.add_argument("--batch_size", type=int, default=128, help="Mini-batch size for Stage 1 (VAE)")
     parser.add_argument("--test_pct", type=float, default=0.2, help="test split")
     parser.add_argument("--num_workers", type=int, default=4, help="gpu optimisation")
-
-    # Inside parse_args()
     parser.add_argument(
         "--drop_cols", 
         nargs='*',
         default=["lender_id", "rejected", "lmean_rejected"], 
         help="List of column names to drop before processing features (we drop y as we already have y seperate)"
     )
-
-    parser.add_argument(
-        "--kl_weights",
-        nargs='*'
-    )
     
-    #-model tweaks
-    parser.add_argument("--run_gp", type=bool, default=False, help="boolean to skip complex keops math")
-    
-    # Optimization Hyperparameters
-    parser.add_argument("--vae_epochs", type=int, default=100, help="Number of epochs to train the VAE (Stage 1)")
-    parser.add_argument("--gp_epochs", type=int, default=100, help="Number of epochs to train the ExactGP (Stage 2)")
-    parser.add_argument("--base_lr_adamw", type=float, default=1.175e-3, help="Base learning rate for AdamW")
-    parser.add_argument("--langevin_temp", type=float, default=7.5e-6, help="Temperature for SGLD noise injection")
-    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Base learning rate for AdamW")
+    # ==========================================
+    # --- Training Stages & Epochs ---
+    # ==========================================
+    parser.add_argument("--warmup_vae_epochs", type=int, default=50)
+    parser.add_argument("--vae_epochs", type=int, default=250)
+    parser.add_argument("--warmup_gp_epochs", type=int, default=50)
+    parser.add_argument("--gp_epochs", type=int, default=200)
+    parser.add_argument("--em_macro_cycles", type=int, default=8)
+    parser.add_argument("--joint_epochs", type=int, default=0)
+    parser.add_argument("--e_epochs_per_cycle", type=int, default=3, help="E-step epochs per EM cycle")
+    parser.add_argument("--m_epochs_per_cycle", type=int, default=5, help="M-step epochs per EM cycle")
 
-    #-niche learning rates-#
+    # ==========================================
+    # --- Optimizers & Learning Rates ---
+    # ==========================================
+    parser.add_argument("--base_lr", type=float, default=1.175e-3, help="Base learning rate for AdamW")
     parser.add_argument("--fast_dir", type=float, default=1e-3, help="learning rate")
     parser.add_argument("--med_dir", type=float, default=5e-4, help="learning rate")
     parser.add_argument("--slow_dir", type=float, default=1e-4, help="learning rate")
@@ -72,18 +113,92 @@ def parse_args():
     parser.add_argument("--ultrasensitive_lr", type=float, default=5e-5, help="learning rate")
     parser.add_argument("--sensitive_lr", type=float, default=1e-4, help="learning rate")
     parser.add_argument("--gp_mean_lr", type=float, default=7.77e-3, help="learning rate")
-    parser.add_argument("--gp_likeliehood_lr", type=float, default=1.77e-2, help="learning rate")
-    parser.add_argument("--gp_hyper_lr", type=float, default=3.5e-3, help="learning rate")
+    parser.add_argument("--gp_likelihood_lr", type=float, default=1.77e-2, help="learning rate")
+    parser.add_argument("--gp_global_hyper_lr", type=float, default=3.5e-3, help="learning rate")
+    parser.add_argument("--lmc_lr", type=float, default=8e-4, help="learning rate for lmc params in dirichlet module")
+    parser.add_argument("--gp_lengthscale_lr", type=float, default=3.5e-3, help="learning rate")
+    parser.add_argument("--gp_kernel_nkn_lr", type=float, default=8e-4, help="learning rate for lmc params in dirichlet module")
 
-    return parser.parse_args()
+    # ==========================================
+    # --- Langevin & Gradient Norm Limits ---
+    # ==========================================
+    parser.add_argument("--langevin_temp", type=float, default=7.5e-6, help="Temperature for SGLD noise injection")
+    parser.add_argument("--max_grad_norm", type=float, default=1.5, help="cap for adam (non-langevin) gradients during training")
+    parser.add_argument("--langevin_clip_norm", type=float, default=10.0, help="gradient norm for langevin trainer")
+    
+    # ==========================================
+    # --- Model Dimensions & Architecture ---
+    # ==========================================
+    parser.add_argument("--input_dim", type=int, default=30, help="Number of input features")
+    parser.add_argument("--latent_dim", type=int, default=16, help="Dimensionality of the latent space (f)")
+    parser.add_argument("--bottleneck_dim", type=int, default=64, help="Dimensionality of the VAE bottleneck")
+    parser.add_argument("--k_atoms", type=int, default=30, help="Number of dictionary atoms (k)")
+    parser.add_argument("--num_latents", type=int, default=8, help="Number of latent GP processes (e)")
+    parser.add_argument("--alpha_factor_rank", type=int, default=3, help="Rank for the Dirichlet alpha factor matrix")
+    parser.add_argument(
+        "--disentangle_split_override", 
+        nargs='+', 
+        type=int, 
+        default=[4, 30, 30], 
+        help="List of dimensions to split the disentangled bottleneck representation"
+    )
+
+    # ==========================================
+    # --- Spectral, Fourier & NKN Settings ---
+    # ==========================================
+    parser.add_argument("--num_fourier_features", type=int, default=128, help="Number of random Fourier features (M)")
+    parser.add_argument("--spectral_emb_dim", type=int, default=2048, help="Dimensionality of the spectral embedding")
+    parser.add_argument(
+        "--spectral_compressions", 
+        nargs='+', 
+        type=int, 
+        default=[1024, 512, 128, 64], 
+        help="List of dimensions for spectral compression layers in decoder"
+    )
+    parser.add_argument("--kernels_out", type=int, default=32, help="Number of output features from the hypernetwork")
+    parser.add_argument("--individual_kernel_input_dim", type=int, default=32, help="Dimensionality of the input to the primitive kernels")
+    parser.add_argument("--individual_kernel_dim_out", type=int, default=32, help="nkn kernel out")
+    parser.add_argument("--num_experts", type=int, default=8, help="Number of kernel experts/primitives in the NKN")
+    parser.add_argument("--num_primitives", type=int, default=5, help="kernel primitives (note that matern is used for 3 and rq is used for 2, so 5 -> 8 in keops kernel)")
+
+    # ==========================================
+    # --- Annealer & Penalty Params ---
+    # ==========================================
+    parser.add_argument("--beta", type=float, default=1.0, help="Beta weighting for the KL divergence terms (Beta-VAE)")
+    parser.add_argument("--iw_stop_beta", type=float, default=0.1, help="Max weight for Inverse-Wishart")
+    parser.add_argument("--kl_stop_beta", type=float, default=0.1, help="Max weight for VAE divergences")
+    parser.add_argument("--kl_cycles", type=int, default=4, help="Number of cyclical annealing cycles")
+    parser.add_argument("--kl_weights", nargs='*', help="Custom weighting for individual KL terms")
+
+    # ==========================================
+    # --- Numerical Stability & Bounds ---
+    # ==========================================
+    parser.add_argument("--dropout", type=float, default=0.05, help="Dropout probability")
+    parser.add_argument("--jitter", type=float, default=1e-6, help="General numerical stability jitter")
+    parser.add_argument("--cholesky_jitter", type=float, default=1e-3, help="for use in langevin trainer")
+    parser.add_argument("--eps", type=float, default=1e-3, help="General numerical stability epsilon")
+    parser.add_argument("--eps_dirichlet", type=float, default=1e-3, help="Epsilon for Dirichlet prior/likelihood stability")
+    parser.add_argument("--large_eps", type=float, default=4e-2, help="Larger epsilon for specific numerical bounds")
+    parser.add_argument("--posterior_dirichlet_epsilon", type=float, default=4e-5, help="Prevents values from falling off the simplex")
+    parser.add_argument("--min_ls", type=float, default=0.05, help="Minimum bounded lengthscale for the GP")
+    parser.add_argument("--max_ls", type=float, default=15.0, help="Maximum bounded lengthscale for the GP")
+    parser.add_argument("--conc_clamp", type=float, default=30.0, help="Upper clamp limit for Dirichlet concentration")
+    parser.add_argument("--gamma_concentration_init", type=float, default=2.5, help="Initial value for Gamma concentration")
+    parser.add_argument("--min_noise", type=float, default=1e-4, help="Lower bound constraint for GP likelihood noise")
+
+    return parser.parse_args(), parser
 
 def main():
     #---------------------------------------------------------
     #-- device config --#
     # ---------------------------------------------------------
-    args = parse_args()
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    args, parser = parse_args()
+    config = load_config(args.config)
+    args = merge_args_and_yaml(args, parser, config)
+    os.environ['KEOPS_CHROOT'] = config['logging']['keops_cache_path']
+    env_settings = get_device_settings(config)
+    device = torch.device(env_settings['device'])
+    args.num_workers = env_settings['num_workers']
     logger.info(f"Initializing pipeline on device: {device}")
 
     #---------------------------------------------------------
@@ -99,7 +214,7 @@ def main():
     
     orchestrator = DataOrchestrator()
 
-    train_loader, test_loader = orchestrator.run_pipeline(
+    train_loader, val_loader, test_loader = orchestrator.run_pipeline(
         df1=df1,
         df2=df2,
         target_col=args.target_col,
@@ -115,94 +230,79 @@ def main():
     # ---------------------------------------------------------
     logger.info("Extracting full dataset into memory for KeOps ExactGP...")
     all_x, all_y = [], []
-    for batch_idx, (x, y) in enumerate(train_loader):
+    for x, y in train_loader:
         all_x.append(x)
         all_y.append(y)
         
-    full_x = torch.cat(all_x, dim=0) #- [N, SeqLen, Features]
-    full_y = torch.cat(all_y, dim=0) #-[N, 30]
+    full_x = torch.cat(all_x, dim=0).to(device=device, dtype=torch.float64)
+    full_y = torch.cat(all_y, dim=0).to(device=device, dtype=torch.float64)
     
     N = full_x.size(0)
     if full_y.dim() == 2 and full_y.size(1) == 30:
-        full_y = full_y.t().contiguous() # for lmc: shape == [30, N]
+        full_y = full_y.t().contiguous()
     
     logger.info(f"Full dataset extracted. N={N}. Target shape: {full_y.shape}")
+
+    args.n_data = N
 
     # ---------------------------------------------------------
     #-- init ExactGP & model -- #
     # ---------------------------------------------------------
     logger.info("Building KeOps ExactGP and StateSpaceKernelProcess...")
-    dummy_x = torch.arange(N, dtype=torch.float32)
+    dummy_x = torch.arange(N, dtype=torch.float64, device=device)
     
+    logger.info("Initializing Gaussian Likelihood...")
+    
+    likelihood = gpytorch.likelihoods.GaussianLikelihood(
+        batch_shape=torch.Size([args.num_latents]), 
+        noise_constraint=gpytorch.constraints.GreaterThan(args.min_noise)
+    ).to(device=device, dtype=torch.float64)
 
     gp = Simple(
         train_x=dummy_x, 
         train_y=full_y, 
-        likelihood=None,
-        num_latents=8
-    )
+        likelihood=likelihood,
+        num_latents=args.num_latents
+    ).to(device=device, dtype=torch.float64)
     #-could argparse atoms and latents obviously, but this will break the entire model
     
-    model = StateSpaceKernelProcess(gp=gp, run_gp=args.run_gp)
+    model = StateSpaceKernelProcess(gp=gp, **vars(args)).to(device=device, dtype=torch.float64)
 
     trainer = LangevinTrainer(
         model=model,
         device=device,
-        total_epochs=(args.vae_epochs + args.gp_epochs),
-        base_lr_adamw=args.base_lr,
-        langevin_temp=args.langevin_temp,
-        max_grad_norm=args.max_grad_norm,
-        n_data=N 
+        **vars(args)
     )
 
-    # ---------------------------------------------------------
-    #- route params -#
-    # ---------------------------------------------------------
-    logger.info("Isolating parameters and building split-brain optimizers...")
-    
-    objective = ExactObjective(model=model, kl_weights=args.kl_weights)
-
-    setup = ParameterIsolate(
-        model=model, 
-        device=device,
-        objective=objective,
-        base_lr_adamw=args.base_lr_adamw,
-        langevin_temp=args.langevin_temp,
-        fast_dir=args.fast_dir,
-        med_dir=args.med_dir,
-        slow_dir=args.slow_dir,
-        gamma_dir=args.gamma_dir,
-        ultrasensitive_lr=args.ultrasensitive_lr,
-        sensitive_lr=args.sensitive_lr,
-        gp_mean_lr=args.gp_mean_lr,
-        gp_likelihood_lr=args.gp_likelihood_lr,
-        gp_hyper_lr=args.gp_hyper_lr
-    )
-    
-    adam_w_opt, langevin_opt, adam_opt, groups = setup.seperate_params_and_build_optimisers()
-
-    # ---------------------------------------------------------
-    #-- init trainer --#
-    # ---------------------------------------------------------
-    logger.info("Initializing Langevin Trainer...")
-    trainer = LangevinTrainer(
-        model=model,
-        adam_optimiser=adam_opt,
-        sgld_optimiser=langevin_opt,
-        adamw_optimiser=adam_w_opt,
-        device=device,
-        total_epochs=100,
-        langevin_temp=7.5e-6,
-        max_grad_norm=1.0
-    )
-
-    # ---------------------------------------------------------
-    #- training --#
-    # ---------------------------------------------------------
+    # --- Training ---
     logger.info("Starting Experiment. Check MLflow dashboard for live metrics!")
-    trainer.fit(train_loader, test_loader)
     
-    logger.info("Training complete.")
+    experiment_name = config['logging'].get('experiment_name', "deep-kernels")
+    mlflow.set_experiment(experiment_name)
+
+    with mlflow.start_run():
+        logger.info("Starting Experiment. Check MLflow dashboard for live metrics!")
+        mlflow.log_dict(config, "config.yaml")
+        trainer.fit(
+            train_loader=train_loader, 
+            full_x=full_x, 
+            full_y=full_y, 
+            test_loader=val_loader,
+            warmup_vae_epochs=args.warmup_vae_epochs,
+            vae_epochs=args.vae_epochs,
+            warmup_gp_epochs=args.warmup_gp_epochs,
+            gp_epochs=args.gp_epochs,
+            em_macro_cycles=args.em_macro_cycles,
+            e_epochs_per_cycle=args.e_epochs_per_cycle,
+            m_epochs_per_cycle=args.m_epochs_per_cycle,
+            joint_epochs=args.joint_epochs
+        )
+
+        final_model_path = "final_model_weights.pt"
+        torch.save(model.state_dict(), final_model_path)
+        mlflow.log_artifact(final_model_path)
+        os.remove(final_model_path)
+        logger.info("Training complete and artifacts uploaded to MLflow.")
 
 if __name__ == "__main__":
     main()

@@ -24,6 +24,7 @@ class EncoderOutput(NamedTuple):
     logvar_z: torch.Tensor
     ls: torch.Tensor
     real_x: torch.Tensor
+    alpha: torch.Tensor
 
 class ConvolutionalLoopEncoder(BaseGenerativeModel):
     """
@@ -41,14 +42,16 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         self.jitter = self.kwargs.get("jitter", 1e-6)
         self.dropout = self.kwargs.get("dropout", 0.05)
         self.latent_dim = self.kwargs.get("latent_dim", 16)
-        self.input_dim = self.kwargs.get("input_dim", 30) ## -- or self.kwargs.get("num_features_real_x", 30)
+        self.input_dim = self.kwargs.get("input_dim", 30)
         self.bottleneck_dim = self.kwargs.get("bottleneck_dim", 64)
         self.k_atoms = self.kwargs.get("k_atoms", 30)
         self.rank = self.kwargs.get("alpha_factor_rank", 3)
         self.M = self.kwargs.get("num_fourier_features", 128)
         self.spectral_emb_dim = self.kwargs.get("spectral_emb_dim", 2048)
         
-
+        #--# safeguard
+        self.num_experts = self.kwargs.get("num_experts", 8)
+        
         # --- Fusion Layer ---
         # conv_bottleneck (16 or 64) + Spectral_bottleneck (64) + Prev Pi (30) -> 110 or 158 or 222?
         fusion_in_dim = self.bottleneck_dim + self.k_atoms + self.bottleneck_dim
@@ -127,7 +130,15 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         if alpha_factor is None:
             alpha_factor = torch.zeros(batch_size, self.k_atoms, self.rank, device=device)
         
+        alpha = params.get('alpha', None)
+        if alpha is None and vae_out is not None:
+            alpha = getattr(vae_out, 'alpha', None)
+        
+        if alpha is None:
+            alpha = torch.zeros(batch_size, self.k_atoms, device=device)
+        
         ls = params.get('ls', None)
+
         if ls is None and vae_out is not None:
             ls = getattr(vae_out, 'ls', None)
         
@@ -135,13 +146,11 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
             ls = empty_tensor
         
         
-        jitter = self.jitter or 1e-6
-        
         mu_data, logvar_data = self.run_convolutional_layers(x) #-outputs 64-#
 
         conv_bottleneck = self.reparameterise(mu_data, logvar_data)
 
-        log_pi = torch.log(pi + jitter) #-30-#
+        log_pi = torch.log(pi + self.jitter) #-30-#
 
         log_pi = log_pi.to(conv_bottleneck.device)
         bottleneck = bottleneck.to(conv_bottleneck.device) #-64
@@ -165,7 +174,8 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
             mu_z=mu_z,
             logvar_z=logvar_z,
             ls=ls,
-            real_x=x
+            real_x=x,
+            alpha=alpha
         )
     
     def run_convolutional_layers(self, x):

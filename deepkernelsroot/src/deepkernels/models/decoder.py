@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.nn.utils import spectral_norm
 
 from deepkernels.models.parent import BaseGenerativeModel
-
+import math
 import torch.nn.functional as F
 import torch.distributions as dist
 
@@ -51,7 +51,6 @@ class DecoderOutput(NamedTuple):
 class SpectralDecoder(BaseGenerativeModel):
     def __init__(self,
                  config=None,
-                 hidden_dims: Optional[Union[int, list[int]]]=None,
                  **kwargs
 ):
         super().__init__()
@@ -68,14 +67,32 @@ class SpectralDecoder(BaseGenerativeModel):
         self.M = self.kwargs.get("num_fourier_features", 128)
         self.spectral_emb_dim = self.kwargs.get("spectral_emb_dim", 2048)
         self.num_latents = self.kwargs.get("num_latents", 8)
-        spectral_compressions = [1024, 512, 128, 64]
+        self.spectral_compressions = self.kwargs.get("spectral_compressions", [1024, 512, 128, 64])
+        self.eps = self.kwargs.get("eps", 1e-3)
         
-        self.hidden_dims = self.kwargs.get("hidden_compression_dims", [1024, 512, 128, 64])
+        self.min_ls = self.kwargs.get("min_ls", 0.05)
+        self.max_ls = self.kwargs.get("max_ls", 15.0)
+        self.beta = self.kwargs.get("beta", 1.0)
+        self.conc_clamp = self.kwargs.get("conc_clamp", 30.0)
+        self.large_eps = self.kwargs.get("large_eps", 4e-2)
+
+        split_override = self.kwargs.get("disentangle_split_override", None)
+        self.disentangle_split = split_override if split_override is not None else [4, 30, 30]
+        
+        # ---Safety Check ---
+        if sum(self.disentangle_split) != self.bottleneck_dim:
+            raise ValueError(
+                f"Architecture mismatch! bottleneck_dim is {self.bottleneck_dim}, "
+                f"but disentangle_split sums to {sum(self.disentangle_split)} {self.disentangle_split}."
+            )
+        
+        #--# safeguard
+        self.num_experts = self.kwargs.get("num_experts", 8)
 
         layers = []
         current_dim = self.spectral_emb_dim
 
-        for compression in spectral_compressions:
+        for compression in self.spectral_compressions:
             layers.append(torch.nn.utils.spectral_norm(nn.Linear(current_dim, compression)))
             layers.append(nn.LayerNorm(compression))
             layers.append(nn.SiLU())
@@ -104,7 +121,7 @@ class SpectralDecoder(BaseGenerativeModel):
             torch.nn.utils.spectral_norm(
                 nn.Linear(self.bottleneck_dim, self.k_atoms)
             ) 
-            for _ in range(self.num_experts)
+            for _ in range(self.num_latents)
         ])
         
         #-roughly equates to prior assertion that 50% of explanatory power comes from mixture weights
@@ -121,6 +138,7 @@ class SpectralDecoder(BaseGenerativeModel):
         
         self.lengthscale_mu = nn.Linear(self.bottleneck_dim, self.k_atoms)
         self.lengthscale_logvar = nn.Linear(self.bottleneck_dim, self.k_atoms)
+        self.scale_head_per_expert = torch.nn.utils.spectral_norm(nn.Linear(self.k_atoms, self.num_latents))
 
         self.register_added_loss_term("lengthscale_kl")
         self.register_added_loss_term("alpha_kl")
@@ -141,26 +159,20 @@ class SpectralDecoder(BaseGenerativeModel):
             spectral_features: [Batch, K*M*2] OR [Batch, K, M*2] as 'x' (embedded dim = 2048)
             vae_out: dirichlet_out
         """
-
         ls_pred_prior = getattr(vae_out, 'ls_pred', None)
-
         ls_logvar_prior = getattr(vae_out, 'ls_logvar', None)
-
         mu_z = getattr(vae_out, 'mu_z', None)
-
         logvar_z = getattr(vae_out, 'logvar_z', None)
-
         real_x = getattr(vae_out, 'real_x', None)
-
-        beta = params.get("beta_override", 1.0)
         
+
         spectral_bottleneck = self.compression_network(x)
         
         bottleneck = torch.tanh(spectral_bottleneck)
 
         recon, trend, amp, residuals = self.disentangle(bottleneck)
 
-        lossterm = self.log_recon_kl(real_x, recon, mu_z, logvar_z, beta=beta)
+        lossterm = self.log_recon_kl(real_x, recon, mu_z, logvar_z, beta=self.beta)
 
         self.update_added_loss_term("recon_kl", LossTerm(lossterm))
 
@@ -231,7 +243,8 @@ class SpectralDecoder(BaseGenerativeModel):
     
     
     def disentangle(self, bottleneck):
-        z_ls, z_pi, z_dt = torch.split(bottleneck, [4, 30, 30], dim=-1)
+        disentangle_split = self.disentangle_split or [4, 30, 30]
+        z_ls, z_pi, z_dt = torch.split(bottleneck, disentangle_split, dim=-1)
         
         trend     = self.ls_head_recon(z_ls) # (-1 to 1)
         amplitude = self.pi_head_recon(z_pi) # (0 to 1)
@@ -242,65 +255,71 @@ class SpectralDecoder(BaseGenerativeModel):
         return recon, trend, amplitude, residual
     
 
-    def log_alpha_kl_low_rank(self, mu, chol, diag, k_atoms=30):
-        """
-        Args:
-            mu: [Batch, k_atoms]
-            chol: [Batch, k_atoms * 3] (The low-rank factor)
-            diag: [Batch, k_atoms] (The diagonal variance)
-        Returns:
-            kl_div: [Batch]
-        """
-        
+    def log_alpha_kl_low_rank(self, mu, chol, diag):
         batch_size = mu.size(0)
-        rank = 3 
+        r = self.kwargs.get("alpha_factor_rank", 3)
+        k = self.k_atoms # Use self.k_atoms for consistency
         
+        factor = chol.view(batch_size, k, r)
         
-        cov_factor = chol.view(batch_size, k_atoms, rank)
+        noise_factor = torch.zeros(batch_size, k, r, device=mu.device)
+        for j in range(r):
+            start, end = j * (k // r), (j + 1) * (k // r)
+            noise_factor[:, start:end, j] = 1.0
         
-        cov_diag = torch.nn.functional.softplus(diag) + 1e-5
+        cov_factor = factor + noise_factor 
+
+        cov_diag = torch.nn.functional.softplus(diag) + self.jitter
         
-        q_dist = LowRankMultivariateNormal(
+        q_dist = torch.distributions.LowRankMultivariateNormal(
             loc=mu,
             cov_factor=cov_factor,
             cov_diag=cov_diag
         )
         
-        p_dist = LowRankMultivariateNormal(
-            loc=torch.zeros_like(mu), 
+        prior_logit = self.inverse_softplus(1.0).to(mu.device)
+        
+        p_dist = torch.distributions.LowRankMultivariateNormal(
+            loc=torch.full_like(mu, prior_logit), 
             cov_factor=torch.zeros_like(cov_factor),
             cov_diag=torch.ones_like(cov_diag)
         )
         
-        kl = kl_divergence(q_dist, p_dist)
-
-        return kl
+        return kl_divergence(q_dist, p_dist)
     
     def dirichlet_sample(self, alpha):
         alpha = F.softplus(alpha)
-        alpha = torch.clamp(alpha, min=4e-2)
+        alpha = torch.clamp(alpha, min=self.large_eps)
         q_alpha= torch.distributions.Dirichlet(alpha)
         pi_sample = q_alpha.rsample()
         return pi_sample
 
-    def predict_lengthscale_and_log_kl(self, bottleneck, ls_pred_prior=None, ls_logvar_prior=None, eps=1e-4):
+    def predict_lengthscale_and_log_kl(self, bottleneck, ls_pred_prior=None, ls_logvar_prior=None):
         """
         Computes the posterior over lengthscales, applies the reparameterisation trick, 
         and logs the KL divergence against a Log-Normal prior.
         """
         mu = self.lengthscale_mu(bottleneck)
-        sigma = torch.exp(0.5 * self.lengthscale_logvar(bottleneck)) + eps
+        sigma = torch.exp(0.5 * self.lengthscale_logvar(bottleneck)) + self.eps
         
         #- Variational Posterior q(log_l | x) -- normal in log space (lognormal)
         q_log_ls = dist.Normal(mu, sigma)
         log_ls_sample = q_log_ls.rsample()
         
+        safe_log_ls = torch.clamp(
+            log_ls_sample, 
+            min=math.log(self.min_ls), 
+            max=math.log(self.max_ls)
+        )
+        
+        ls_sample = torch.exp(safe_log_ls)
         if ls_pred_prior is not None and ls_logvar_prior is not None:
-            prior_loc = torch.log(ls_pred_prior + eps)
-            prior_scale = torch.exp(0.5 * ls_logvar_prior) + eps
+            prior_loc = torch.log(ls_pred_prior)
+            prior_scale = torch.exp(0.5 * ls_logvar_prior) + self.eps
         else:
             prior_loc = torch.zeros_like(mu)
             prior_scale = torch.ones_like(sigma) * 2.5
+        
         #- Prior p(log_l) -- expect lengthscales are centered around exp(0) = 1.0 -#
         
         p_log_ls = dist.Normal(prior_loc, prior_scale)
@@ -310,6 +329,6 @@ class SpectralDecoder(BaseGenerativeModel):
         #-transform to lengthscale space-#
         ls_sample = torch.exp(log_ls_sample)
         
-        ls_sample = torch.clamp(ls_sample, min=eps, max=100.0)
+        ls_sample = torch.clamp(ls_sample, min=self.min_ls, max=self.max_ls)
         
-        return ls_sample, kl_div
+        return ls_sample, kl_div.sum(dim=-1)

@@ -46,3 +46,22 @@ deepkernels/unused/
 .vscode/*
 *.vscode
 .DS_Store
+# Python caches
+__pycache__/
+*.py[cod]
+*.[oa]
+
+# PyTorch & ML
+*.pt
+*.pth
+*.ckpt
+runs/
+wandb/
+lightning_logs/
+
+# Server/Data junk
+data/
+logs/
+*.log
+.env
+*.db

@@ -32,25 +32,7 @@ class LossTerm(gpytorch.mlls.AddedLossTerm):
     def loss(self):
         return self.loss_tensor
 
-class HistoryOutput(NamedTuple):
-    gp_params: GPParams
-    recons: torch.Tensor
-    latents: torch.Tensor
-    pis: torch.Tensor
-    gp_features: torch.Tensor
-    bottlenecks: torch.Tensor
-    expert_params: torch.Tensor
-    frequencies: torch.Tensor
-    trends: torch.Tensor
-    bw_mods: torch.Tensor
-    ls: torch.Tensor
-    gate_weights: torch.Tensor
-    mu_z: torch.Tensor
-    logvar_z: torch.Tensor
-    lmc_matrices: torch.Tensor
-
-
-class DecoderStateOutput(NamedTuple):
+class StateSpaceOutput(NamedTuple):
     gp_params: GPParams
     bottleneck: torch.Tensor
     alpha: torch.Tensor
@@ -70,51 +52,57 @@ class DecoderStateOutput(NamedTuple):
     logvar_z: torch.Tensor
     lmc_matrices: torch.Tensor
 
-
-class StateSpaceOutput(NamedTuple):
-    state: DecoderStateOutput
-    history: HistoryOutput
-
 class SpectralVAE(BaseGenerativeModel):
-    def __init__(self):
+    def __init__(self, **kwargs):
         super().__init__()
-        self.dirichlet = AmortisedDirichlet()
-        self.decoder = SpectralDecoder()
-        self.encoder = ConvolutionalLoopEncoder()
-        self.eps = 1e-4
+        self.dirichlet = AmortisedDirichlet(**kwargs)
+        self.decoder = SpectralDecoder(**kwargs)
+        self.encoder = ConvolutionalLoopEncoder(**kwargs)
+        self.eps = kwargs.get('eps_dirichlet', 1e-4)
+        self.kwargs=kwargs
     
-    def get_zero_state(self, device, batch_size=128):
-        # Standard dimensions from your architecture
-        k = 30 # k_atoms
-        e = 8  # num_experts / num_latents
-        f = 16 # latent_dim / features
-        x_in = 30
-        fact = k * 30
-        bottleneck = 64
+    def get_zero_state(self, device, batch_size):
+        k = self.kwargs.get("k_atoms", 30)
+        e = self.kwargs.get("num_latents", 8)
+        f = self.kwargs.get("latent_dim", 16)
+        r = self.kwargs.get("alpha_factor_rank", 3) # Use the actual rank
+        x_in = self.kwargs.get("input_dim", 30)
+        bottleneck = self.kwargs.get("bottleneck_dim", 64)
         
-        init_pi = self.init_pi_value(batch_size=batch_size, device=device)
+        uniform_logit = self.inverse_softplus(1.0).item()
 
-        return DecoderStateOutput(
-            recon=torch.zeros(batch_size, x_in, device=device),
-            gp_features=torch.zeros(batch_size, e, f, device=device),
+        alpha_factor = torch.zeros(batch_size, k, r, device=device)
+        for j in range(r):
+            start, end = j * (k // r), (j + 1) * (k // r)
+            alpha_factor[:, start:end, j] = 1.0
+        alpha_factor += torch.randn_like(alpha_factor) * 0.001
+        #-pi init-#
+        init_pi = self.init_pi_value(batch_size=batch_size, device=device)
+        initial_lmc = torch.eye(k, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+        symmetry_breaker = torch.randn_like(initial_lmc) * 1e-4
+        initial_lmc = initial_lmc + symmetry_breaker
+
+        return StateSpaceOutput(
+            recon=torch.randn(batch_size, x_in, device=device) * self.eps,
+            gp_features=torch.randn(batch_size, e, f, device=device) * self.eps,
             pi=init_pi,
-            alpha=torch.zeros(batch_size, k, device=device),
-            alpha_mu=torch.zeros(batch_size, k, device=device),
-            alpha_factor=torch.ones(batch_size, fact, device=device),
-            alpha_diag=torch.eye(batch_size, k, device=device),
-            bottleneck=torch.zeros(batch_size, bottleneck, device=device),
-            parameters_per_expert=torch.zeros(batch_size, e, f, device=device),
+            alpha=torch.ones(batch_size, k, device=device),
+            alpha_mu=torch.full((batch_size, k), uniform_logit, device=device),
+            alpha_factor=alpha_factor,
+            alpha_diag = torch.full((batch_size, k), -0.45, device=device), #-jeffreys prior-#
+            bottleneck=torch.randn(batch_size, bottleneck, device=device) * self.eps,
+            parameters_per_expert=torch.randn(batch_size, e, f, device=device) * self.eps,
             bandwidth_mod=torch.ones(batch_size, e, device=device),
             amp=torch.ones(batch_size, x_in, device=device),
             trend=torch.zeros(batch_size, x_in, device=device),
             res=torch.zeros(batch_size, x_in, device=device),
             ls=torch.ones(batch_size, k, device=device),
-            mu_z = torch.zeros(batch_size, f, device=device),
-            logvar_z = torch.ones(batch_size, f, device=device) * 0.1,
-            lmc_matrices=torch.zeros(batch_size, k, e, device=device),
+            mu_z = torch.randn(batch_size, f, device=device) * self.eps,
+            logvar_z = torch.ones(batch_size, f, device=device) * 0.05,
+            lmc_matrices=initial_lmc,
             
             gp_params=GPParams(
-                gates=torch.ones(batch_size, 8, device=device) * 1/8,
+                gates=torch.ones(batch_size, 8, device=device) * 0.125,
                 periodic=torch.randn(batch_size, 32, device=device) * 0.01,
                 linear=torch.randn(batch_size, 32, device=device) * 0.01,
                 matern=torch.randn(batch_size, 32, device=device) * 0.01,
@@ -124,104 +112,78 @@ class SpectralVAE(BaseGenerativeModel):
         )
 
     def init_pi_value(self, batch_size, device, k_atoms=30):
-        device = self.get_device()
         pi = torch.full((batch_size, k_atoms), 1.0/k_atoms, device=device)
         pi = pi + (torch.randn_like(pi) * 0.01)
         pi = F.softmax(pi, dim=-1)
         return pi
 
-    def refinement_loop(self, x, steps, initial_state=None, generative_mode:bool=False):
-        current_state = initial_state #-this is vae_out-#
+    def refinement_loop(self, x, steps, current_state=None, generative_mode:bool=False):
+        if current_state is None:
+            current_state = self.get_zero_state(x.device, batch_size=x.size(0))
 
-        hist_recons, hist_latents, hist_pis = [], [], []
-        hist_gp_features, hist_bottlenecks, hist_expert_params = [], [], []
-        hist_frequencies, hist_trends, hist_bw_mods = [], [], []
-        hist_ls, hist_gate_weights, hist_params_nkn = [], [], []
-        hist_mu_z, hist_logvar_z, hist_lmcs = [], [], []
+        #hist_recons, hist_pis = [], []
+        #hist_gp_features, hist_bottlenecks, hist_expert_params = [], [], []
+        #hist_frequencies, hist_trends, hist_bw_mods = [], [], []
+        #hist_ls, hist_gate_weights, hist_params_nkn = [], [], []
+        #hist_mu_z, hist_logvar_z, hist_lmcs = [], [], []
         
-        batch_size, seq_len, features = x.shape
+        batch_size = x.size(0)
         
         # --- SEQUENCE LOOP --- #
-        for t in range(seq_len):
+        for t in range(steps): 
             if generative_mode and t > 0:
                 x_t = current_state.recon 
             else:
-                x_t = x[:, t, :]
-                
-            # --- REFINEMENT LOOP --- #
-            for _ in range(steps):
-                encoder_out = self.encoder(x_t, vae_out=current_state)
-                
-                alpha = encoder_out.alpha
-                if alpha.dim() > 2:
-                    alpha = alpha.squeeze(-1)
-                
-                pi_current = self.dirichlet_sample(alpha)
-                
-                current_ls = encoder_out.ls
-                if current_ls is not None and current_ls.numel() == 0:
-                    current_ls = None
-                
-                dirichlet_out = self.dirichlet(
-                    encoder_out.z, 
-                    encoder_out, 
-                    pi=pi_current, 
-                    ls=current_ls
-                )
-                
-                decoder_out = self.decoder(
-                    dirichlet_out.features,
-                    dirichlet_out
-                )
-                
-                current_state = decoder_out
+                x_t = x[:, t, :] if x.dim() == 3 else x
+            encoder_out = self.encoder(x_t, vae_out=current_state)
             
-            hist_params_nkn.append(decoder_out.gp_params)
-            hist_recons.append(decoder_out.recon)
-            hist_pis.append(dirichlet_out.pi)
-            hist_latents.append(encoder_out.z)
-            hist_bottlenecks.append(decoder_out.bottleneck)
-            hist_frequencies.append(dirichlet_out.frequencies)
-            hist_expert_params.append(decoder_out.parameters_per_expert)
-            hist_gp_features.append(decoder_out.gp_features)
-            hist_trends.append(decoder_out.trend)
-            hist_ls.append(decoder_out.ls)
-            hist_bw_mods.append(decoder_out.bandwidth_mod)
-            hist_gate_weights.append(dirichlet_out.gated_weights)
-            hist_mu_z.append(encoder_out.mu_z)
-            hist_logvar_z.append(encoder_out.logvar_z)
-            hist_lmcs.append(decoder_out.lmc_matrices)
-        
-        stacked_gp_params = GPParams(
-            gates=torch.stack([p.gates for p in hist_params_nkn], dim=1).unsqueeze(1),
-            linear=torch.stack([p.linear for p in hist_params_nkn], dim=1).unsqueeze(1),
-            periodic=torch.stack([p.periodic for p in hist_params_nkn], dim=1).unsqueeze(1),
-            rational=torch.stack([p.rational for p in hist_params_nkn], dim=1).unsqueeze(1),
-            polynomial=torch.stack([p.polynomial for p in hist_params_nkn], dim=1).unsqueeze(1),
-            matern=torch.stack([p.matern for p in hist_params_nkn], dim=1).unsqueeze(1)
-        )
-        
-        history = HistoryOutput(
-            gp_params=stacked_gp_params,
-            recons=torch.stack(hist_recons, dim=1),
-            latents=torch.stack(hist_latents, dim=1),
-            pis=torch.stack(hist_pis, dim=1),
-            gp_features=torch.stack(hist_gp_features, dim=1).transpose(1, 2),
-            bottlenecks=torch.stack(hist_bottlenecks, dim=1),
-            expert_params=torch.stack(hist_expert_params, dim=1).transpose(1, 2),
-            frequencies=torch.stack(hist_frequencies, dim=1),
-            trends=torch.stack(hist_trends, dim=1),
-            bw_mods=torch.stack(hist_bw_mods, dim=1),
-            ls=torch.stack(hist_ls, dim=1),
-            gate_weights=torch.stack(hist_gate_weights, dim=1),
-            mu_z = torch.stack(hist_mu_z, dim=1),
-            logvar_z = torch.stack(hist_logvar_z, dim=1),
-            lmc_matrices = torch.stack(hist_lmcs, dim=1)
-        )
             
-        return current_state, history
+            dirichlet_out = self.dirichlet(
+                encoder_out.z, 
+                encoder_out,
+                ls=encoder_out.ls,
+                alpha_mu=encoder_out.alpha_mu,
+                alpha_diag=encoder_out.alpha_diag,
+                alpha_factor=encoder_out.alpha_factor
+            )
+            
+            decoder_out = self.decoder(
+                dirichlet_out.features,
+                dirichlet_out
+            )
+            
+            current_state = StateSpaceOutput(
+                recon=decoder_out.recon,
+                gp_features=decoder_out.gp_features,
+                pi=decoder_out.pi,
+                alpha=decoder_out.alpha,
+                alpha_mu=decoder_out.alpha_mu,
+                alpha_factor=decoder_out.alpha_factor,
+                alpha_diag=decoder_out.alpha_diag,
+                bottleneck=decoder_out.bottleneck,
+                parameters_per_expert=decoder_out.parameters_per_expert,
+                bandwidth_mod=decoder_out.bandwidth_mod,
+                amp=decoder_out.amp,
+                trend=decoder_out.trend,
+                res=decoder_out.res,
+                ls=decoder_out.ls,
+                mu_z = decoder_out.mu_z,
+                logvar_z = decoder_out.logvar_z,
+                lmc_matrices=decoder_out.lmc_matrices,
+            
+                gp_params=GPParams(
+                    gates=decoder_out.gp_params.gates,
+                    periodic=decoder_out.gp_params.periodic,
+                    linear=decoder_out.gp_params.linear,
+                    matern=decoder_out.gp_params.matern,
+                    rational=decoder_out.gp_params.rational,
+                    polynomial=decoder_out.gp_params.polynomial
+                )
+            )
+            
+        return current_state
     
     def forward(self, x, vae_out=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         steps = steps if steps is not None else 3
-        current_state, history = self.refinement_loop(x=x, steps=steps, initial_state=vae_out, generative_mode=False)
-        return StateSpaceOutput(state=current_state, history=history)
+        current_state = self.refinement_loop(x=x, steps=steps, current_state=vae_out, generative_mode=False)
+        return current_state
