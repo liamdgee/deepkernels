@@ -72,7 +72,7 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
         #-register priors-#
         self.register_prior("scale_12_prior", gpytorch.priors.GammaPrior(4.0, 0.6), "raw_scale_12")
         self.register_prior("scale_32_prior", gpytorch.priors.GammaPrior(4.0, 3.0), "raw_scale_32")
-        self.register_prior("scale_52_prior", gpytorch.priors.GammaPrior(4.0, 15.0), "raw_scale_52")
+        self.register_prior("scale_52_prior", gpytorch.priors.GammaPrior(4.0, 9.0), "raw_scale_52")
         self.register_prior("rq_alpha_prior", gpytorch.priors.GammaPrior(3.0, 0.75), "raw_rq_alpha")
         
         self.register_prior("linear_scale_prior", gpytorch.priors.HalfCauchyPrior(2.0), "raw_linear_scale")
@@ -87,16 +87,16 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
         initial_weights = (torch.ones(4, 8) / 8.0) + (torch.randn(4, 8) * 0.005)
         
         self.initialize(
-            scale_12 = torch.tensor(1.6),
-            scale_32 = torch.tensor(0.7),
-            scale_52 = torch.tensor(0.1),
-            rq_alpha = torch.tensor(1.0),
-            linear_scale = torch.tensor(0.5),
-            poly_offset = torch.tensor(0.2),
-            inv_bandwidth = torch.ones(1, 32) * torch.exp(torch.tensor(0.035)),
-            outputscale = torch.exp(torch.tensor(0.015)),
-            latent_amplitude = torch.exp(torch.tensor(0.025)),
-            nkn_weights=initial_weights
+            raw_scale_12 = torch.tensor(0.0),
+            raw_scale_32 = torch.tensor(0.0),
+            raw_scale_52 = torch.tensor(0.0),
+            raw_rq_alpha = torch.tensor(0.0),
+            raw_linear_scale = torch.tensor(0.5),
+            raw_poly_offset = torch.tensor(0.2),
+            raw_inv_bandwidth = torch.tensor(1.035),
+            raw_outputscale = torch.tensor(1.015),
+            raw_latent_amplitude = torch.tensor(1.025),
+            raw_nkn_weights=initial_weights
         )
     
     @property
@@ -124,47 +124,10 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
     def _safe_tensor(self, value):
         """Helper to ensure we always pass a tensor to the inverse transform"""
         return value if torch.is_tensor(value) else torch.tensor(value)
-
-    #-setters-#
-    @scale_12.setter
-    def scale_12(self, value):
-        self.initialize(**{"scale_12": self.raw_scale_12_constraint.inverse_transform(self._safe_tensor(value))})
-    
-    @scale_32.setter
-    def scale_32(self, value):
-        self.initialize(**{"scale_32": self.raw_scale_32_constraint.inverse_transform(self._safe_tensor(value))})
-    
-    @scale_52.setter
-    def scale_52(self, value):
-        self.initialize(**{"scale_52": self.raw_scale_52_constraint.inverse_transform(self._safe_tensor(value))})
-    
-    @rq_alpha.setter
-    def rq_alpha(self, value):
-        self.initialize(**{"rq_alpha": self.raw_rq_alpha_constraint.inverse_transform(self._safe_tensor(value))})
-    
-    @linear_scale.setter
-    def linear_scale(self, value):
-        self.initialize(**{"linear_scale": self.raw_linear_scale_constraint.inverse_transform(self._safe_tensor(value))})
-    
-    @poly_offset.setter
-    def poly_offset(self, value):
-        self.initialize(**{"poly_offset": self.raw_poly_offset_constraint.inverse_transform(self._safe_tensor(value))})
-    
-    @latent_amplitude.setter
-    def latent_amplitude(self, value):
-        self.initialize(**{"latent_amplitude": self.raw_latent_amplitude_constraint.inverse_transform(self._safe_tensor(value))})
-    
-    @outputscale.setter
-    def outputscale(self, value):
-        self.initialize(**{"outputscale": self.raw_outputscale_constraint.inverse_transform(self._safe_tensor(value))})
-    
-    @inv_bandwidth.setter
-    def inv_bandwidth(self, value):
-        self.initialize(**{"inv_bandwidth": self.raw_inv_bandwidth_constraint.inverse_transform(self._safe_tensor(value))})
     
     @nkn_weights.setter
     def nkn_weights(self, value):
-        self.initialize(**{"nkn_weights": self.raw_nkn_weights_constraint.inverse_transform(self._safe_tensor(value))})
+        self.initialize(**{"raw_nkn_weights": self.raw_nkn_weights_constraint.inverse_transform(self._safe_tensor(value))})
 
     
     def forward(self, x1, x2, diag=False, **params) -> LinearOperator:

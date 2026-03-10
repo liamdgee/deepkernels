@@ -25,21 +25,19 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
     def __init__(self, vae=None, likelihood=None, gp=None, run_gp:bool=False, **kwargs):
         super().__init__()
         self.vae = vae if vae is not None else SpectralVAE(**kwargs)
-        min_noise = kwargs.get("min_noise", 3e-4)
-        num_latents = kwargs.get("num_latents", 8)
+        k_atoms = kwargs.get("k_atoms", 30)
+        min_noise = kwargs.get("min_noise", 1e-3)
         if likelihood is not None:
             self.likelihood = likelihood
         else:
-            self.likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.k_atoms)
+            self.likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=k_atoms, noise_constraint=gpytorch.constraints.GreaterThan(min_noise))
         
         self.run_gp = run_gp
         if gp is not None:
             self.gp = gp
         else:
             self.gp = AcceleratedKernelGP(
-                likelihood=self.likelihood, 
-                k_atoms=self.k_atoms, 
-                num_latents=self.num_latents,
+                likelihood=self.likelihood,
                 **kwargs
             )
 
@@ -83,7 +81,6 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
         
         gp_features = self.pack_features(state.gp_params, state.pi)
         lmc_learned = state.lmc_matrices
-        
         mvn = None
         if self.gp is not None and self.run_gp:
             

@@ -106,11 +106,11 @@ class AmortisedDirichlet(BaseGenerativeModel):
         atom_sigma_upper_scale = self.sigma_upper_bound / 100
 
         
-        mu_constraint = gpytorch.constraints.Interval(lower_bound=-self.mu_lower_bound, upper_bound=self.mu_upper_bound)
-        sigma_constraint = gpytorch.constraints.Interval(lower_bound=self.sigma_lower_bound, upper_bound=self.sigma_upper_bound)
+        mu_constraint = gpytorch.constraints.Interval(lower_bound=-30.0, upper_bound=20.0)
+        sigma_constraint = gpytorch.constraints.Interval(lower_bound=0.01, upper_bound=5.0)
         ls_constraint = gpytorch.constraints.Interval(lower_bound=self.min_ls, upper_bound=self.max_ls)
-        atom_mu_constraint = gpytorch.constraints.Interval(lower_bound=atom_mu_lower_scale, upper_bound=atom_mu_upper_scale)
-        atom_sigma_constraint = gpytorch.constraints.Interval(lower_bound=atom_sigma_lower_scale, upper_bound=atom_sigma_upper_scale)
+        atom_mu_constraint = gpytorch.constraints.Interval(lower_bound=-30.0, upper_bound=20.0)
+        atom_sigma_constraint = gpytorch.constraints.Interval(lower_bound=0.01, upper_bound=5.0)
         lmc_constraint = gpytorch.constraints.Interval(lower_bound=-5.0, upper_bound=5.0)
         
         #============
@@ -136,10 +136,10 @@ class AmortisedDirichlet(BaseGenerativeModel):
         self.register_constraint("raw_h_sigma", sigma_constraint)
         
         #-atoms for spectral features (gaussian)-#
-        self.register_parameter(name="raw_atom_loc", parameter=nn.Parameter(torch.zeros(self.k_atoms, 1, self.latent_dim)))
+        self.register_parameter(name="raw_atom_loc", parameter=nn.Parameter(torch.randn(self.k_atoms, 1, self.latent_dim) * 2 * math.sqrt(0.1)))
         self.register_constraint("raw_atom_loc", atom_mu_constraint)
 
-        self.register_parameter(name="raw_atom_scale", parameter=nn.Parameter(torch.zeros(self.k_atoms, 1, self.latent_dim)))
+        self.register_parameter(name="raw_atom_scale", parameter=nn.Parameter(torch.randn(self.k_atoms, 1, self.latent_dim) * 0.1))
         self.register_constraint("raw_atom_scale", atom_sigma_constraint)
 
         #kernel lengthscales-#
@@ -202,16 +202,16 @@ class AmortisedDirichlet(BaseGenerativeModel):
         target_lmc_var = torch.ones(self.k_atoms) + (torch.rand(self.k_atoms) * 0.1)
 
         self.initialize(
-            q_a_global=torch.exp(torch.tensor(0.0025)),
-            q_b_global=torch.exp(torch.tensor(0.47)),
-            gamma=torch.exp(torch.tensor(0.433)),
-            h_mu=torch.exp(torch.tensor(-3.3)),
-            h_sigma=torch.exp(torch.tensor(0.025)),
-            atom_loc=torch.exp(target_atom_mu),
-            atom_scale=target_atom_sigma, 
-            lengthscale_uncertainty=torch.exp(torch.tensor(0.025)),
-            lmc_var=target_lmc_var,
-            lmc_matrix=target_lmc
+            raw_q_a_global=torch.tensor(0.0),
+            raw_q_b_global=torch.tensor(0.0),
+            raw_gamma=torch.tensor(0.0),
+            raw_h_mu=torch.tensor(0.0),
+            raw_h_sigma=torch.tensor(0.0),
+            raw_lengthscale_uncertainty=torch.tensor(0.0),
+            raw_atom_loc=torch.randn_like(target_atom_mu) * 0.05,
+            raw_atom_scale=torch.randn_like(target_atom_sigma) * 0.05, 
+            raw_lmc_var=torch.randn_like(target_lmc_var) * 0.05,
+            raw_lmc_matrix=torch.randn_like(target_lmc) * 0.05
         )
     
     #-properties for params -#
@@ -250,47 +250,6 @@ class AmortisedDirichlet(BaseGenerativeModel):
     def _safe_tensor(self, value):
         """Helper to ensure we always pass a tensor to the inverse transform"""
         return value if torch.is_tensor(value) else torch.tensor(value)
-
-    #-setters-#
-    @q_a_global.setter
-    def q_a_global(self, value):
-        self.initialize(**{"raw_q_a_global": self.raw_q_a_global_constraint.inverse_transform(self._safe_tensor(value))})
-
-    @q_b_global.setter
-    def q_b_global(self, value):
-        self.initialize(**{"raw_q_b_global": self.raw_q_b_global_constraint.inverse_transform(self._safe_tensor(value))})
-
-    @gamma.setter
-    def gamma(self, value):
-        self.initialize(**{"raw_gamma": self.raw_gamma_constraint.inverse_transform(self._safe_tensor(value))})
-
-    @h_mu.setter
-    def h_mu(self, value):
-        self.initialize(**{"raw_h_mu": self.raw_h_mu_constraint.inverse_transform(self._safe_tensor(value))})
-
-    @h_sigma.setter
-    def h_sigma(self, value):
-        self.initialize(**{"raw_h_sigma": self.raw_h_sigma_constraint.inverse_transform(self._safe_tensor(value))})
-
-    @atom_loc.setter
-    def atom_loc(self, value):
-        self.initialize(**{"raw_atom_loc": self.raw_atom_loc_constraint.inverse_transform(self._safe_tensor(value))})
-
-    @atom_scale.setter
-    def atom_scale(self, value):
-        self.initialize(**{"raw_atom_scale": self.raw_atom_scale_constraint.inverse_transform(self._safe_tensor(value))})
-
-    @lengthscale_uncertainty.setter
-    def lengthscale_uncertainty(self, value):
-        self.initialize(**{"raw_lengthscale_uncertainty": self.raw_lengthscale_uncertainty_constraint.inverse_transform(self._safe_tensor(value))})
-
-    @lmc_var.setter
-    def lmc_var(self, value):
-        self.initialize(**{"raw_lmc_var": self.raw_lmc_var_constraint.inverse_transform(self._safe_tensor(value))})
-
-    @lmc_matrix.setter
-    def lmc_matrix(self, value):
-        self.initialize(**{"raw_lmc_matrix": self.raw_lmc_matrix_constraint.inverse_transform(self._safe_tensor(value))})
     
     def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params) -> DirichletOutput:
         """

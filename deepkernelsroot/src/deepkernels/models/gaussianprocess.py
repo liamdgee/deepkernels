@@ -43,9 +43,6 @@ class AcceleratedKernelGP(gpytorch.models.ApproximateGP):
         Args:
             inducing_points: (M, D) tensor of initial inducing point locations.
         """
-        self.k_atoms = k_atoms
-        self.num_latents = num_latents
-        self.likelihood = likelihood
 
         #-inducing points-#
         base_inducing_points = params.get("inducing_points", torch.randn(256, kernel_features_dim))
@@ -60,9 +57,11 @@ class AcceleratedKernelGP(gpytorch.models.ApproximateGP):
 
         inner_strategy = gpytorch.variational.VariationalStrategy(self, inducing_points, variational_distribution, learn_inducing_locations=True)
         
-        variational_strategy = DynamicStrategy(inner_strategy, num_tasks=self.k_atoms, num_latents=self.num_latents, latent_dim=-1)
+        variational_strategy = DynamicStrategy(inner_strategy, num_tasks=k_atoms, num_latents=num_latents, latent_dim=-1)
         
         super().__init__(variational_strategy)
+
+        self.likelihood = likelihood
         
         self.mean_module = ProbabilisticMixtureMean(batch_shape=latent_batch_shape)
         

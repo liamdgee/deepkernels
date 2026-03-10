@@ -49,7 +49,7 @@ class EvidenceLowerBound(nn.Module):
             gp_output: The MultivariateNormal returned by your GP.
             gp_target: The sequence the GP is supposed to be predicting. (ground truth)
         """
-        device = gp_target.device
+        device = gp_target.device if gp_target is not None else next(model.parameters()).device
         kl_metrics = {}
 
         if gp_output is not None and gp_target is not None:

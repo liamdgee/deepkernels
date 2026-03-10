@@ -146,11 +146,13 @@ class ParameterIsolate:
                 else:
                     deterministic_recon_params.append(param)
                     all_decoder_params.append(param)
-            elif 'gp' in name:
-                if 'mean_module' in name:
+            elif 'gp' in name or 'likelihood' in name:
+                if 'likelihood' in name:
+                    likelihood_params.append(param)
+                    all_gp_params.append(param) 
+                elif 'mean_module' in name:
                     gp_mean_params.append(param)
                     all_gp_params.append(param)
-                    
                 elif 'covar_module' in name:
                     if "outputscale" in name or "amplitude" in name:
                         gp_kernel_global_params.append(param)
@@ -168,11 +170,6 @@ class ParameterIsolate:
                         gp_kernel_ls_params.append(param)
                         all_gp_kernel_hyperparams.append(param)
                         all_gp_params.append(param)
-                        
-                elif 'likelihood' in name:
-                    likelihood_params.append(param)
-                    all_gp_params.append(param)
-                
                 elif 'variational_strategy' in name or 'lmc' in name:
                     if 'inducing_points' in name:
                         gp_inducing_params.append(param)
@@ -328,19 +325,19 @@ class ParameterIsolate:
         """
         self._set_group_grad("encoder_total", False)
         self._set_group_grad("decoder_total", False)
-        self._set_group_grad("dirichlet_total", False)    
+        self._set_group_grad("dirichlet_total", True)    
         self._set_group_grad("hypernetwork_total", False) # <-- FROZEN
         self._set_group_grad("gp_total", True)
         logger.info("Mode: GP Warmup. (Calibrating Mean and Likelihood Noise)")
     
     def train_gp_only(self):
         """
-        Stage 2: Full-Batch KeOps ExactGP Training.
+        Stage 3: Full-Batch KeOps ExactGP Training.
         Freezes the entire VAE to save VRAM. Unfreezes the Neural Kernel Network and GP.
         """
         self._set_group_grad("encoder_total", False)
         self._set_group_grad("decoder_total", False)
-        self._set_group_grad("dirichlet_total", False)    
+        self._set_group_grad("dirichlet_total", True)    
         self._set_group_grad("hypernetwork_total", True)
         self._set_group_grad("gp_total", True)
     
