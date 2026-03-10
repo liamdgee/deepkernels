@@ -21,17 +21,6 @@ if not logger.handlers:
 from deepkernels.models.parent import BaseGenerativeModel
 from deepkernels.models.NKN import GPParams
 
-class LossTerm(gpytorch.mlls.AddedLossTerm):
-    """
-    A concrete implementation of an AddedLossTerm that simply 
-    returns a pre-calculated scalar tensor.
-    """
-    def __init__(self, loss_tensor):
-        self.loss_tensor = loss_tensor
-        
-    def loss(self):
-        return self.loss_tensor
-
 class StateSpaceOutput(NamedTuple):
     gp_params: GPParams
     bottleneck: torch.Tensor

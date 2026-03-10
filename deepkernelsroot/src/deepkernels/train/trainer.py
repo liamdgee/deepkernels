@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import LinearLR
 
 from deepkernels.train.stochastic_annealer import StochasticAnnealer
 from deepkernels.models.model import StateSpaceKernelProcess
-from deepkernels.train.exact_objective import ExactObjective
+from deepkernels.train.variational_objective import EvidenceLowerBound
 from typing import Union, Optional, Iterable
 import gpytorch
 from tqdm import tqdm
@@ -34,7 +34,7 @@ class ParameterIsolate:
         self.model = model
         self.device = self.get_device(device)
         self.kwargs = kwargs
-        self.objective = objective if objective is not None else ExactObjective(self.model)
+        self.objective = objective if objective is not None else EvidenceLowerBound(self.model)
         
         self.adam_optimiser = None
         self.adamw_optimiser = None
@@ -91,6 +91,9 @@ class ParameterIsolate:
         gp_kernel_ls_params = []
         gp_kernel_nkn_params = []
         likelihood_params = []
+        gp_inducing_params = []
+        gp_variational_params = []
+        gp_other_params = []
         
         
         total_trainable_params = 0
@@ -147,6 +150,7 @@ class ParameterIsolate:
                 if 'mean_module' in name:
                     gp_mean_params.append(param)
                     all_gp_params.append(param)
+                    
                 elif 'covar_module' in name:
                     if "outputscale" in name or "amplitude" in name:
                         gp_kernel_global_params.append(param)
@@ -164,11 +168,20 @@ class ParameterIsolate:
                         gp_kernel_ls_params.append(param)
                         all_gp_kernel_hyperparams.append(param)
                         all_gp_params.append(param)
+                        
                 elif 'likelihood' in name:
                     likelihood_params.append(param)
                     all_gp_params.append(param)
+                
+                elif 'variational_strategy' in name or 'lmc' in name:
+                    if 'inducing_points' in name:
+                        gp_inducing_params.append(param)
+                        all_gp_params.append(param)
+                    else:
+                        gp_variational_params.append(param)
+                        all_gp_params.append(param)  
                 else:
-                    gp_mean_params.append(param)
+                    gp_other_params.append(param)
                     all_gp_params.append(param)
             elif 'vae.dirichlet' in name:
                 if 'mu_atom' in name or 'log_sigma_atom' in name:
@@ -201,22 +214,19 @@ class ParameterIsolate:
                 all_encoder_params.append(param)
                 
             routed_params += 1
-
-        if total_trainable_params != routed_params:
-            logger.error(f"Parameter mismatch! Trainable: {total_trainable_params}, Routed: {routed_params}")
-        #-build adamW optimiser-#
-        #-fdr adam optimiser-#
-        base_lr_adamw = self.kwargs.get('base_lr_adamw', 1.175e-3)
         
+        base_lr_adamw = self.kwargs.get('base_lr_adamw', 1.175e-3)
         base_decay_adamw = base_lr_adamw / 10
         slow_decay_adamw = base_decay_adamw / 10
         slow_lr = (base_lr_adamw / 10) * 4.77    #~-5e-4
         very_slow_lr = (base_lr_adamw / 250) * 2.77 #~1.3e-5
-        gp_global_hyper_lr = self.kwargs.get('gp_global_hyper_lr', 8e-3)
-        gp_mean_lr = self.kwargs.get('gp_mean_lr', 6e-3)
-        gp_likelihood_lr = self.kwargs.get('gp_likelihood_lr', 2e-2)
-        gp_lengthscale_lr = self.kwargs.get('gp_lengthscale_lr', 4e-3)
-        gp_kernel_nkn_lr = self.kwargs.get('gp_kernel_nkn_lr', 2e-3)
+        gp_global_hyper_lr = self.kwargs.get('gp_global_hyper_lr', 3e-3)
+        gp_mean_lr = self.kwargs.get('gp_mean_lr', 2e-3)
+        gp_likelihood_lr = self.kwargs.get('gp_likelihood_lr', 5e-3)
+        gp_lengthscale_lr = self.kwargs.get('gp_lengthscale_lr', 2e-4)
+        gp_kernel_nkn_lr = self.kwargs.get('gp_kernel_nkn_lr', 2e-6)
+        gp_variational_lr = self.kwargs.get('gp_variational_lr', 7e-4)
+        gp_inducing_lr = self.kwargs.get('gp_inducing_lr', 1e-3)
 
         #-for SGLD optimiser-#
         fast_dir = self.kwargs.get('fast_dir', 1e-3)
@@ -257,11 +267,18 @@ class ParameterIsolate:
             {'params': ultrasensitive_spectral_params, 'lr': ultrasensitive_lr},
             {'params': primitive_params, 'lr': base_lr_adamw},
             {'params': combinatorics_params, 'lr': slow_lr},
+            {'params': gp_variational_params, 'lr': gp_variational_lr},
+            {'params': gp_inducing_params, 'lr': gp_inducing_lr},
+            {'params': gp_other_params, 'lr': base_lr_adamw}
         ], weight_decay=0.0)
         
         total_opt_params = sum(len(group['params']) for opt in [self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser] for group in opt.param_groups)
         logger.info(f"Parameter Isolation Complete. {total_opt_params}/{total_trainable_params} tensors strictly routed into 3 Optimizers.")
+        total_opt_params = sum(len(group['params']) for opt in [self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser] for group in opt.param_groups)
         
+        if total_trainable_params != total_opt_params:
+            logger.error(f"Parameter Optimizer Mismatch! Model has {total_trainable_params} trainable tensors, but optimizers only received {total_opt_params}.")
+
         self.module_groups = {
             "encoder_total": all_encoder_params,
             "decoder_total": all_decoder_params,
@@ -276,6 +293,8 @@ class ParameterIsolate:
         """Helper to cleanly flip gradients for a specific parameter list."""
         for param in self.module_groups[group_name]:
             param.requires_grad = requires_grad
+            if not requires_grad:
+                param.grad = None
 
     def train_vae_only(self):
         """
@@ -324,7 +343,6 @@ class ParameterIsolate:
         self._set_group_grad("dirichlet_total", False)    
         self._set_group_grad("hypernetwork_total", True)
         self._set_group_grad("gp_total", True)
-        logger.info("Mode: GP Only. (Requires passing the FULL dataset at once)")
     
     def train_cyclically(self):
         """

@@ -1,41 +1,27 @@
-import torch
-import gpytorch
-import torch.nn as nn
-from gpytorch.models import ApproximateGP
-import torch.nn.functional as F
-from typing import Literal
-import random
-from typing import NamedTuple
+
+import pykeops
+from pykeops.torch import LazyTensor
+import math
+import itertools
+import linear_operator
+from linear_operator.operators import LinearOperator, KeOpsLinearOperator
+from gpytorch.kernels.keops import RBFKernel
 
 import os
 if 'CONDA_PREFIX' in os.environ:
     os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
     os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
 
+
 from deepkernels.models.parent import BaseGenerativeModel
 from deepkernels.kernels.keops import GenerativeKernel, ProbabilisticMixtureMean
 
-import os
-os.environ['CUDA_HOME'] = '/usr/local/cuda'
-os.environ['PATH'] = '/usr/local/cuda/bin:' + os.environ['PATH']
+import torch
+import gpytorch
+import torch.nn as nn
+from typing import NamedTuple
 
-import pykeops
-
-from pykeops.torch import LazyTensor
-
-#### -- pykeops.clean_pykeops()
-pykeops.config.cuda_standalone = True
-pykeops.config.use_OpenMP = False
-
-import math
-import itertools
-from gpytorch.kernels import Kernel
-
-import linear_operator
-from linear_operator.operators import LinearOperator, KeOpsLinearOperator
-from gpytorch.kernels.keops import RBFKernel
-
-class DynamicLMCVariationalStrategy(gpytorch.variational.LMCVariationalStrategy):
+class DynamicStrategy(gpytorch.variational.LMCVariationalStrategy):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._dynamic_lmc = None
@@ -50,8 +36,8 @@ class DynamicLMCVariationalStrategy(gpytorch.variational.LMCVariationalStrategy)
             return self._dynamic_lmc
         return self.lmc_coefficients_parameter
 
-class AcceleratedKernelGP(ApproximateGP):
-    def __init__(self, likelihood, inducing=None, k_atoms=30, num_latents=8, **params):
+class AcceleratedKernelGP(gpytorch.models.ApproximateGP):
+    def __init__(self, likelihood, inducing=None, k_atoms=30, num_latents=8, kernel_features_dim=198, **params):
         """
         'Physics Anchor' with KeOps Optimised Kernel
         Args:
@@ -62,8 +48,7 @@ class AcceleratedKernelGP(ApproximateGP):
         self.likelihood = likelihood
 
         #-inducing points-#
-        kernel_features_dim = 5 * 32 + 8
-        base_inducing_points = params.get("inducing_points", torch.randn(256, 168))
+        base_inducing_points = params.get("inducing_points", torch.randn(256, kernel_features_dim))
         base_inducing_points = inducing if inducing is not None else base_inducing_points
         num_inducing = base_inducing_points.size(0)
         
@@ -75,7 +60,7 @@ class AcceleratedKernelGP(ApproximateGP):
 
         inner_strategy = gpytorch.variational.VariationalStrategy(self, inducing_points, variational_distribution, learn_inducing_locations=True)
         
-        variational_strategy = gpytorch.variational.LMCVariationalStrategy(inner_strategy, num_tasks=self.k_atoms, num_latents=self.num_latents, latent_dim=-1)
+        variational_strategy = DynamicStrategy(inner_strategy, num_tasks=self.k_atoms, num_latents=self.num_latents, latent_dim=-1)
         
         super().__init__(variational_strategy)
         
@@ -83,12 +68,19 @@ class AcceleratedKernelGP(ApproximateGP):
         
         self.covar_module = GenerativeKernel(batch_shape=latent_batch_shape)
 
-    def forward(self, x, **kwargs):
+    def forward(self, x, lmc_learned=None, diag=None, **kwargs):
         """
         x: The PACKED feature tensor [..., N, 168] coming from the decoder.
         kwargs: Contains 'pi' for the Mixture Mean.
         """
-        kwargs.pop("diag", None)
+
+        if lmc_learned is not None:
+            if lmc_learned.dim() == 3:
+                lmc_learned = lmc_learned.mean(dim=0)
+            
+            self.variational_strategy._dynamic_lmc = lmc_learned
+        else:
+            self.variational_strategy._dynamic_lmc = None
 
         xc = x.contiguous()
         

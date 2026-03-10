@@ -12,7 +12,7 @@ from collections import defaultdict
 import torch.nn.functional as F
 import gpytorch
 
-from deepkernels.train.exact_objective import ExactObjective
+from deepkernels.train.variational_objective import EvidenceLowerBound
 from deepkernels.train.stochastic_annealer import StochasticAnnealer
 from typing import Union
 from deepkernels.train.trainer import ParameterIsolate
@@ -46,7 +46,7 @@ class LangevinTrainer:
         self.model = model
         self.device = self.get_device(device)
         self.temp = kwargs.get('langevin_temp', 7.5e-6)
-        self.objective = ExactObjective(self.model)
+        self.objective = EvidenceLowerBound(self.model)
         self.orchestrator = ParameterIsolate(model, device=device, **kwargs)
         self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser, self.debug = self.orchestrator.seperate_params_and_build_optimisers()
         self.kl_weights = self.objective.kl_weights
@@ -132,9 +132,9 @@ class LangevinTrainer:
         self.adamw_optimiser.zero_grad()
         self.langevin_optimiser.zero_grad()
         
-        state_space = self.model(x, run_gp=False, **kwargs) 
+        state= self.model(x, run_gp=False, **kwargs) 
         loss, metrics = self.objective(
-            model=self.model, x_target=x, state_output=state_space, 
+            model=self.model,
             gp_output=None, gp_target=None, **kwargs
         )
 
@@ -154,13 +154,12 @@ class LangevinTrainer:
         
         return metrics
 
-    def step_gp(self, full_x, full_y, **kwargs):
+    def step_gp(self, x, y, **kwargs):
         """Full-batch exact step for Stage 2."""
         self.adam_optimiser.zero_grad()
         
         cholesky_jitter_val = self.kwargs.get('cholesky_jitter', 1e-3)
         
-        # The GPyTorch Speed Hacks + Jitter
         with gpytorch.settings.cholesky_jitter(float(cholesky_jitter_val)), \
             gpytorch.settings.max_cg_iterations(70), \
             gpytorch.settings.max_preconditioner_size(25), \
@@ -168,10 +167,12 @@ class LangevinTrainer:
             gpytorch.settings.cg_tolerance(2.4), \
             gpytorch.settings.num_trace_samples(2):
             
-            model_out = self.model(full_x, run_gp=True, **kwargs)
+            model_out = self.model(x, run_gp=True, **kwargs)
             loss, metrics = self.objective(
-                model=self.model, x_target=full_x, state_output=model_out.state, 
-                gp_output=model_out.gp_out, gp_target=full_y, **kwargs
+                model=self.model,
+                gp_output=model_out.gp_out, 
+                gp_target=y, 
+                **kwargs
             )
         
         if not torch.isfinite(loss):
@@ -255,7 +256,7 @@ class LangevinTrainer:
         return mean_test_stats
 
     @tracker(experiment="deepkernels")
-    def fit(self, train_loader, full_x, full_y, test_loader=None, warmup_vae_epochs=50, vae_epochs=250, warmup_gp_epochs=50, gp_epochs=200,
+    def fit(self, train_loader, test_loader=None, warmup_vae_epochs=50, vae_epochs=250, warmup_gp_epochs=50, gp_epochs=200,
             em_macro_cycles=8, e_epochs_per_cycle=3, m_epochs_per_cycle=5, joint_epochs=0, **kwargs):
         """
         full_x: [38003, Features] (Your entire dataset tensor)
@@ -330,20 +331,19 @@ class LangevinTrainer:
         import gc
         gc.collect()
         torch.cuda.empty_cache()
-        
         self.orchestrator.train_gp_warmup()
-        self.orchestrator.train_gp_warmup()
-        full_x = full_x.to(self.device, dtype=torch.float64)
-        full_y = full_y.to(self.device, dtype=torch.float64)
         logger.info(f"--- Entering Stage 2: GP Warmup ({warmup_gp_epochs} Epochs) ---")
         for epoch in range(1, warmup_gp_epochs + 1):
             self.model.train()
             self.objective.train()
             self.kwargs['cholesky_jitter'] = 1e-3
-            metrics = self.step_gp(full_x, full_y, **kwargs)
-            epoch_idx = epoch + warmup_vae_epochs + vae_epochs
-            self._log_metrics(epoch_idx, metrics, prefix="gp_warmup")
-            logger.info(f"GP Warmup Epoch {epoch}/{warmup_gp_epochs} | Exact MLL: {metrics.get('loss_gp', 0.0):.4f}")
+            for x, y in train_loader:
+                x = x.to(self.device, dtype=torch.float64)
+                y = y.to(self.device, dtype=torch.float64)
+                metrics = self.step_gp(x, y, **kwargs)
+                epoch_idx = epoch + warmup_vae_epochs + vae_epochs
+                self._log_metrics(epoch_idx, metrics, prefix="gp_warmup")
+                logger.info(f"GP Warmup Epoch {epoch}/{warmup_gp_epochs} | Exact MLL: {metrics.get('loss_gp', 0.0):.4f}")
         mlflow.pytorch.log_model(self.model, "model_stage3_warmup")
         # ==========================================
         # STAGE 3: Full KeOps ExactGP (Hypernetwork Unfrozen)
@@ -355,13 +355,17 @@ class LangevinTrainer:
             self.model.train()
             self.objective.train()
             self.kwargs['cholesky_jitter'] = 3e-4
-            metrics = self.step_gp(full_x, full_y, **kwargs)     
-            epoch_idx = epoch + warmup_vae_epochs + vae_epochs + warmup_gp_epochs
-            self._log_metrics(epoch_idx, metrics, prefix="gp_train")
-            logger.info(f"GP Epoch {epoch}/{gp_epochs} | Exact MLL: {metrics.get('loss_gp', 0.0):.4f}")
+            for x, y in train_loader:
+                x = x.to(self.device, dtype=torch.float64)
+                y = y.to(self.device, dtype=torch.float64)
             
-            if test_loader and epoch % 10 == 0:
-                self.evaluate(test_loader, epoch_idx)
+                metrics = self.step_gp(x, y, **kwargs)     
+                epoch_idx = epoch + warmup_vae_epochs + vae_epochs + warmup_gp_epochs
+                self._log_metrics(epoch_idx, metrics, prefix="gp_train")
+                logger.info(f"GP Epoch {epoch}/{gp_epochs} | Exact MLL: {metrics.get('loss_gp', 0.0):.4f}")
+            
+                if test_loader and epoch % 10 == 0:
+                    self.evaluate(test_loader, epoch_idx)
 
         mlflow.pytorch.log_model(self.model, "model_stage3_full")
         # ==========================================
@@ -392,7 +396,6 @@ class LangevinTrainer:
                     self.model.train()      # <--- ADD THIS
                     self.objective.train()
                     current_epoch += 1 # Step forward in MLflow time
-                    
                     train_stats = defaultdict(float)
                     for x, y in train_loader:
                         x = x.to(self.device, dtype=torch.float64)
@@ -415,31 +418,26 @@ class LangevinTrainer:
                     self.objective.train()
                     
                     current_epoch += 1 # Step forward in MLflow time
-                    
                     self.kwargs['cholesky_jitter'] = 7e-5
-                    metrics = self.step_gp(full_x, full_y, **kwargs)
-                    
-                    # 3. Log the M-Step metrics!
-                    self._log_metrics(current_epoch, metrics, prefix="em_m_step")
-                    logger.info(f"  [M-Step] GP Epoch {m_epoch} | Exact MLL: {metrics.get('loss_gp', 0.0):.4f}")
+                    for x, y in train_loader:
+                        x = x.to(self.device, dtype=torch.float64)
+                        y = y.to(self.device, dtype=torch.float64)
+                        metrics = self.step_gp(x, y, **kwargs)
+    
+                        self._log_metrics(current_epoch, metrics, prefix="em_m_step")
+                        logger.info(f"  [M-Step] GP Epoch {m_epoch} | Exact MLL: {metrics.get('loss_gp', 0.0):.4f}")
             
             mlflow.pytorch.log_model(self.model, "model_stage4_em")
-
-                #-stage 5-#
+        
         if joint_epochs > 0:
             self.orchestrator.train_cyclically() 
-            
             logger.info(f"--- Entering Stage 5: Fully Unfrozen Joint Training ({joint_epochs} Epochs) ---")
-            
             self.kwargs['cholesky_jitter'] = 2e-5
             
             for epoch in range(1, joint_epochs + 1):
                 self.model.train()      
                 self.objective.train()
-                
-                self.adam_optimiser.zero_grad()
-                self.adamw_optimiser.zero_grad()
-                self.langevin_optimiser.zero_grad()
+                train_stats = defaultdict(float)
                 
                 with gpytorch.settings.cholesky_jitter(float(self.kwargs['cholesky_jitter'])), \
                     gpytorch.settings.max_cg_iterations(70), \
@@ -448,28 +446,32 @@ class LangevinTrainer:
                     gpytorch.settings.cg_tolerance(2.4), \
                     gpytorch.settings.num_trace_samples(2):
                         
-                    model_out = self.model(full_x, run_gp=True, **kwargs)
-                    
-                    loss, metrics = self.objective(
-                            model=self.model, x_target=full_x, state_output=model_out.state, 
-                            gp_output=model_out.gp_out, gp_target=full_y, **kwargs
-                    )
-                    
-                if not torch.isfinite(loss):
-                    logger.warning("NaN/Inf loss detected in Joint Training. Skipping epoch.")
-                    continue
-                
-                loss.backward()
-                
-                torch.nn.utils.clip_grad_norm_(self.adamw_params + self.adam_params + self.langevin_params, 1.0)
-                
-                self.adam_optimiser.step()
-                self.adamw_optimiser.step()
-                self.langevin_optimiser.step()
-                
+                        for x, y in train_loader:
+                            # 1. Zero grads INSIDE the loop
+                            self.adam_optimiser.zero_grad()
+                            self.adamw_optimiser.zero_grad()
+                            self.langevin_optimiser.zero_grad()
+                            
+                            x = x.to(self.device, dtype=torch.float64)
+                            y = y.to(self.device, dtype=torch.float64)
+                            model_out = self.model(x, run_gp=True, **kwargs)
+                            loss, metrics = self.objective(self.model, model_out.gp_out, y, **kwargs)
+                            
+                            if not torch.isfinite(loss):
+                                logger.warning("NaN/Inf loss detected. Skipping batch.")
+                                continue
+                            loss.backward()
+                            torch.nn.utils.clip_grad_norm_(self.adamw_params + self.adam_params + self.langevin_params, 1.0)
+                            
+                            self.adam_optimiser.step()
+                            self.adamw_optimiser.step()
+                            self.langevin_optimiser.step()
+                            
+                            for k, v in metrics.items(): train_stats[k] += v
+                mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()}
                 current_epoch_idx = epoch + warmup_vae_epochs + vae_epochs + warmup_gp_epochs + gp_epochs
-                self._log_metrics(current_epoch_idx, metrics, prefix="joint")
-                logger.info(f"Joint Epoch {epoch}/{joint_epochs} | Total Joint Loss: {metrics.get('loss_total', float('nan')):.4f}")
+                self._log_metrics(current_epoch_idx, mean_train_stats, prefix="joint")
+                logger.info(f"Joint Epoch {epoch}/{joint_epochs} | Total Loss: {mean_train_stats.get('loss_total', float('nan')):.4f}")
 
         self.save_checkpoint("deepkernels_model.pth")
         mlflow.pytorch.log_model(self.model, "deepkernels_model")

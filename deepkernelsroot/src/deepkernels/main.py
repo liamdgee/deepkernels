@@ -16,12 +16,8 @@ import sys
 
 # --- Internal imports ---
 from deepkernels.models.model import StateSpaceKernelProcess
-from deepkernels.train.trainer import ParameterIsolate
 from deepkernels.train.langevin_trainer import LangevinTrainer
 from deepkernels.preprocess.pipe import DataOrchestrator
-from deepkernels.models.exactgp import Simple
-from deepkernels.models.variationalautoencoder import SpectralVAE
-from deepkernels.train.exact_objective import ExactObjective
 
 import os
 if 'CONDA_PREFIX' in os.environ:
@@ -173,6 +169,21 @@ def parse_args():
     # ==========================================
     # --- Numerical Stability & Bounds ---
     # ==========================================
+    
+    # --- Variational/Dirichlet Bounds ---
+    parser.add_argument("--sigma_lower_bound", type=float, default=1e-4, help="Lower bound clamp for latent sigma")
+    parser.add_argument("--sigma_upper_bound", type=float, default=5.0, help="Upper bound clamp for latent sigma")
+    parser.add_argument("--mu_lower_bound", type=float, default=-17.0, help="Lower bound clamp for latent mu")
+    parser.add_argument("--mu_upper_bound", type=float, default=17.0, help="Upper bound clamp for latent mu")
+    
+    # --- Clipping & Scaling ---
+    parser.add_argument("--eps_clip", type=float, default=2.7, help="Gradient/Value clipping threshold")
+    parser.add_argument("--psi_scale", type=float, default=1.0, help="Scaling factor for digamma/psi functions")
+    
+    # --- Extreme Numerical Tolerances ---
+    parser.add_argument("--stick_breaking_epsilon", type=float, default=3e-3, help="Epsilon for Kumaraswamy/Dirichlet stick-breaking")
+    parser.add_argument("--uniform_dist_clamp", type=float, default=5e-5, help="Clamp for uniform distribution sampling")
+    parser.add_argument("--tiny_eps", type=float, default=3e-8, help="Absolute minimum epsilon to prevent log(0) and div/0")
     parser.add_argument("--dropout", type=float, default=0.05, help="Dropout probability")
     parser.add_argument("--jitter", type=float, default=1e-6, help="General numerical stability jitter")
     parser.add_argument("--cholesky_jitter", type=float, default=1e-3, help="for use in langevin trainer")
@@ -225,48 +236,15 @@ def main():
         num_workers=args.num_workers
     )
 
-    # ---------------------------------------------------------
-    #-- Extract Full Dataset for ExactGP-#
-    # ---------------------------------------------------------
-    logger.info("Extracting full dataset into memory for KeOps ExactGP...")
-    all_x, all_y = [], []
-    for x, y in train_loader:
-        all_x.append(x)
-        all_y.append(y)
-        
-    full_x = torch.cat(all_x, dim=0).to(device=device, dtype=torch.float64)
-    full_y = torch.cat(all_y, dim=0).to(device=device, dtype=torch.float64)
-    
-    N = full_x.size(0)
-    if full_y.dim() == 2 and full_y.size(1) == 30:
-        full_y = full_y.t().contiguous()
-    
-    logger.info(f"Full dataset extracted. N={N}. Target shape: {full_y.shape}")
-
+    N = len(train_loader.dataset)
     args.n_data = N
+    logger.info(f"Dataset loaded. Total training samples (N) = {N}")
 
     # ---------------------------------------------------------
     #-- init ExactGP & model -- #
     # ---------------------------------------------------------
-    logger.info("Building KeOps ExactGP and StateSpaceKernelProcess...")
-    dummy_x = torch.arange(N, dtype=torch.float64, device=device)
-    
-    logger.info("Initializing Gaussian Likelihood...")
-    
-    likelihood = gpytorch.likelihoods.GaussianLikelihood(
-        batch_shape=torch.Size([args.num_latents]), 
-        noise_constraint=gpytorch.constraints.GreaterThan(args.min_noise)
-    ).to(device=device, dtype=torch.float64)
-
-    gp = Simple(
-        train_x=dummy_x, 
-        train_y=full_y, 
-        likelihood=likelihood,
-        num_latents=args.num_latents
-    ).to(device=device, dtype=torch.float64)
-    #-could argparse atoms and latents obviously, but this will break the entire model
-    
-    model = StateSpaceKernelProcess(gp=gp, **vars(args)).to(device=device, dtype=torch.float64)
+    logger.info("Building StateSpaceKernelProcess...")
+    model = StateSpaceKernelProcess(**vars(args)).to(device=device, dtype=torch.float64)
 
     trainer = LangevinTrainer(
         model=model,
@@ -274,9 +252,7 @@ def main():
         **vars(args)
     )
 
-    # --- Training ---
-    logger.info("Starting Experiment. Check MLflow dashboard for live metrics!")
-    
+    # --- Training -#
     experiment_name = config['logging'].get('experiment_name', "deep-kernels")
     mlflow.set_experiment(experiment_name)
 
@@ -284,9 +260,7 @@ def main():
         logger.info("Starting Experiment. Check MLflow dashboard for live metrics!")
         mlflow.log_dict(config, "config.yaml")
         trainer.fit(
-            train_loader=train_loader, 
-            full_x=full_x, 
-            full_y=full_y, 
+            train_loader=train_loader,
             test_loader=val_loader,
             warmup_vae_epochs=args.warmup_vae_epochs,
             vae_epochs=args.vae_epochs,

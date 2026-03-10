@@ -368,23 +368,25 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
 class ProbabilisticMixtureMean(gpytorch.means.Mean):
     def __init__(self, batch_shape=torch.Size([]), **kwargs):
         super().__init__()
-        self.num_experts = kwargs.get("num_experts", 8)
-        self.k_atoms = kwargs.get("k_atoms", 30)
+        self.k_atoms = kwargs.get("k_atoms", 30) #--this is an unncessary headache but it expects k_atoms=30
         self.register_parameter(
             name="cluster_constants", 
-            parameter=torch.nn.Parameter(torch.randn(self.k_atoms, *batch_shape) * 0.1)
+            parameter=torch.nn.Parameter(torch.randn(30, self.k_atoms, *batch_shape) * 0.1)
         )
 
     def forward(self, x, **params):
-        target_shape = x.shape[:-1] 
-        pi = params.get("pi", None)
-        if pi is not None and len(target_shape) > 2:
-            c_transposed = self.cluster_constants.movedim(0, -1).unsqueeze(-2)
-            latent_means = (pi * c_transposed).sum(dim=-1)
-            return latent_means
-        else:
-            return torch.zeros(target_shape, device=x.device)
-        
+        """
+        x shape: [num_latents, ..., N, 198]
+        """
+        target_shape = x.shape[:-1]
+        pi = x[..., 168: 198]
+        c_T = self.cluster_constants.t() 
+        for _ in range(pi.dim() - c_T.dim()):
+            c_T = c_T.unsqueeze(-2)
+        latent_means = (pi * c_T).sum(dim=-1)
+        return latent_means
+
+
 class CustomLaplacePrior(Prior):
     def __init__(self, loc, scale, validate_args=False, **kwargs):
         super().__init__(validate_args=validate_args, **kwargs)

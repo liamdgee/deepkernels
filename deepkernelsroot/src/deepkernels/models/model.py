@@ -12,23 +12,55 @@ if 'CONDA_PREFIX' in os.environ:
 from tqdm import tqdm
 
 from deepkernels.models.variationalautoencoder import SpectralVAE, StateSpaceOutput
-from deepkernels.models.exactgp import Simple
+from deepkernels.models.gaussianprocess import AcceleratedKernelGP
 from deepkernels.models.NKN import GPParams
 from typing import NamedTuple, Optional
 
 class ModelOutput(NamedTuple):
-    state: DecoderStateOutput
+    state: StateSpaceOutput
     gp_out: Optional[gpytorch.distributions.MultivariateNormal]
     gp_in: torch.Tensor
 
 class StateSpaceKernelProcess(BaseGenerativeModel):
-    def __init__(self, vae=None, gp=None, run_gp:bool=False, **kwargs):
+    def __init__(self, vae=None, likelihood=None, gp=None, run_gp:bool=False, **kwargs):
         super().__init__()
         self.vae = vae if vae is not None else SpectralVAE(**kwargs)
-        self.gp = gp if gp else None
-        self.kwargs = kwargs
-        self.run_gp = run_gp if run_gp is not None else False
+        min_noise = kwargs.get("min_noise", 3e-4)
+        num_latents = kwargs.get("num_latents", 8)
+        if likelihood is not None:
+            self.likelihood = likelihood
+        else:
+            self.likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.k_atoms)
         
+        self.run_gp = run_gp
+        if gp is not None:
+            self.gp = gp
+        else:
+            self.gp = AcceleratedKernelGP(
+                likelihood=self.likelihood, 
+                k_atoms=self.k_atoms, 
+                num_latents=self.num_latents,
+                **kwargs
+            )
+
+        self.kwargs = kwargs
+    
+    def pack_features(self, gp_params, pi):
+        """Safely pool any 4D tensors to 3D and concatenate the 198D payload."""
+        def process_param(p):
+            return p.mean(dim=2) if p.dim() == 4 else p
+
+        packed = torch.cat([
+            process_param(gp_params.gates), 
+            process_param(gp_params.linear), 
+            process_param(gp_params.periodic), 
+            process_param(gp_params.rational), 
+            process_param(gp_params.polynomial), 
+            process_param(gp_params.matern),
+            pi
+        ], dim=-1)
+        
+        return packed.contiguous()
 
     def forward(self, x, vae_out=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         batch_size = x.size(0)
@@ -48,43 +80,19 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
         if features_only:
             return state
         
-        gp_in = state.gp_params
         
-        gp_features = torch.cat([gp_in.gates, gp_in.linear, gp_in.periodic, gp_in.rational, gp_in.polynomial, gp_in.matern], dim=-1)
-
-        if isinstance(gp_in, tuple):
-            gp_in = gp_in[0]
-        
-        gp_in = gp_in.contiguous()
+        gp_features = self.pack_features(state.gp_params, state.pi)
+        lmc_learned = state.lmc_matrices
         
         mvn = None
         if self.gp is not None and self.run_gp:
-            gp_kwargs = {
-                "gp_params": state.gp_params,
-                "pi": state.pi
-            }
-
-            mvn = self.gp(gp_in, **gp_kwargs)
+            
+            mvn = self.gp(gp_features, x=gp_features, lmc_learned=lmc_learned)
         
         return ModelOutput(
             state=state,
             gp_out=mvn, 
-            gp_in=gp_in
+            gp_in=gp_features #-dim 168
         )
     
-    def pack_gp_features(self, hyperparams):
-        """
-        Takes the structured GPParams and flattens them into a single 
-        168-dimensional tensor for the Gaussian Process.
-        """
-        param_keys = ['gates', 'linear', 'periodic', 'rational', 'polynomial', 'matern']
-        pooled_params = []
-
-        for k in param_keys:
-            val = getattr(hyperparams, k)
-            if val.dim() == 4:
-                val = val.mean(dim=2)
-                
-            pooled_params.append(val)
-        
-        return torch.cat(pooled_params, dim=-1)
+    

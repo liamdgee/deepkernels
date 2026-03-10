@@ -9,6 +9,7 @@ import torch.distributions as dist
 import math
 import logging
 from typing import Union, Optional, Dict, Tuple, TypeAlias, Union
+import pykeops
 
 import torch
 from torch.distributions import LowRankMultivariateNormal, Independent, Normal, kl_divergence
@@ -154,6 +155,12 @@ class BaseGenerativeModel(gpytorch.Module):
             safe_target,
             torch.log(torch.expm1(safe_target))
         )
+    
+    def clear_pkeops(self):
+        pykeops.clean_pykeops()
+        pykeops.config.cuda_standalone = True
+        pykeops.config.use_OpenMP = False
+
     @staticmethod
     def init_inducing_with_omega(
         omega: torch.Tensor, 
@@ -273,3 +280,14 @@ class BaseGenerativeModel(gpytorch.Module):
         sequences = sequences.transpose(1, 2)
         
         return sequences
+
+    class LossTerm(gpytorch.mlls.AddedLossTerm):
+        """
+        A concrete implementation of an AddedLossTerm that simply 
+        returns a pre-calculated scalar tensor.
+        """
+        def __init__(self, loss_tensor):
+            self.loss_tensor = loss_tensor
+            
+        def loss(self):
+            return self.loss_tensor
