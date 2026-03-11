@@ -40,7 +40,7 @@ class EvidenceLowerBound(nn.Module):
         if self.kl_weights is None:
             self.kl_weights = base_kl_weights
     
-    def forward(self, model, gp_output, gp_target, **kwargs):
+    def forward(self, model, gp_output, gp_target, global_step=None, annealers=None, **kwargs):
         """
         Args:
             model: overarching SpectralVAE model (to pull added loss terms).
@@ -71,18 +71,35 @@ class EvidenceLowerBound(nn.Module):
                 total_vae_loss = total_vae_loss + recon_loss
                 kl_metrics[f'loss_{name}'] = recon_loss.item()
                 continue
-            
-            weight = self.kl_weights.get(name, 1.0)
-            for key, val in self.kl_weights.items():
-                if key in name:
-                    weight = val
-                    break
+            base_weight = self.kl_weights.get(name, 1.0)
+            current_beta = 1.0
+            if annealers is not None and global_step is not None:
+                if name in annealers:
+                    current_beta = annealers[name].get_beta(global_step)
                 
-            scaled_kl = weight * raw_loss
+                elif 'divergence' in name:
+                    target = 'global_divergence' if 'global' in name else 'local_divergence'
+                    annealer = annealers.get(target)
+                    if annealer:
+                        current_beta = annealer.get_beta(global_step)
+                        
+                elif 'kl' in name:
+                    target = 'alpha_kl' if 'alpha' in name else 'lengthscale_kl'
+                    annealer = annealers.get(target)
+                    if annealer:
+                        current_beta = annealer.get_beta(global_step)
+                        
+                elif 'inverse_wishart' in name:
+                    annealer = annealers.get('inverse_wishart')
+                    if annealer:
+                        current_beta = annealer.get_beta(global_step)
+                
+            scaled_kl = base_weight * current_beta * raw_loss
             kl_sum = kl_sum + scaled_kl
             total_vae_loss = total_vae_loss + scaled_kl
             
             kl_metrics[f'loss_{name}'] = raw_loss.item()
+            kl_metrics[f'beta_{name}'] = current_beta
         
         
         # --- GP Marginal Log Likelihood (Variational ELBO)-- negative for gradient descent --- #

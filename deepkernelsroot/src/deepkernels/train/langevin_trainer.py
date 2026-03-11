@@ -127,14 +127,14 @@ class LangevinTrainer:
             if torch.backends.mps.is_available() and torch.backends.mps.is_built():
                 return torch.device('mps')
             return torch.device('cpu')
-    def step_vae(self, x, **kwargs):
+    def step_vae(self, x, global_step, annealers, **kwargs):
         """Standard mini-batch step for Stage 1."""
         self.adamw_optimiser.zero_grad()
         self.langevin_optimiser.zero_grad()
-        
+        current_noise = annealers['global_divergence'].get_noise(global_step)
         state= self.model(x, run_gp=False, **kwargs) 
         loss, metrics = self.objective(
-            model=self.model,
+            model=self.model, global_step=global_step, annealers=annealers,
             gp_output=None, gp_target=None, **kwargs
         )
 
@@ -154,7 +154,7 @@ class LangevinTrainer:
         
         return metrics
 
-    def step_gp(self, x, y, **kwargs):
+    def step_gp(self, x, y, annealers, global_step, **kwargs):
         """Full-batch exact step for Stage 2."""
         self.adam_optimiser.zero_grad()
         
@@ -171,7 +171,9 @@ class LangevinTrainer:
             loss, metrics = self.objective(
                 model=self.model,
                 gp_output=model_out.gp_out, 
-                gp_target=y, 
+                gp_target=y,
+                global_step=global_step,
+                annealers=annealers,
                 **kwargs
             )
         
@@ -263,13 +265,30 @@ class LangevinTrainer:
         full_y: [30, 38003] (Your entire targets tensor)
         """
         logger.info(f"Starting Two-Stage Training on {self.device}")
-        
+        total_steps_vae = (warmup_vae_epochs + vae_epochs) * len(train_loader)
+        total_steps_gp = warmup_gp_epochs + gp_epochs
+        iw_stop_beta = self.kwargs.get('iw_stop_beta', 0.1)
+        vae_annealers = {
+            "global_divergence": StochasticAnnealer(total_steps_vae, n_cycles=4, ratio=0.5, stop_beta=0.15, noise_scale=0.01),
+            "local_divergence": StochasticAnnealer(total_steps_vae, n_cycles=4, ratio=0.5, stop_beta=0.11, noise_scale=0.01),
+            "alpha_kl": StochasticAnnealer(total_steps_vae, n_cycles=1, ratio=0.2, stop_beta=0.15, noise_scale=0.0),
+            "lengthscale_kl": StochasticAnnealer(total_steps_vae, n_cycles=1, ratio=0.2, stop_beta=0.125, noise_scale=0.0),
+            "inverse_wishart": StochasticAnnealer(total_steps_vae, n_cycles=1, ratio=0.2, stop_beta=iw_stop_beta, noise_scale=0.01)
+        }
+        gp_annealers = {
+            "global_divergence": StochasticAnnealer(total_steps_gp, n_cycles=1, ratio=0.02, stop_beta=1.0, noise_scale=0.0),
+            "local_divergence": StochasticAnnealer(total_steps_gp, n_cycles=1, ratio=0.03, stop_beta=1.0, noise_scale=0.0),
+            "alpha_kl": StochasticAnnealer(total_steps_gp, n_cycles=1, ratio=0.45, stop_beta=1.0, noise_scale=0.0),
+            "lengthscale_kl": StochasticAnnealer(total_steps_gp, n_cycles=1, ratio=0.45, stop_beta=1.0, noise_scale=0.0),
+            "inverse_wishart": StochasticAnnealer(total_steps_gp, n_cycles=1, ratio=0.075, stop_beta=iw_stop_beta, noise_scale=0.0)
+        }
         # ==========================================
         # STAGE 1 (warmup): Train the VAE alone
         # ==========================================
         #-WARMUP EPOCHS-#
 
         logger.info(f"--- Entering Stage 0: VAE Warmup ({warmup_vae_epochs} Epochs) ---")
+        vae_steps = 0
         for epoch in range(1, warmup_vae_epochs + 1):
             self.model.train()
             self.objective.train()
@@ -278,9 +297,11 @@ class LangevinTrainer:
             for x, y in train_loader:
                 x = x.to(self.device, dtype=torch.float64)
                 y = y.to(self.device, dtype=torch.float64)
+                vae_steps += 1
+                metrics = self.step_vae(x, annealers=vae_annealers, global_step=vae_steps, **kwargs) 
+                for k, v in metrics.items(): 
+                    train_stats[k] += v
                 
-                metrics = self.step_vae(x, **kwargs) 
-                for k, v in metrics.items(): train_stats[k] += v
                     
             mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()}
             self._log_metrics(epoch, mean_train_stats, prefix="warmup")
@@ -291,19 +312,7 @@ class LangevinTrainer:
         # STAGE 2: Train the VAE (Mini-Batches) with dirichlet module
         # ==========================================
         self.orchestrator.train_vae_and_dirichlet()
-        total_steps = vae_epochs * len(train_loader)
-        iw_stop_beta = self.kwargs.get('iw_stop_beta', 0.1)
-
-        annealers = {
-            "global_divergence": StochasticAnnealer(total_steps, n_cycles=4, ratio=0.5, stop_beta=0.1, noise_scale=0.01),
-            "local_divergence": StochasticAnnealer(total_steps, n_cycles=4, ratio=0.5, stop_beta=0.1, noise_scale=0.01),
-            "alpha_kl": StochasticAnnealer(total_steps, n_cycles=1, ratio=0.2, stop_beta=1.0, noise_scale=0.0),
-            "lengthscale_kl": StochasticAnnealer(total_steps, n_cycles=1, ratio=0.2, stop_beta=1.0, noise_scale=0.0),
-            "inverse_wishart": StochasticAnnealer(total_steps, n_cycles=1, ratio=0.2, stop_beta=iw_stop_beta, noise_scale=0.0)
-        }
-
         logger.info("--- Entering Stage 1 (Full): VAE Training ---")
-        global_step = 0
         for epoch in range(1, vae_epochs + 1):
             self.model.train()
             self.objective.train()
@@ -311,12 +320,11 @@ class LangevinTrainer:
             for x, y in train_loader:
                 x = x.to(self.device, dtype=torch.float64)
                 y = y.to(self.device, dtype=torch.float64)
-                current_kl_weights = {name: annealer(global_step) for name, annealer in annealers.items()}
-                self.objective.kl_weights = current_kl_weights
-                metrics = self.step_vae(x, **kwargs) 
+                vae_steps += 1
+                metrics = self.step_vae(x, global_step=vae_steps, annealers=vae_annealers, **kwargs) 
                 for k, v in metrics.items(): 
                     train_stats[k] += v
-                global_step += 1
+                
             
             mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()}
             self._log_metrics(epoch + warmup_vae_epochs, mean_train_stats, prefix="vae_train")
@@ -333,6 +341,7 @@ class LangevinTrainer:
         torch.cuda.empty_cache()
         self.orchestrator.train_gp_warmup()
         logger.info(f"--- Entering Stage 2: GP Warmup ({warmup_gp_epochs} Epochs) ---")
+        gp_steps = 0
         for epoch in range(1, warmup_gp_epochs + 1):
             self.model.train()
             self.objective.train()
@@ -340,7 +349,8 @@ class LangevinTrainer:
             for x, y in train_loader:
                 x = x.to(self.device, dtype=torch.float64)
                 y = y.to(self.device, dtype=torch.float64)
-                metrics = self.step_gp(x, y, **kwargs)
+                gp_steps += 1
+                metrics = self.step_gp(x, y, annealers=gp_annealers, global_step=gp_steps, **kwargs)
                 epoch_idx = epoch + warmup_vae_epochs + vae_epochs
                 self._log_metrics(epoch_idx, metrics, prefix="gp_warmup")
                 logger.info(f"GP Warmup Epoch {epoch}/{warmup_gp_epochs} | Exact MLL: {metrics.get('loss_gp', 0.0):.4f}")
@@ -358,8 +368,8 @@ class LangevinTrainer:
             for x, y in train_loader:
                 x = x.to(self.device, dtype=torch.float64)
                 y = y.to(self.device, dtype=torch.float64)
-            
-                metrics = self.step_gp(x, y, **kwargs)     
+                gp_steps += 1
+                metrics = self.step_gp(x, y, global_step=gp_steps, annealers=gp_annealers, **kwargs)     
                 epoch_idx = epoch + warmup_vae_epochs + vae_epochs + warmup_gp_epochs
                 self._log_metrics(epoch_idx, metrics, prefix="gp_train")
                 logger.info(f"GP Epoch {epoch}/{gp_epochs} | Exact MLL: {metrics.get('loss_gp', 0.0):.4f}")
@@ -373,14 +383,6 @@ class LangevinTrainer:
         # ==========================================
         if em_macro_cycles > 0:
             logger.info(f"--- Entering Stage 4: E-M Cyclical Refinement ({em_macro_cycles} Macro-Cycles) ---")
-            
-            self.objective.kl_weights = {
-                "global_divergence": 0.1, 
-                "local_divergence": 0.1, 
-                "alpha_kl": 1.0, 
-                "lengthscale_kl": 1.0,
-                "inverse_wishart": self.kwargs.get('iw_stop_beta', 0.1)
-            }
 
             current_epoch = warmup_vae_epochs + vae_epochs + warmup_gp_epochs + gp_epochs
 
@@ -391,7 +393,8 @@ class LangevinTrainer:
                 # E-Step: Refine Latent Representations (Mini-Batches)
                 # --------------------------------------------------
                 self.orchestrator.train_vae_and_dirichlet() # GP Frozen
-                
+                e_steps = 0
+                m_steps = 0
                 for e_epoch in range(1, e_epochs_per_cycle + 1):
                     self.model.train()      # <--- ADD THIS
                     self.objective.train()
@@ -400,7 +403,8 @@ class LangevinTrainer:
                     for x, y in train_loader:
                         x = x.to(self.device, dtype=torch.float64)
                         y = y.to(self.device, dtype=torch.float64)
-                        metrics = self.step_vae(x, **kwargs) 
+                        e_steps += 1
+                        metrics = self.step_vae(x, annealers=vae_annealers, global_step=e_steps, **kwargs) 
                         for k, v in metrics.items(): train_stats[k] += v
                     
                     mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()}
@@ -422,13 +426,14 @@ class LangevinTrainer:
                     for x, y in train_loader:
                         x = x.to(self.device, dtype=torch.float64)
                         y = y.to(self.device, dtype=torch.float64)
-                        metrics = self.step_gp(x, y, **kwargs)
+                        m_steps += 1
+                        metrics = self.step_gp(x, y, annealers=gp_annealers, global_step=m_steps, **kwargs)
     
                         self._log_metrics(current_epoch, metrics, prefix="em_m_step")
                         logger.info(f"  [M-Step] GP Epoch {m_epoch} | Exact MLL: {metrics.get('loss_gp', 0.0):.4f}")
             
             mlflow.pytorch.log_model(self.model, "model_stage4_em")
-        
+        cycles = 0
         if joint_epochs > 0:
             self.orchestrator.train_cyclically() 
             logger.info(f"--- Entering Stage 5: Fully Unfrozen Joint Training ({joint_epochs} Epochs) ---")
@@ -451,11 +456,11 @@ class LangevinTrainer:
                             self.adam_optimiser.zero_grad()
                             self.adamw_optimiser.zero_grad()
                             self.langevin_optimiser.zero_grad()
-                            
+                            cycles += 1
                             x = x.to(self.device, dtype=torch.float64)
                             y = y.to(self.device, dtype=torch.float64)
                             model_out = self.model(x, run_gp=True, **kwargs)
-                            loss, metrics = self.objective(self.model, model_out.gp_out, y, **kwargs)
+                            loss, metrics = self.objective(self.model, model_out.gp_out, y, annealers=gp_annealers, global_step=cycles, **kwargs)
                             
                             if not torch.isfinite(loss):
                                 logger.warning("NaN/Inf loss detected. Skipping batch.")
