@@ -30,9 +30,9 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
 
     def __init__(self, batch_shape=torch.Size([]), **kwargs):
         super().__init__(batch_shape=batch_shape, **kwargs)
-        self.kwargs = kwargs
-        self.kernels_out = self.kwargs.get('kernels_out', 32)
-        self.individual_kernel_input_dim = self.kwargs.get('individual_kernel_input_dim', 32)
+        kwargs.pop('config', None)
+        self.kernels_out = kwargs.get('kernels_out', 32)
+        self.individual_kernel_input_dim = kwargs.get('individual_kernel_input_dim', 32)
         self.base_kernel = RBFKernel(batch_shape=batch_shape)
         self.batch_shape = batch_shape
 
@@ -329,7 +329,7 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
 class ProbabilisticMixtureMean(gpytorch.means.Mean):
     def __init__(self, batch_shape=torch.Size([]), **kwargs):
         super().__init__()
-        self.k_atoms = kwargs.get("k_atoms", 30) #--this is an unncessary headache but it expects k_atoms=30
+        self.k_atoms = 30
         self.register_parameter(
             name="cluster_constants", 
             parameter=torch.nn.Parameter(torch.randn(30, self.k_atoms, *batch_shape) * 0.1)
@@ -350,19 +350,29 @@ class ProbabilisticMixtureMean(gpytorch.means.Mean):
 
 class CustomLaplacePrior(Prior):
     def __init__(self, loc, scale, validate_args=False, **kwargs):
-        super().__init__(validate_args=validate_args, **kwargs)
-        # Register as buffers so .to("cuda") and .type() work correctly
-        self.register_buffer("loc_val", torch.as_tensor(loc, dtype=torch.float32))
-        self.register_buffer("scale_val", torch.as_tensor(scale, dtype=torch.float32))
+        super().__init__(batch_shape=torch.Size([]), validate_args=validate_args, **kwargs)
+        # Register values as buffers to handle device/dtype moves automatically
+        self.register_buffer("loc_val", torch.as_tensor(loc))
+        self.register_buffer("scale_val", torch.as_tensor(scale))
 
     def log_prob(self, parameter):
-        return Laplace(self.loc_val, self.scale_val).log_prob(parameter)
+        # Create the distribution locally, use it, then let it be garbage collected
+        dist_obj = Laplace(self.loc_val, self.scale_val)
+        return dist_obj.log_prob(parameter)
 
     def rsample(self, sample_shape=torch.Size()):
-        return Laplace(self.loc_val, self.scale_val).rsample(sample_shape)
+        dist_obj = Laplace(self.loc_val, self.scale_val)
+        return dist_obj.rsample(sample_shape)
     
+    def __repr__(self):
+        return f"CustomLaplacePrior(loc={self.loc_val.item()}, scale={self.scale_val.item()})"
+
     @property
     def loc(self): return self.loc_val
 
     @property
     def scale(self): return self.scale_val
+    
+    @property
+    def arg_constraints(self):
+        return {}

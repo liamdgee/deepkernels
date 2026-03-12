@@ -37,15 +37,15 @@ class DynamicStrategy(gpytorch.variational.LMCVariationalStrategy):
         return self.lmc_coefficients_parameter
 
 class AcceleratedKernelGP(gpytorch.models.ApproximateGP):
-    def __init__(self, likelihood, inducing=None, k_atoms=30, num_latents=8, kernel_features_dim=198, **params):
+    def __init__(self, likelihood, inducing=None, k_atoms=30, num_latents=8, kernel_features_dim=198):
         """
         'Physics Anchor' with KeOps Optimised Kernel
         Args:
             inducing_points: (M, D) tensor of initial inducing point locations.
         """
-
         #-inducing points-#
-        base_inducing_points = params.get("inducing_points", torch.randn(256, kernel_features_dim))
+        
+        base_inducing_points = torch.randn(256, kernel_features_dim)
         base_inducing_points = inducing if inducing is not None else base_inducing_points
         num_inducing = base_inducing_points.size(0)
         
@@ -67,7 +67,7 @@ class AcceleratedKernelGP(gpytorch.models.ApproximateGP):
         
         self.covar_module = GenerativeKernel(batch_shape=latent_batch_shape)
 
-    def forward(self, x, lmc_learned=None, diag=None, indices=None, **kwargs):
+    def forward(self, x, xval=None, lmc_learned=None, diag=None, indices=None, **kwargs):
         """
         x: The PACKED feature tensor [..., N, 168] coming from the decoder.
         kwargs: Contains 'pi' for the Mixture Mean.
@@ -82,8 +82,11 @@ class AcceleratedKernelGP(gpytorch.models.ApproximateGP):
 
         xc = x.contiguous()
         
-        mean_x = self.mean_module(xc, **kwargs)
+        mean_x = self.mean_module(xc)
         
-        covar_x = self.covar_module(xc, xc, **kwargs)
+        if xval is not None:
+            covar_x = self.covar_module(xc, xval.contiguous())
+        else:
+            covar_x = self.covar_module(xc, xc)
         
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)

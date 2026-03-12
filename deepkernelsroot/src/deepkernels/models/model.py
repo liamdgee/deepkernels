@@ -28,11 +28,9 @@ class ModelOutput(NamedTuple):
     gp_in: torch.Tensor
 
 class StateSpaceKernelProcess(BaseGenerativeModel):
-    def __init__(self, vae=None, likelihood=None, gp=None, run_gp:bool=False, **kwargs):
+    def __init__(self, likelihood=None, gp=None, run_gp:bool=False, k_atoms=30, min_noise=1e-3):
         super().__init__()
-        self.vae = vae if vae is not None else SpectralVAE(**kwargs)
-        k_atoms = kwargs.get("k_atoms", 30)
-        min_noise = kwargs.get("min_noise", 1e-3)
+        self.vae = SpectralVAE()
         if likelihood is not None:
             self.likelihood = likelihood
         else:
@@ -40,14 +38,11 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
         
         self.run_gp = run_gp
         if gp is not None:
-            self.gp = gp
+            self.gp = gp(likelihood=self.likelihood)
         else:
             self.gp = AcceleratedKernelGP(
-                likelihood=self.likelihood,
-                **kwargs
+                likelihood=self.likelihood
             )
-
-        self.kwargs = kwargs
     
     def pack_features(self, gp_params, pi):
         """Safely pool any 4D tensors to 3D and concatenate the 198D payload."""
@@ -69,8 +64,6 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
     def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         batch_size = x.size(0)
         steps = steps if steps is not None else 3
-
-        updated_params = {**params, "indices": indices}
         if vae_out is None:
             vae_out = self.vae.get_zero_state(x, x.device, batch_size=batch_size)
         
@@ -81,8 +74,7 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
             vae_out=vae_out,
             steps=steps,
             batch_shape=batch_shape,
-            indices=indices,
-            **params
+            indices=indices
         )
         
         if features_only:
@@ -95,13 +87,12 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
         mvn = None
 
         if self.gp is not None and self.run_gp:
-            mvn = self.gp(gp_features, x=gp_features, lmc_learned=lmc_learned, indices=indices, **self.kwargs)
+            mvn = self.gp(gp_features, x=gp_features, lmc_learned=lmc_learned, indices=indices)
         
         return ModelOutput(
             state=state,
             gp_out=mvn, 
-            gp_in=gp_features,
-            **updated_params
+            gp_in=gp_features
         )
     
     

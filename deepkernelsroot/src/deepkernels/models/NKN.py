@@ -3,9 +3,12 @@ import torch.nn as nn
 import math
 import torch.nn.utils.parametrizations as P
 import torch.nn.functional as F
-from deepkernels.models.parent import BaseGenerativeModel
 import gpytorch
 from typing import Optional, Any, NamedTuple
+
+
+from deepkernels.models.parent import BaseGenerativeModel
+from deepkernels.models.dirichlet import DirichletConfig
 
 class GPParams(NamedTuple):
     gates: torch.Tensor
@@ -28,13 +31,13 @@ class SafeSoftplus(nn.Module):
 
 class KernelNetwork(BaseGenerativeModel):
     def __init__(self,
-                 **kwargs):
+                 config=None):
         super().__init__()
-        self.kwargs = kwargs
-        self.bottleneck_dim = self.kwargs.get("bottleneck_dim", 64)
-        self.spectral_emb_dim = self.kwargs.get("spectral_emb_dim", 2048)
-        self.individual_kernel_dim_out = self.kwargs.get("individual_kernel_dim_out", 32)
-        self.num_primitives = self.kwargs.get("num_primitives", 5)
+        self.config = config if config else DirichletConfig()
+        self.bottleneck_dim = self.config.bottleneck_dim
+        self.spectral_emb_dim = self.config.spectral_emb_dim
+        self.individual_kernel_dim_out = self.config.individual_kernel_dim_out
+        self.num_primitives = self.config.num_primitives
         
         
         self.primitives_total_dim = self.num_primitives * self.individual_kernel_dim_out # 8 * 32 = 160

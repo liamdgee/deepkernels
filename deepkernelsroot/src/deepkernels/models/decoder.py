@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class StateSpaceOutput(NamedTuple):
+class DecoderOutput(NamedTuple):
     gp_params: GPParams
     bottleneck: torch.Tensor
     alpha: torch.Tensor
@@ -40,42 +40,64 @@ class StateSpaceOutput(NamedTuple):
     lmc_matrices: torch.Tensor
     real_x: torch.Tensor
 
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+@dataclass
+class DecoderConfig:
+    # --- Dimensions & Architecture ---
+    latent_dim: int = 16
+    input_dim: int = 30
+    bottleneck_dim: int = 64
+    k_atoms: int = 30
+    alpha_factor_rank: int = 3
+    num_fourier_features: int = 128
+    spectral_emb_dim: int = 2048
+    num_latents: int = 8
+    num_experts: int = 8
+    n_data: float = 76674.0
+    alpha_factor_rank: int = 3
+    spectral_compressions: List[int] = field(default_factory=lambda: [1024, 512, 128, 64])
+    dropout: float = 0.05
+    beta: float = 1.0
+    jitter: float = 1e-6
+    eps: float = 1e-3
+    large_eps: float = 4e-2
+    min_ls: float = 0.05
+    max_ls: float = 15.0
+    conc_clamp: float = 30.0
+
 class SpectralDecoder(BaseGenerativeModel):
     def __init__(self,
                  config=None,
                  **kwargs
 ):
         super().__init__()
-
-        self.config = config if config else None
-        self.kwargs = kwargs
-        self.jitter = self.kwargs.get("jitter", 1e-6)
-        self.dropout = self.kwargs.get("dropout", 0.05)
-        self.latent_dim = self.kwargs.get("latent_dim", 16)
-        self.input_dim = self.kwargs.get("input_dim", 30) ## -- or self.kwargs.get("num_features_real_x", 30)
-        self.bottleneck_dim = self.kwargs.get("bottleneck_dim", 64)
-        self.k_atoms = self.kwargs.get("k_atoms", 30)
-        self.rank = self.kwargs.get("alpha_factor_rank", 3)
-        self.M = self.kwargs.get("num_fourier_features", 128)
-        self.spectral_emb_dim = self.kwargs.get("spectral_emb_dim", 2048)
-        self.num_latents = self.kwargs.get("num_latents", 8)
-        self.spectral_compressions = self.kwargs.get("spectral_compressions", [1024, 512, 128, 64])
-        self.eps = self.kwargs.get("eps", 1e-3)
+        self.config = config if config is not None else DecoderConfig()
+        #-global & dynamic:
+        self.input_dim = kwargs.get("input_dim", 30)
         self.n_data = kwargs.get('n_data', 76674.0)
-        self.min_ls = self.kwargs.get("min_ls", 0.05)
-        self.max_ls = self.kwargs.get("max_ls", 15.0)
-        self.beta = self.kwargs.get("beta", 1.0)
-        self.conc_clamp = self.kwargs.get("conc_clamp", 30.0)
-        self.large_eps = self.kwargs.get("large_eps", 4e-2)
 
-        split_override = self.kwargs.get("disentangle_split_override", None)
-        self.disentangle_split = split_override if split_override is not None else [4, 30, 30]
+        self.jitter = self.config.jitter
+        self.dropout = self.config.dropout
+        self.latent_dim = self.config.latent_dim
         
-    
+        self.bottleneck_dim = self.config.bottleneck_dim
+        self.k_atoms = self.config.k_atoms
+        self.alpha_factor_rank = self.config.alpha_factor_rank
+        self.M = self.config.num_fourier_features
+        self.spectral_emb_dim = self.config.spectral_emb_dim
+        self.num_latents = self.config.num_latents
+        self.spectral_compressions = self.config.spectral_compressions or [1024, 512, 128, 64]
+        self.eps = self.config.eps
+        self.min_ls = self.config.min_ls
+        self.max_ls = self.config.max_ls
+        self.beta = self.config.beta
+        self.conc_clamp = self.config.conc_clamp
+        self.large_eps = self.config.large_eps
+        self.disentangle_split = [4, 30, 30]
+        self.rank = self.alpha_factor_rank or 3
         
-        #--# safeguard
-        self.num_experts = self.kwargs.get("num_experts", 8)
-
         layers = []
         current_dim = self.spectral_emb_dim
 
@@ -107,7 +129,7 @@ class SpectralDecoder(BaseGenerativeModel):
             for _ in range(self.num_experts)
         ])
 
-        self.rank=3
+        
 
         self.mu_alpha = nn.Linear(self.bottleneck_dim, self.k_atoms)
         self.factor_alpha = nn.Linear(self.bottleneck_dim, self.k_atoms * self.rank)
@@ -136,33 +158,38 @@ class SpectralDecoder(BaseGenerativeModel):
             spectral_features: [Batch, K*M*2] OR [Batch, K, M*2] as 'x' (embedded dim = 2048)
             vae_out: dirichlet_out
         """
+        t = params.get('t', 0)
         ls_pred_prior = getattr(vae_out, 'ls_pred', None)
         ls_logvar_prior = getattr(vae_out, 'ls_logvar', None)
         mu_z = getattr(vae_out, 'mu_z', None)
-        logvar_z = getattr(vae_out, 'logvar_z', None)
-        
+        logvar_z = getattr(vae_out, 'logvar_z', None)  
         real_x = getattr(vae_out, 'real_x', None)
         bottleneck = self.compression_network(x)
         recon, trend, amp, residuals = self.disentangle(bottleneck)
+        recon_to_loss = None
+        target_to_loss = None
         if real_x is not None:
-            if real_x.dim() == 2:
-                raise ValueError(f"CRITICAL: real_x is 2D {real_x.shape}. "
-                                 f"Expected 3D [Batch, Seq, Feat]. Check Encoder output.")
-            if real_x.dim() == 3 and real_x.shape[0] == self.kwargs.get('seq_len', 32):
-                real_x = real_x.transpose(0, 1).contiguous()
+            if real_x.shape != recon.shape:
+                if real_x.size(1) == 1 and recon.size(1) == 32:
+                    recon_to_loss = recon[:, -1:, :]
+                    target_to_loss = real_x
+                elif real_x.size(1) == 32 and recon.size(1) == 1:
+                    recon_to_loss = recon
+                    target_to_loss = real_x[:, -1:, :]
+                else:
+                    recon_to_loss = recon
+                    target_to_loss = real_x
+            else:
+                recon_to_loss = recon
+                target_to_loss = real_x
 
-            real_x = real_x.to(recon.dtype)
-            
-            if recon.shape != real_x.shape:
-                logger.warning(f"Shape mismatch in Recon: {recon.shape} vs {real_x.shape}. Forcing alignment.")
-                real_x = real_x.view_as(recon)
+        reconloss = F.mse_loss(recon_to_loss, target_to_loss, reduction='mean')
         
+        reconkl = self.log_recon_kl(mu_z, logvar_z)
 
-        reconloss, reconkl = self.log_recon(real_x, recon, mu_z, logvar_z)
+        self.update_added_loss_term("recon_term", LossTerm(reconloss, t_index=t))
 
-        self.update_added_loss_term("recon_term", LossTerm(reconloss))
-
-        self.update_added_loss_term("recon_kl", LossTerm(reconkl))
+        self.update_added_loss_term("recon_kl", LossTerm(reconkl, t_index=t))
 
         latent_expert_functions = [variational(bottleneck) for variational in self.expert_variational_heads]
 
@@ -184,7 +211,7 @@ class SpectralDecoder(BaseGenerativeModel):
 
         gp_features = torch.stack(latent_features_per_expert, dim=1)
 
-        vae_out = StateSpaceOutput(
+        vae_out = DecoderOutput(
             gp_params=vae_out.gp_params,
             bottleneck=bottleneck,
             alpha=vae_out.local_conc,
@@ -236,7 +263,7 @@ class SpectralDecoder(BaseGenerativeModel):
 
     def log_alpha_kl_low_rank(self, mu, chol, diag):
         batch_size = mu.size(0)
-        r = self.kwargs.get("alpha_factor_rank", 3)
+        r = self.alpha_factor_rank
         k = self.k_atoms
         
         factor = chol.view(batch_size, k, r)
@@ -248,7 +275,7 @@ class SpectralDecoder(BaseGenerativeModel):
         
         cov_factor = factor + noise_factor 
 
-        cov_diag = torch.clamp(diag + self.jitter, min=0.025)
+        cov_diag = torch.clamp(diag + self.jitter, min=0.035)
         
         q_dist = torch.distributions.LowRankMultivariateNormal(
             loc=mu,
@@ -277,10 +304,9 @@ class SpectralDecoder(BaseGenerativeModel):
         pi_sample = q_alpha.rsample()
         return pi_sample
     
-    def log_recon(self, x, recon, mu_z, logvar_z):
-        loss = F.mse_loss(recon, x, reduction='mean')
+    def log_recon_kl(self, mu_z, logvar_z):
         kl = -0.5 * torch.sum(1 + logvar_z - mu_z.pow(2) - logvar_z.exp(), dim=-1).mean()
-        return loss, kl
+        return kl
 
     def predict_lengthscale_and_log_kl(self, bottleneck, ls_pred_prior=None, ls_logvar_prior=None):
         """
@@ -318,7 +344,7 @@ class SpectralDecoder(BaseGenerativeModel):
         return ls_sample, scaled_global_kl
     
 class TemporalReconDecoder(nn.Module):
-    def __init__(self, in_dim, out_features, seq_len=32):
+    def __init__(self, in_dim, out_features):
         super().__init__()
         self.init_channels = 64
         self.init_length = 4
@@ -344,8 +370,9 @@ class LossTerm(gpytorch.mlls.AddedLossTerm):
     A concrete implementation of an AddedLossTerm that simply 
     returns a pre-calculated scalar tensor.
     """
-    def __init__(self, loss_tensor):
+    def __init__(self, loss_tensor, t_index=None):
         self.loss_tensor = loss_tensor
+        self.t_index = t_index
         
     def loss(self):
         return self.loss_tensor

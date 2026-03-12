@@ -12,7 +12,7 @@ from src.deepkernels.kernels.lmckernel import DeepStatelessEigenKernel
 from src.deepkernels.models.beta_vae import SpectralVAE, VAEConfig
 from src.deepkernels.models.encoder import RecurrentEncoder
 from src.deepkernels.models.linear_decoder import BayesDecoder
-from src.deepkernels.models.NKN import NeuralKernelNetwork
+from src.deepkernels.models.NKN import KernelNetwork
 from src.deepkernels.kernels.deepkernel import DeepKernel
 
 #-orchestration GP class-#
@@ -63,7 +63,7 @@ class DeepGaussianProcess(gpytorch.models.ApproximateGP):
         self.dirichlet = dirichlet if dirichlet else AmortisedDirichlet()
         self.vae_decoder = vae_decoder if vae_decoder else BayesDecoder(self.latent_dim, self.input_dim)
         self.topic_decoder = nn.Linear(self.k_experts, self.input_dim, bias=False)
-        self.nkn = nkn if nkn else NeuralKernelNetwork()
+        self.nkn = nkn if nkn else KernelNetwork()
         
 
         #-mean module-#

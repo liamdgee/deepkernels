@@ -11,6 +11,17 @@ import gpytorch
 from deepkernels.losses.simple import SimpleLoss
 from deepkernels.models.parent import BaseGenerativeModel
 
+from dataclasses import dataclass
+
+@dataclass
+class EncoderConfig:
+    latent_dim: int = 16
+    input_dim: int = 30
+    bottleneck_dim: int = 64
+    k_atoms: int = 30
+    rank: int = 3
+    jitter: float = 1e-6
+
 class EncoderOutput(NamedTuple):
     alpha_mu: torch.Tensor
     alpha_factor: torch.Tensor
@@ -35,15 +46,17 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
                  **kwargs
         ):
         super().__init__()
-        self.kwargs = kwargs
-        self.config = config if config else None
-        self.jitter = self.kwargs.get("jitter", 1e-6)
-        self.latent_dim = self.kwargs.get("latent_dim", 16)
-        self.input_dim = self.kwargs.get("input_dim", 30)
-        self.bottleneck_dim = self.kwargs.get("bottleneck_dim", 64)
-        self.k_atoms = self.kwargs.get("k_atoms", 30)
-        self.rank = self.kwargs.get("alpha_factor_rank", 3)
+        self.config = config if config is not None else EncoderConfig()
+        self.jitter = self.config.jitter
+        self.latent_dim = self.config.latent_dim
+        self.bottleneck_dim = self.config.bottleneck_dim
+        self.k_atoms = self.config.k_atoms
+        self.rank = self.config.rank
         
+        #-global & dynamic:
+        self.input_dim = kwargs.get("input_dim", 30)
+        self.n_data = kwargs.get('n_data', 76674.0)
+
         # --- Fusion Layer ---
         # conv_bottleneck (16 or 64) + Spectral_bottleneck (64) + Prev Pi (30) -> 110 or 158 or 222?
         fusion_in_dim = self.bottleneck_dim + self.k_atoms + self.bottleneck_dim
@@ -86,6 +99,8 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         batch_size = x.size(0)
         device = x.device
         empty_tensor = torch.empty(0, device=device)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
         
         pi = params.get('pi', None)
         if pi is None and vae_out is not None:
@@ -200,7 +215,6 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
 class ConvolutionalNetwork1D(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1):
         super().__init__()
-        # Ensure padding keeps sequence length consistent if stride=1
         padding = kernel_size // 2 
         
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding, bias=False)

@@ -28,34 +28,11 @@ class BaseGenerativeModel(gpytorch.Module):
     def __init__(self):
         super().__init__()
     
-    def __call__(self, *args, **kwargs):
-        """
-        bypasses GPyTorch's strict output policing 
-        by routing the execution directly through torch
-        """
-        return torch.nn.Module.__call__(self, *args, **kwargs)
     
     def register_constrained_parameter(self, name, parameter, constraint):
         self.register_parameter(name, parameter)
         self.register_constraint(name, constraint)
         return self
-
-    def log_loss(self, name, value):
-        """
-        Wraps the raw tensor in an AddedLossTerm and updates it.
-        usage: self.log_loss("reconstruction_loss", recon_tensor)
-        """
-        if not hasattr(self, "_added_loss_terms") or name not in self._added_loss_terms:
-             raise RuntimeError(f"Loss term '{name}' not registered in Base __init__")
-        scalar_loss = value.sum() if value.dim() > 0 else value
-        self.update_added_loss_term(name, SimpleLoss(scalar_loss))
-    
-    def sample_logistic_normal(self, mu, logvar):
-        z = self.reparameterise(mu, logvar)
-        pi = F.softmax(z, dim=-1)
-        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-        self.update_added_loss_term("logistic_kl", SimpleLoss(kl.mean()))
-
     
     def reparameterise(self, mu, logvar, eps_min=-3.3, eps_max=3.3):
         std = torch.exp(0.5 * logvar)
@@ -81,6 +58,21 @@ class BaseGenerativeModel(gpytorch.Module):
         alpha = torch.nn.functional.softplus(logits) + jitter
         
         return alpha
+    def inverse_softplus(self, target_value, min=3e-7):
+        """
+        Numerically stable mapping from concentration space (0, inf) 
+        to logit space (-inf, inf).
+        """
+        if not isinstance(target_value, torch.Tensor):
+            target_value = torch.tensor(target_value)
+            
+        safe_target = torch.clamp(target_value, min=min)
+        
+        return torch.where(
+            safe_target > 20.0,
+            safe_target,
+            torch.log(torch.expm1(safe_target))
+        )
     
     def dirichlet_sample(self, alpha):
         alpha = F.softplus(alpha)
@@ -125,7 +117,7 @@ class BaseGenerativeModel(gpytorch.Module):
     def lowrankmultivariatenorm(self, mu, factor, diag):
         mvn = torch.distributions.LowRankMultivariateNormal(loc=mu, cov_factor=factor, cov_diag=diag)
         logits = mvn.rsample()
-        return logits # Return logits, softplus them later
+        return logits
     
     def apply_softplus(self, x, jitter=1e-6):
         return F.softplus(x) + jitter
@@ -135,159 +127,3 @@ class BaseGenerativeModel(gpytorch.Module):
     
     def get_resource(self, name_string, **params):
         return getattr(self, name_string, None)
-    
-    def inverse_softplus(self, target_value, min=3e-7):
-        """
-        Numerically stable mapping from concentration space (0, inf) 
-        to logit space (-inf, inf).
-        """
-        # 1. Convert to tensor so torch.clamp works
-        if not isinstance(target_value, torch.Tensor):
-            target_value = torch.tensor(target_value)
-            
-        # 2. Safety clamp to prevent log(0)
-        safe_target = torch.clamp(target_value, min=min)
-        
-        # 3. Numerical stability for large values (Softplus(x) -> x as x -> inf)
-        # If target is > 20, the inverse is basically the target itself
-        return torch.where(
-            safe_target > 20.0,
-            safe_target,
-            torch.log(torch.expm1(safe_target))
-        )
-    
-    def clear_pkeops(self):
-        pykeops.clean_pykeops()
-        pykeops.config.cuda_standalone = True
-        pykeops.config.use_OpenMP = False
-
-    @staticmethod
-    def init_inducing_with_omega(
-        omega: torch.Tensor, 
-        n_inducing: int, 
-        latent_dim: int = 16,
-        pi: Optional[torch.Tensor] = None
-    ):
-        """
-        Initializes inducing points directly in the spectral feature space 
-        by projecting base latent points through the given frequencies.
-
-        Mirrors logic in the original projection
-        
-        Args:
-            omega: [K, M, D] or [1, K, M, D] tensor of raw frequencies.
-            n_inducing: Number of inducing points (e.g., 128).
-            latent_dim: The dimension of the latent space z.
-            pi: Optional gating probabilities [n_inducing, K_atoms].
-        Returns:
-            inducing: [n_inducing, K * M * 2] tensor of inducing points.
-        """
-        device = omega.device
-        
-        z_init = torch.randn(n_inducing, latent_dim, device=device) * 1.5
-        # omega shape expected to be: [K, M, D] or [B, K, M, D]
-        if omega.dim() == 3: 
-            proj = (z_init.view(n_inducing, 1, 1, latent_dim) * omega.unsqueeze(0)).sum(dim=-1)
-        elif omega.dim() == 4:
-            proj = (z_init.view(n_inducing, 1, 1, latent_dim) * omega).sum(dim=-1)
-        else:
-            raise ValueError(f"Expected omega to be 3D or 4D, got {omega.dim()}D")
-            
-        #-fourier mapping-#
-        M = omega.size(-2)
-        scale = 1.0 / math.sqrt(M)
-        
-        cos_proj = torch.cos(proj) * scale
-        sin_proj = torch.sin(proj) * scale
-        
-        if pi is not None:
-             pi_scl = torch.sqrt(pi).unsqueeze(-1) # [n_inducing, K, 1]
-             cos_proj = cos_proj * pi_scl
-             sin_proj = sin_proj * pi_scl
-        else:
-             # Uniform fallback if pi is omitted
-             k_atoms = omega.size(-3)
-             pi_scl = math.sqrt(1.0 / k_atoms)
-             cos_proj = cos_proj * pi_scl
-             sin_proj = sin_proj * pi_scl
-             
-        # 5. Stack and flatten to match feature_dim
-        feats = torch.stack([cos_proj, sin_proj], dim=-1) # [n_inducing, K, M, 2]
-        
-        inducing = feats.flatten(1) # [n_inducing, K * M * 2]
-        
-        # Add a tiny bit of jitter to prevent singular matrices at initialization
-        inducing_jitter = torch.randn_like(inducing) * 1e-4
-        
-        return inducing + inducing_jitter
-    
-    @staticmethod
-    def init_inducing_with_fft(y_target, n_inducing, feature_dim):
-        """
-        Initializes inducing point values based on the FFT of the target signal.
-        Args:
-        y_target: [N_data] tensor of training targets used for initialization (Assuming somewhat evenly spaced or interpolated)
-        n_inducing: Number of inducing points (must match model)
-        M: Number of RFF components (M from dirichlet or encoder -- these will match)
-        feature_dim: K clusters (30) * M fourier features (128) * 2 = 7680
-        """
-        #-fast fourier transform of target variable y-#
-        if y_target is None:
-            return torch.randn(n_inducing, feature_dim) / math.sqrt(feature_dim)
-        
-        yflat = y_target.flatten().cpu()
-        n_points = len(yflat)
-        
-        if n_points == 0 or yflat.abs().sum() < 1e-6:
-            return torch.randn(n_inducing, feature_dim) / math.sqrt(feature_dim)
-        
-        fourier_vals = torch.fft.rfft(yflat)
-        freqs = torch.fft.rfftfreq(n_points)
-        jitter = 1e-6
-        eps = 1e-9
-        #-Construct a Probability Distribution from FFT magnitudes to sample weights from-#
-        density = torch.abs(fourier_vals)
-        if density.shape[0] > 0:
-            density[0] = 0 #-remove DC component-#
-            cdf = density.sum()
-        if cdf < eps:
-            return torch.randn(n_inducing, feature_dim) / math.sqrt(feature_dim)
-        p = density / cdf
-        indices = torch.multinomial(p, feature_dim, replacement=True)
-        samples = freqs[indices]
-        binary_mask = torch.bernoulli(torch.full((feature_dim,), 0.5))
-        plus_or_minus_one = 2 * binary_mask - 1
-        sigma_y = y_target.std() + jitter
-        sigma_samples = samples.std() + jitter
-
-        sqrt_feature_dim_scale = sigma_y / (sigma_samples * math.sqrt(feature_dim))
-        weights_flat = samples * plus_or_minus_one * sqrt_feature_dim_scale
-
-        inducing = weights_flat.unsqueeze(0).repeat(n_inducing, 1)
-        inducing_jitter = torch.randn_like(inducing) * (sqrt_feature_dim_scale * sigma_samples * 0.13)
-        inducing = inducing + inducing_jitter
-        return inducing
-
-
-    def create_sequences(flat_data, seq_len):
-        """
-        flat_data shape: [Total_Timesteps, Features] (e.g., [1000, 30])
-        Returns shape: [Total_Samples, seq_len, Features]
-        """
-        
-        sequences = flat_data.unfold(0, seq_len, 1)
-        
-        sequences = sequences.transpose(1, 2)
-        
-        return sequences
-
-    class LossTerm(gpytorch.mlls.AddedLossTerm):
-        """
-        A concrete implementation of an AddedLossTerm that simply 
-        returns a pre-calculated scalar tensor.
-        """
-        def __init__(self, loss_tensor):
-            self.loss_tensor = loss_tensor
-            
-        def loss(self):
-            return self.loss_tensor

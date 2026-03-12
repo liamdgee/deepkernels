@@ -12,8 +12,6 @@ import mlflow
 from torch.optim import Adam, RMSprop, AdamW
 from torch.optim.lr_scheduler import LinearLR
 
-from deepkernels.train.stochastic_annealer import StochasticAnnealer
-from deepkernels.models.model import StateSpaceKernelProcess
 from deepkernels.train.variational_objective import EvidenceLowerBound
 from typing import Union, Optional, Iterable
 import gpytorch
@@ -29,28 +27,95 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+from dataclasses import dataclass
+
+@dataclass
+class TrainerConfig:
+    # --- Dataset & Epochs ---
+    n_data: float = 76674.0
+    warmup_vae_epochs: int = 50
+    vae_epochs: int = 250
+    warmup_gp_epochs: int = 100
+    gp_epochs: int = 200
+
+    # --- AdamW Optimiser (VAE / Encoder / Decoder) ---
+    base_lr_adamw: float = 1.175e-3
+    base_decay_adamw: float = 0.05
+    slow_decay_adamw: float = 0.001
+
+    # --- Adam Optimiser (GPyTorch / Kernel Network) ---
+    gp_global_hyper_lr: float = 3e-3
+    gp_mean_lr: float = 2e-3
+    gp_likelihood_lr: float = 5e-3
+    gp_lengthscale_lr: float = 2e-4
+    gp_kernel_nkn_lr: float = 2e-6
+    gp_variational_lr: float = 7e-4
+    gp_inducing_lr: float = 1e-3
+
+    # --- SGLD Optimiser (Dirichlet / Latent Variables) ---
+    fast_dir: float = 1e-3
+    med_dir: float = 5e-4
+    slow_dir: float = 1e-4
+    gamma_lr: float = 1e-5
+    lmc_lr: float = 8e-4
+    ultrasensitive_lr: float = 5e-5
+    sensitive_lr: float = 1e-4
+    langevin_temp: float = 7.5e-6
+    k_atoms: int = 30
+    
+    # --- Gradient Clipping ---
+    max_grad_norm: float = 2.0
+    langevin_clip_norm: float = 4.0
+    rmspropalpha: float = 0.98
+    rmspropeps: float = 1e-7
+
+    #-epochs-#
+    em_macro_cycles: int = 8
+    e_epochs_per_cycle: int = 3
+    m_epochs_per_cycle: int = 5
+    joint_epochs: int = 0
+
 class ParameterIsolate:
-    def __init__(self, model, objective=None, device='cuda', **kwargs):
+    def __init__(self, model, config=None, objective=None, device='cuda'):
         self.model = model
+        self.config = config if config is not None else TrainerConfig()
         self.device = self.get_device(device)
-        self.kwargs = kwargs
         self.objective = objective if objective is not None else EvidenceLowerBound(self.model)
+        # --- VAE LR ---
+        self.base_lr_adamw = self.config.base_lr_adamw
+        self.slow_lr = self.base_lr_adamw / 10  # Calculated safely here
+        self.base_decay_adamw = self.config.base_decay_adamw
+        self.slow_decay_adamw = self.config.slow_decay_adamw
         
-        self.adam_optimiser = None
-        self.adamw_optimiser = None
-        self.langevin_optimiser = None
+        # --- GP LR ---
+        self.gp_global_hyper_lr = self.config.gp_global_hyper_lr
+        self.gp_mean_lr = self.config.gp_mean_lr
+        self.gp_likelihood_lr = self.config.gp_likelihood_lr
+        self.gp_lengthscale_lr = self.config.gp_lengthscale_lr
+        self.gp_kernel_nkn_lr = self.config.gp_kernel_nkn_lr
+        self.gp_variational_lr = self.config.gp_variational_lr
+        self.gp_inducing_lr = self.config.gp_inducing_lr
+
+        # --- SGLD LR ---
+        self.fast_dir = self.config.fast_dir
+        self.med_dir = self.config.med_dir
+        self.slow_dir = self.config.slow_dir
+        self.gamma_lr = self.config.gamma_lr
+        self.lmc_lr = self.config.lmc_lr
+        self.ultrasensitive_lr = self.config.ultrasensitive_lr
+        self.sensitive_lr = self.config.sensitive_lr
+        self.rmspropalpha = self.config.rmspropalpha
+        self.rmspropeps = self.config.rmspropeps
 
         self.encoder_module = self.model.vae.encoder
         self.decoder_module = self.model.vae.decoder
         self.dirichlet_module = self.model.vae.dirichlet
 
-    def seperate_params_and_build_optimisers(self, **kwargs):
+    def seperate_params_and_build_optimisers(self):
         """Executes the massive parameter routing and returns the two optimizers."""
         model = self.model.to(self.device)
         
         model.train()
-        
-        #-GROUP MODEL PARAMS-#
         
         #-encoder params include:
         all_encoder_params = []
@@ -212,67 +277,42 @@ class ParameterIsolate:
                 
             routed_params += 1
         
-        base_lr_adamw = self.kwargs.get('base_lr_adamw', 1.175e-3)
-        
-        slow_lr = base_lr_adamw / 10    
-        
-        base_decay_adamw = self.kwargs.get('base_decay_adamw', 0.05)
-        slow_decay_adamw = self.kwargs.get('slow_decay_adamw', 0.001)
-        gp_global_hyper_lr = self.kwargs.get('gp_global_hyper_lr', 3e-3)
-        gp_mean_lr = self.kwargs.get('gp_mean_lr', 2e-3)
-        gp_likelihood_lr = self.kwargs.get('gp_likelihood_lr', 5e-3)
-        gp_lengthscale_lr = self.kwargs.get('gp_lengthscale_lr', 2e-4)
-        gp_kernel_nkn_lr = self.kwargs.get('gp_kernel_nkn_lr', 2e-6)
-        gp_variational_lr = self.kwargs.get('gp_variational_lr', 7e-4)
-        gp_inducing_lr = self.kwargs.get('gp_inducing_lr', 1e-3)
 
-        #-for SGLD optimiser-#
-        fast_dir = self.kwargs.get('fast_dir', 1e-3)
-        med_dir = self.kwargs.get('med_dir', 5e-4)
-        slow_dir = self.kwargs.get('slow_dir', 1e-4)
-        gamma_lr = self.kwargs.get('gamma_lr', 1e-5)
-        lmc_lr = self.kwargs.get('lmc_lr', 8e-4)
-
-        ultrasensitive_lr = self.kwargs.get('ultrasensitive_lr', 5e-5)
-        sensitive_lr = self.kwargs.get('sensitive_lr', 1e-4)
-        
-
-        self.adamw_optimiser = torch.optim.AdamW([
-            {'params': conv_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
-            {'params': fusion_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
-            {'params': latent_params, 'lr': slow_lr, 'weight_decay': slow_decay_adamw},
-            {'params': deterministic_recon_params, 'lr': base_lr_adamw, 'weight_decay': base_decay_adamw},
-            {'params': probabilistic_nn_params, 'lr': base_lr_adamw, 'weight_decay': slow_decay_adamw},
+        adamw_optimiser = torch.optim.AdamW([
+            {'params': conv_params, 'lr': self.base_lr_adamw, 'weight_decay': self.base_decay_adamw},
+            {'params': fusion_params, 'lr': self.base_lr_adamw, 'weight_decay': self.base_decay_adamw},
+            {'params': latent_params, 'lr': self.slow_lr, 'weight_decay': self.slow_decay_adamw},
+            {'params': deterministic_recon_params, 'lr': self.base_lr_adamw, 'weight_decay': self.base_decay_adamw},
+            {'params': probabilistic_nn_params, 'lr': self.base_lr_adamw, 'weight_decay': self.slow_decay_adamw},
         ])
 
-        self.langevin_optimiser = torch.optim.RMSprop([
-            {'params': dirichlet_atom_params, 'lr': med_dir},
-            {'params': dirichlet_global_dist_params, 'lr': slow_dir},
-            {'params': dirichlet_gamma_params, 'lr': gamma_lr},
-            {'params': dirichlet_ls_params, 'lr': ultrasensitive_lr},
-            {'params': dirichlet_all_nn_params, 'lr': med_dir},
-            {'params': dirichlet_variational_params, 'lr': fast_dir},
-            {'params': dirichlet_lmc_params, 'lr': lmc_lr},
-        ], alpha=0.97, eps=1e-6)
+        langevin_optimiser = torch.optim.RMSprop([
+            {'params': dirichlet_atom_params, 'lr': self.med_dir},
+            {'params': dirichlet_global_dist_params, 'lr': self.slow_dir},
+            {'params': dirichlet_gamma_params, 'lr': self.gamma_lr},
+            {'params': dirichlet_ls_params, 'lr': self.ultrasensitive_lr},
+            {'params': dirichlet_all_nn_params, 'lr': self.med_dir},
+            {'params': dirichlet_variational_params, 'lr': self.fast_dir},
+            {'params': dirichlet_lmc_params, 'lr': self.lmc_lr},
+        ], alpha=self.rmspropalpha, eps=self.rmspropeps)
 
-        self.adam_optimiser = torch.optim.Adam([
-            {'params': likelihood_params, 'lr': gp_likelihood_lr},
-            {'params': gp_mean_params, 'lr': gp_mean_lr},
-            {'params': gp_kernel_global_params, 'lr': gp_global_hyper_lr},
-            {'params': gp_kernel_ls_params, 'lr': gp_lengthscale_lr},
-            {'params': gp_kernel_nkn_params, 'lr': gp_kernel_nkn_lr},
-            {'params': sensitive_ls_params, 'lr': sensitive_lr},
-            {'params': ultrasensitive_spectral_params, 'lr': ultrasensitive_lr},
-            {'params': primitive_params, 'lr': base_lr_adamw},
-            {'params': combinatorics_params, 'lr': slow_lr},
-            {'params': gp_variational_params, 'lr': gp_variational_lr},
-            {'params': gp_inducing_params, 'lr': gp_inducing_lr},
-            {'params': gp_other_params, 'lr': base_lr_adamw}
+        adam_optimiser = torch.optim.Adam([
+            {'params': likelihood_params, 'lr': self.gp_likelihood_lr},
+            {'params': gp_mean_params, 'lr': self.gp_mean_lr},
+            {'params': gp_kernel_global_params, 'lr': self.gp_global_hyper_lr},
+            {'params': gp_kernel_ls_params, 'lr': self.gp_lengthscale_lr},
+            {'params': gp_kernel_nkn_params, 'lr': self.gp_kernel_nkn_lr},
+            {'params': sensitive_ls_params, 'lr': self.sensitive_lr},
+            {'params': ultrasensitive_spectral_params, 'lr': self.ultrasensitive_lr},
+            {'params': primitive_params, 'lr': self.base_lr_adamw},
+            {'params': combinatorics_params, 'lr': self.slow_lr},
+            {'params': gp_variational_params, 'lr': self.gp_variational_lr},
+            {'params': gp_inducing_params, 'lr': self.gp_inducing_lr},
+            {'params': gp_other_params, 'lr': self.base_lr_adamw}
         ], weight_decay=0.0)
         
-        total_opt_params = sum(len(group['params']) for opt in [self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser] for group in opt.param_groups)
+        total_opt_params = sum(len(group['params']) for opt in [adamw_optimiser, langevin_optimiser, adam_optimiser] for group in opt.param_groups)
         logger.info(f"Parameter Isolation Complete. {total_opt_params}/{total_trainable_params} tensors strictly routed into 3 Optimizers.")
-        total_opt_params = sum(len(group['params']) for opt in [self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser] for group in opt.param_groups)
         
         if total_trainable_params != total_opt_params:
             logger.error(f"Parameter Optimizer Mismatch! Model has {total_trainable_params} trainable tensors, but optimizers only received {total_opt_params}.")
@@ -285,7 +325,7 @@ class ParameterIsolate:
             "gp_total": all_gp_params
         }
 
-        return self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser, self.module_groups
+        return adamw_optimiser, langevin_optimiser, adam_optimiser, self.module_groups
     
     def _set_group_grad(self, group_name: str, requires_grad: bool):
         """Helper to cleanly flip gradients for a specific parameter list."""

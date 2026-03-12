@@ -15,7 +15,6 @@ import linear_operator
 from linear_operator.operators import RootLinearOperator, MatmulLinearOperator, DiagLinearOperator, AddedDiagLinearOperator
 
 from deepkernels.models.parent import BaseGenerativeModel
-from deepkernels.losses.simple import SimpleLoss
 from deepkernels.models.NKN import KernelNetwork, KernelNetworkOutput, GPParams
 from deepkernels.kernels.keops import CustomLaplacePrior
 from pydantic import BaseModel
@@ -47,43 +46,89 @@ class DirichletOutput(NamedTuple):
     real_x: torch.Tensor
     lmc_matrices: torch.Tensor
 
+from dataclasses import dataclass
+
+@dataclass
+class DirichletConfig:
+    # --- Dimensions & Architecture ---
+    latent_dim: int = 16
+    input_dim: int = 30
+    bottleneck_dim: int = 64
+    k_atoms: int = 30
+    alpha_factor_rank: int = 3
+    num_latents: int = 8
+    num_experts: int = 8
+    num_fourier_features: int = 128
+    spectral_emb_dim: int = 2048
+    n_data: float = 76674.0  # Kept as float for division stability
+    
+    # --- Hyperparameters ---
+    dropout: float = 0.05
+    gamma_concentration_init: float = 1.5417
+    noise_scalar: float = 0.316
+    psi_scale: float = 1.0
+    
+    # --- Numerical Bounds & Tolerances ---
+    jitter: float = 1e-6
+    eps: float = 1e-3
+    large_eps: float = 4e-2
+    posterior_dirichlet_epsilon: float = 4e-5
+    conc_clamp: float = 30.0
+    min_ls: float = 0.05
+    max_ls: float = 15.0
+    sigma_lower_bound: float = 1e-4
+    sigma_upper_bound: float = 5.0
+    mu_lower_bound: float = -17.0
+    mu_upper_bound: float = 17.0
+    eps_clip: float = 2.7
+    stick_breaking_epsilon: float = 3e-3
+    uniform_dist_clamp: float = 5e-5
+    tiny_eps: float = 3e-8
+    M_series: int = 8
+    num_primitives: int = 5
+    individual_kernel_dim_out: int = 32
+
+
 class AmortisedDirichlet(BaseGenerativeModel):
-    def __init__(self, 
+    def __init__(self,
                  config=None,
                  **kwargs):
         
         super().__init__()
-        self.config = config if config else None
-        
-        self.kwargs = kwargs
-        self.jitter = self.kwargs.get("jitter", 1e-6)
-        self.dropout = self.kwargs.get("dropout", 0.05)
-        self.latent_dim = self.kwargs.get("latent_dim", 16)
-        self.input_dim = self.kwargs.get("input_dim", 30) ## -- or self.kwargs.get("num_features_real_x", 30)
-        self.bottleneck_dim = self.kwargs.get("bottleneck_dim", 64)
-        self.k_atoms = self.kwargs.get("k_atoms", 30)
-        self.rank = self.kwargs.get("alpha_factor_rank", 3)
-        self.M = self.kwargs.get("num_fourier_features", 128)
-        self.spectral_emb_dim = self.kwargs.get("spectral_emb_dim", 2048)
-        self.eps = self.kwargs.get("eps", 1e-3)
-        self.gamma_concentration_init = self.kwargs.get("gamma_concentration_init", 1.5417)
-        self.num_latents = self.kwargs.get("num_latents", 8)
-        self.large_eps = self.kwargs.get("large_eps", 4e-2)
-        self.posterior_eps = self.kwargs.get("posterior_dirichlet_epsilon", 4e-5) #-cannot be too large or throws out simplex vals-#
-        self.conc_clamp = self.kwargs.get("conc_clamp", 30.0)
-        self.min_ls = self.kwargs.get("min_ls", 0.05)
-        self.max_ls = self.kwargs.get("max_ls", 15.0)
-        self.noise_scalar = self.kwargs.get("noise_scalar", 0.316)
-        self.num_experts = self.kwargs.get("num_experts", 8)
+        self.config = config if config is not None else DirichletConfig()
+        self.stick_breaking_epsilon = self.config.stick_breaking_epsilon
+        self.uniform_dist_clamp = self.config.uniform_dist_clamp
+        self.tiny_eps = self.config.tiny_eps
+        self.M_series = self.config.M_series
+        self.jitter = self.config.jitter
+        self.dropout = self.config.dropout
+        self.latent_dim = self.config.latent_dim
+        self.input_dim = self.config.input_dim ## -- or self.kwargs.get("num_features_real_x", 30)
+        self.bottleneck_dim = self.config.bottleneck_dim
+        self.k_atoms = self.config.k_atoms
+        self.rank = self.config.alpha_factor_rank
+        self.M = self.config.num_fourier_features
+        self.spectral_emb_dim = self.config.spectral_emb_dim
+        self.eps = self.config.eps
+        self.gamma_concentration_init = self.config.gamma_concentration_init
+        self.num_latents = self.config.num_latents
+        self.large_eps = self.config.large_eps
+        self.posterior_eps = self.config.posterior_dirichlet_epsilon
+        self.conc_clamp = self.config.conc_clamp
+        self.min_ls = self.config.min_ls
+        self.max_ls = self.config.max_ls
+        self.noise_scalar = self.config.noise_scalar
+        self.num_experts = self.config.num_experts
+        self.sigma_lower_bound = self.config.sigma_lower_bound
+        self.sigma_upper_bound = self.config.sigma_upper_bound
+        self.mu_lower_bound = self.config.mu_lower_bound
+        self.mu_upper_bound = self.config.mu_upper_bound
+        self.eps_clip = self.config.eps_clip
+        self.psi_scale = self.config.psi_scale
+
+        #-global & dynamic:
+        self.input_dim = kwargs.get("input_dim", 30)
         self.n_data = kwargs.get('n_data', 76674.0)
-        self.sigma_lower_bound = self.kwargs.get("sigma_lower_bound", 1e-4)
-        self.sigma_upper_bound = self.kwargs.get("sigma_upper_bound", 5.0)
-        self.mu_lower_bound = self.kwargs.get("mu_lower_bound", -17.0)
-        self.mu_upper_bound = self.kwargs.get("mu_upper_bound", 17.0)
-
-        self.eps_clip = self.kwargs.get("eps_clip", 2.7)
-        self.psi_scale = self.kwargs.get("psi_scale", 1.0)
-
         #-hypernetworks
         self.compress_spectral_features_head = torch.nn.utils.spectral_norm(nn.Linear(self.k_atoms * self.M * 2, self.spectral_emb_dim))
         
@@ -93,7 +138,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
             nn.SiLU()
         )
         
-        self.kernel_network = KernelNetwork(**kwargs)
+        self.kernel_network = KernelNetwork(config=self.config)
 
 
         scale_constraint = gpytorch.constraints.GreaterThan(1e-4)
@@ -253,7 +298,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
         Args:
             latent z (param: x) -- dim 16
         """
-
+        t = params.get("t", 0)
         batch_size = x.size(0)
         device = x.device
         empty_tensor = torch.empty(0, device=device)
@@ -299,7 +344,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
         
         beta, gamma_conc, global_kl = self.global_stick_breaking_kumaraswamy()
 
-        self.update_added_loss_term("global_divergence", LossTerm(global_kl))
+        self.update_added_loss_term("global_divergence", LossTerm(global_kl, t_index=t))
     
         bottleneck, gate, gp_params = self.run_neural_nets_dirichlet(x)
         
@@ -311,9 +356,9 @@ class AmortisedDirichlet(BaseGenerativeModel):
 
         iw_loss = self.inverse_wishart_penalty(B_mat_current_state)
 
-        self.update_added_loss_term("inverse_wishart", LossTerm(iw_loss))
+        self.update_added_loss_term("inverse_wishart", LossTerm(iw_loss, t_index=t))
 
-        self.update_added_loss_term("local_divergence", LossTerm(local_kl))
+        self.update_added_loss_term("local_divergence", LossTerm(local_kl, t_index=t))
         
         ls_pred, bw_learned, ls_logvar = self.predict_kernel_lengthscales(ls)
         
@@ -352,6 +397,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
             return raw
         safe = math.log(math.expm1(raw))
         return safe
+    
     def get_omega(self, bw, **params):
         # Broadcasting: [1, 1, D] + [K, 1, D] + ([K, M, D] * [B, K, 1, D])
         noise_weights = self.noise_weights
@@ -401,17 +447,14 @@ class AmortisedDirichlet(BaseGenerativeModel):
         return feats.flatten(1)
     
 
-    def global_stick_breaking_kumaraswamy(self, **params):
-        stick_breaking_epsilon = self.kwargs.get("stick_breaking_epsilon", 3e-3)
-        uniform_dist_clamp = self.kwargs.get("uniform_dist_clamp", 5e-5)
-        tiny_eps = self.kwargs.get("tiny_eps", 3e-8)
-        q_a = self.q_a_global + stick_breaking_epsilon
-        q_b = self.q_b_global + stick_breaking_epsilon
-        u = torch.rand_like(q_a).clamp(uniform_dist_clamp, 1.0 - uniform_dist_clamp)
+    def global_stick_breaking_kumaraswamy(self, **kwargs):
+        q_a = self.q_a_global + self.stick_breaking_epsilon
+        q_b = self.q_b_global + self.stick_breaking_epsilon
+        u = torch.rand_like(q_a).clamp(self.uniform_dist_clamp, 1.0 - self.uniform_dist_clamp)
         
         #-Inverse CDF transform-: fomula: v = (1 - (1 - u)^(1/b))^(1/a)
         qv_global = (1.0 - (1.0 - u).pow(1.0 / q_b)).pow(1.0 / q_a)
-        qv_global = qv_global.clamp(uniform_dist_clamp, 1.0 - uniform_dist_clamp)
+        qv_global = qv_global.clamp(self.uniform_dist_clamp, 1.0 - self.uniform_dist_clamp)
         
         #log_qv = ( --for monte carlo kl-#
         #    torch.log(q_a) + torch.log(q_b) 
@@ -419,7 +462,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
           #  + (q_b - 1.0) * torch.log((1.0 - qv_global.pow(q_a)).clamp(min=8e-8))
         #).sum()
         
-        gamma_conc = self.gamma + stick_breaking_epsilon
+        gamma_conc = self.gamma + self.stick_breaking_epsilon
         
         #log_pv = (
         #    torch.log(gamma_conc) 
@@ -450,7 +493,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
         )
         
         taylor_sum = 0
-        M_series = self.kwargs.get("M_series", 8)
+        M_series = self.M_series
         for m in range(1, M_series + 1):
             taylor_sum += 1.0 / (m * (m * q_b + q_a))
             
@@ -581,8 +624,9 @@ class LossTerm(gpytorch.mlls.AddedLossTerm):
     A concrete implementation of an AddedLossTerm that simply 
     returns a pre-calculated scalar tensor.
     """
-    def __init__(self, loss_tensor):
+    def __init__(self, loss_tensor, t_index=None):
         self.loss_tensor = loss_tensor
+        self.t_index = t_index
         
     def loss(self):
         return self.loss_tensor

@@ -113,13 +113,12 @@ class DataOrchestrator:
         if train_end <= 0:
             raise ValueError(f"Dataset too small for seq_len={seq_len} with these split percentages. "
                              f"Total seqs: {total_seqs}, required train_end: {train_end}")
-        
-        train_x, train_y = seq_x[:train_end], seq_y[:train_end]
-        val_x, val_y = seq_x[val_start:val_end], seq_y[val_start:val_end]
-        test_x, test_y = seq_x[test_start:], seq_y[test_start:]
-        train_y_point = train_y[:, -1, :]
-        val_y_point = val_y[:, -1, :]
-        test_y_point = test_y[:, -1, :]
+        train_x = seq_x[:train_end]
+        val_x = seq_x[val_start:val_end]
+        test_x = seq_x[test_start:]
+        train_y_point = seq_y[:train_end, -1, :]
+        val_y_point = seq_y[val_start:val_end, -1, :]
+        test_y_point = seq_y[test_start:, -1, :]
         logger.info(f"Chronological Split (Purged Overlaps) -> Train: {train_x.size(0)} | Val: {val_x.size(0)} | Test: {test_x.size(0)}")
         loader_kwargs = {
             "batch_size": batch_size,

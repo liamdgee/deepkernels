@@ -1,7 +1,6 @@
 
 import yaml
 from pathlib import Path
-import torch
 import gpytorch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, Subset
@@ -9,6 +8,8 @@ import pandas as pd
 import logging
 import argparse
 import mlflow
+import torch
+torch.cuda.empty_cache()
 
 torch.set_default_dtype(torch.float64)
 import sys
@@ -27,53 +28,14 @@ if 'CONDA_PREFIX' in os.environ:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def get_device_settings(config):
-    mode = config['environment']['mode']
-    
-    # Simple auto-detect based on platform or GPU availability
-    if mode == "auto":
-        mode = "remote" if torch.cuda.is_available() else "local"
-    
-    settings = config['environment'][mode]
-    print(f"Running in {mode} mode on {settings['device']}")
-    return settings
-
-
-def load_config(config_path):
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
-
-def merge_args_and_yaml(args, parser, config):
-    """
-    Overwrites 'args' with YAML values UNLESS the user explicitly typed 
-    the flag in the command line.
-    """
-    # Get a list of flags the user actually typed in the terminal
-    user_provided_flags = [arg.strip('--') for arg in sys.argv if arg.startswith('--')]
-    
-    # Flatten the YAML config for easy lookup
-    flat_config = {}
-    for section, values in config.items():
-        if isinstance(values, dict):
-            flat_config.update(values)
-
-    args_dict = vars(args)
-    for key in args_dict.keys():
-        # If the key is in the YAML, AND the user didn't explicitly override it in CLI
-        if key in flat_config and key not in user_provided_flags:
-            args_dict[key] = flat_config[key] # Override argparse default with YAML
-            
-    return args
-
 def parse_args():
     parser = argparse.ArgumentParser(description="DeepKernels: A generative state space process")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Path to base config")
 
     # ==========================================
     # --- Data & Pipeline Execution ---
     # ==========================================
-    parser.add_argument("--data_path1", type=str, default="/home/liam/deepkernels/data/lendio_all_methods_sociocorr_lender.dta", help="Path to the primary lender data")
-    parser.add_argument("--data_path2", type=str, default="/home/liam/deepkernels/data/appr_reg_data.dta", help="Path to the secondary regression data")
+    parser.add_argument("--data_path1", type=str, default="/home/liam/deepkernels/deepkernelsroot/data/lendio_all_methods_sociocorr_lender.dta", help="Path to the primary lender data")
+    parser.add_argument("--data_path2", type=str, default="/home/liam/deepkernels/deepkernelsroot/data/appr_reg_data.dta", help="Path to the secondary regression data")
     parser.add_argument("--target_col", type=str, default="lmean_rejected", help="The ground truth target variable")
     parser.add_argument("--seq_len", type=int, default=32, help="Sequence length for the state-space model")
     parser.add_argument("--batch_size", type=int, default=128, help="Mini-batch size for Stage 1 (VAE)")
@@ -203,13 +165,9 @@ def main():
     #---------------------------------------------------------
     #-- device config --#
     # ---------------------------------------------------------
-    args, parser = parse_args()
-    config = load_config(args.config)
-    args = merge_args_and_yaml(args, parser, config)
-    os.environ['KEOPS_CHROOT'] = config['logging']['keops_cache_path']
-    env_settings = get_device_settings(config)
-    device = torch.device(env_settings['device'])
-    args.num_workers = env_settings['num_workers']
+    args, _ = parse_args()
+    os.environ['KEOPS_CHROOT'] = "./.cache/keops"
+    device = torch.device('cuda') or torch.device('cuda:0')
     logger.info(f"Initializing pipeline on device: {device}")
 
     #---------------------------------------------------------
@@ -224,6 +182,7 @@ def main():
     logger.info("Running Data Orchestrator (Parallel Cleaning -> Merging -> Harmonising -> Sequencing)...")
     
     orchestrator = DataOrchestrator()
+    
     x_tensor, y_tensor = orchestrator.run_pipeline(
         df1=df1,
         df2=df2,
@@ -232,7 +191,7 @@ def main():
         float_64=True
     )
 
-    seq_x, seq_y = orchestrator.to_seq_data(
+    seq_x, seq_y = orchestrator.to_seq_data(        
         x_tensor,
         y_tensor, 
         seq_len=args.seq_len
@@ -240,7 +199,7 @@ def main():
 
     train_loader, val_loader, test_loader = orchestrator.prepare_data(
             seq_x, seq_y, seq_len=args.seq_len, val_pct=0.1, test_pct=0.1, 
-            batch_size=args.batch_size, num_workers=4
+            batch_size=args.batch_size, num_workers=args.num_workers
         )
     
     N = len(train_loader.dataset)
@@ -251,32 +210,31 @@ def main():
     #-- init Variational GP & model -- #
     # ---------------------------------------------------------
     logger.info("Building StateSpaceKernelProcess...")
-    model = StateSpaceKernelProcess(**vars(args)).to(device=device, dtype=torch.float64)
+    
+    model_keys = ['n_data', "input_dim"]
+    model_keys_with_seq_len = ['n_data', "input_dim", "seq_len"]
 
+    dynamics = {k: v for k, v in vars(args).items() if k in model_keys}
+    trainer_dynamics = {k: v for k, v in vars(args).items() if k in model_keys_with_seq_len}
+    
+    model = StateSpaceKernelProcess(**dynamics).to(device=device, dtype=torch.float64)
+    
     trainer = LangevinTrainer(
         model=model,
         device=device,
-        **vars(args)
+        **trainer_dynamics 
     )
 
-    # --- Training -#
-    experiment_name = config['logging'].get('experiment_name', "deep-kernels")
+    experiment_name = "deep-kernels"
     mlflow.set_experiment(experiment_name)
-
     with mlflow.start_run():
+        run_params = vars(args)
+        mlflow.log_params(run_params)
         logger.info("Starting Experiment. Check MLflow dashboard for live metrics!")
-        mlflow.log_dict(config, "config.yaml")
+        mlflow.log_dict(run_params, "run_config.yaml")
         trainer.fit(
             train_loader=train_loader,
-            test_loader=val_loader,
-            warmup_vae_epochs=args.warmup_vae_epochs,
-            vae_epochs=args.vae_epochs,
-            warmup_gp_epochs=args.warmup_gp_epochs,
-            gp_epochs=args.gp_epochs,
-            em_macro_cycles=args.em_macro_cycles,
-            e_epochs_per_cycle=args.e_epochs_per_cycle,
-            m_epochs_per_cycle=args.m_epochs_per_cycle,
-            joint_epochs=args.joint_epochs
+            test_loader=val_loader
         )
 
         final_model_path = "final_model_weights.pt"

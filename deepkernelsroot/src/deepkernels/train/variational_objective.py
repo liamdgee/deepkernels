@@ -20,11 +20,10 @@ class EvidenceLowerBound(nn.Module):
             num_data: Total number of samples in your entire training dataset (crucial for GP KL scaling).
         """
         super().__init__()
-        n_data = kwargs.get('n_data', 76674)
         self.mll = gpytorch.mlls.VariationalELBO(
             likelihood=model.gp.likelihood, 
             model=model.gp, 
-            num_data=n_data
+            num_data=kwargs.get('n_data', 76674)
         )
         
         base_kl_weights = {
@@ -49,7 +48,7 @@ class EvidenceLowerBound(nn.Module):
         ramp_length = int(cycle_length * ratio)
         return min(1.0, step_in_cycle / ramp_length) if ramp_length > 0 else 1.0
     
-    def forward(self, model, gp_output, gp_target, state_out, global_step=None, total_steps=None, annealers=None, **kwargs):
+    def forward(self, model, gp_output, gp_target, state_out, global_step=None, total_steps=None, annealers=None):
         """
         Args:
             model: overarching SpectralVAE model (to pull added loss terms).
