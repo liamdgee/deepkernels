@@ -217,12 +217,11 @@ def main():
     dynamics = {k: v for k, v in vars(args).items() if k in model_keys}
     trainer_dynamics = {k: v for k, v in vars(args).items() if k in model_keys_with_seq_len}
     
-    model = StateSpaceKernelProcess(**dynamics).to(device=device, dtype=torch.float64)
+    model = StateSpaceKernelProcess().to(device=device, dtype=torch.float64)
     
     trainer = LangevinTrainer(
         model=model,
-        device=device,
-        **trainer_dynamics 
+        device=device
     )
 
     experiment_name = "deep-kernels"
@@ -231,7 +230,6 @@ def main():
         run_params = vars(args)
         mlflow.log_params(run_params)
         logger.info("Starting Experiment. Check MLflow dashboard for live metrics!")
-        mlflow.log_dict(run_params, "run_config.yaml")
         trainer.fit(
             train_loader=train_loader,
             test_loader=val_loader

@@ -15,7 +15,7 @@ import linear_operator
 from linear_operator.operators import RootLinearOperator, MatmulLinearOperator, DiagLinearOperator, AddedDiagLinearOperator
 
 from deepkernels.models.parent import BaseGenerativeModel
-from deepkernels.models.NKN import KernelNetwork, KernelNetworkOutput, GPParams
+from deepkernels.models.NKN import KernelNetwork, GPParams
 from deepkernels.kernels.keops import CustomLaplacePrior
 from pydantic import BaseModel
 import torch.distributions as dist
@@ -42,9 +42,15 @@ class DirichletOutput(NamedTuple):
     ls_logvar: torch.Tensor
     mu_z: torch.Tensor
     logvar_z: torch.Tensor
-    gp_params: GPParams
     real_x: torch.Tensor
     lmc_matrices: torch.Tensor
+    gates: torch.Tensor
+    linear: torch.Tensor
+    periodic: torch.Tensor
+    rational: torch.Tensor
+    polynomial: torch.Tensor
+    matern: torch.Tensor
+
 
 from dataclasses import dataclass
 
@@ -381,7 +387,12 @@ class AmortisedDirichlet(BaseGenerativeModel):
             conc_prior=gamma_conc,
             local_conc=local_conc,
             ls_logvar=ls_logvar,
-            gp_params=gp_params,
+            gates=gp_params.gates,
+            linear=gp_params.linear,
+            periodic = gp_params.periodic,
+            rational = gp_params.rational,
+            polynomial = gp_params.polynomial,
+            matern = gp_params.matern,
             mu_z=mu_z,
             logvar_z=logvar_z,
             real_x=real_x,
@@ -559,8 +570,8 @@ class AmortisedDirichlet(BaseGenerativeModel):
     
     def run_neural_nets_dirichlet(self, x):
         bottleneck = self.bottleneck_mixer(x) #-takes latent z[B,16] -> [B,64]
-        nkn_out = self.kernel_network(bottleneck)
-        return bottleneck, nkn_out.dirichlet_features, nkn_out.gp_params
+        gp_params, features = self.kernel_network.forward(bottleneck)
+        return bottleneck, features, gp_params
     
     def compress_and_gate(self, features, gate):
         embedded_features = self.compress_spectral_features_head(features)

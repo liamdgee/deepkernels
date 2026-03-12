@@ -8,7 +8,6 @@ import torch.nn.functional as F
 import torch.distributions as dist
 import gpytorch
 
-from deepkernels.losses.simple import SimpleLoss
 from deepkernels.models.parent import BaseGenerativeModel
 
 from dataclasses import dataclass
@@ -42,7 +41,7 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
     bottleneck_dim: The exact dimension your KernelNetwork expects (64)
     """
     def __init__(self,
-                 config=None,
+                 config:EncoderConfig,
                  **kwargs
         ):
         super().__init__()
@@ -75,9 +74,9 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         )
         
         #- Convolutional layers capture sequentially tighter & higher frequencies)
-        self.stage1 = ConvolutionalNetwork1D(32, 64, kernel_size=5, stride=2)
-        self.stage2 = ConvolutionalNetwork1D(64, 128, kernel_size=3, stride=2)
-        self.stage3 = ConvolutionalNetwork1D(128, 256, kernel_size=3, stride=2)
+        self.stage1 = ConvolutionalNetwork1D(in_channels=32, out_channels=64, kernel_size=5, stride=2)
+        self.stage2 = ConvolutionalNetwork1D(in_channels=64, out_channels=128, kernel_size=3, stride=2)
+        self.stage3 = ConvolutionalNetwork1D(in_channels=128, out_channels=256, kernel_size=3, stride=2)
         
         #- Global average pooling -- makes bottleneck invariant to the exact sequence length
         self.global_pool = nn.AdaptiveAvgPool1d(1)

@@ -20,7 +20,12 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class DecoderOutput(NamedTuple):
-    gp_params: GPParams
+    gates: torch.Tensor
+    linear: torch.Tensor
+    periodic: torch.Tensor
+    polynomial: torch.Tensor
+    matern: torch.Tensor
+    rational: torch.Tensor
     bottleneck: torch.Tensor
     alpha: torch.Tensor
     alpha_mu: torch.Tensor
@@ -66,6 +71,7 @@ class DecoderConfig:
     min_ls: float = 0.05
     max_ls: float = 15.0
     conc_clamp: float = 30.0
+    num_experts: int = 8
 
 class SpectralDecoder(BaseGenerativeModel):
     def __init__(self,
@@ -81,7 +87,7 @@ class SpectralDecoder(BaseGenerativeModel):
         self.jitter = self.config.jitter
         self.dropout = self.config.dropout
         self.latent_dim = self.config.latent_dim
-        
+        self.num_experts = self.config.num_experts
         self.bottleneck_dim = self.config.bottleneck_dim
         self.k_atoms = self.config.k_atoms
         self.alpha_factor_rank = self.config.alpha_factor_rank
@@ -212,7 +218,12 @@ class SpectralDecoder(BaseGenerativeModel):
         gp_features = torch.stack(latent_features_per_expert, dim=1)
 
         vae_out = DecoderOutput(
-            gp_params=vae_out.gp_params,
+            gates=vae_out.gates,
+            linear=vae_out.linear,
+            periodic = vae_out.periodic,
+            rational = vae_out.rational,
+            polynomial = vae_out.polynomial,
+            matern = vae_out.matern,
             bottleneck=bottleneck,
             alpha=vae_out.local_conc,
             alpha_mu=mu,

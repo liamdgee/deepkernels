@@ -8,7 +8,6 @@ from typing import Optional, Any, NamedTuple
 
 
 from deepkernels.models.parent import BaseGenerativeModel
-from deepkernels.models.dirichlet import DirichletConfig
 
 class GPParams(NamedTuple):
     gates: torch.Tensor
@@ -19,11 +18,6 @@ class GPParams(NamedTuple):
     polynomial:torch.Tensor
     
 
-class KernelNetworkOutput(NamedTuple):
-    dirichlet_features: torch.Tensor
-    gp_params: GPParams
-
-
 class SafeSoftplus(nn.Module):
     def forward(self, x):
         return F.softplus(x) + 1e-4
@@ -31,9 +25,9 @@ class SafeSoftplus(nn.Module):
 
 class KernelNetwork(BaseGenerativeModel):
     def __init__(self,
-                 config=None):
+                 config):
         super().__init__()
-        self.config = config if config else DirichletConfig()
+        self.config = config
         self.bottleneck_dim = self.config.bottleneck_dim
         self.spectral_emb_dim = self.config.spectral_emb_dim
         self.individual_kernel_dim_out = self.config.individual_kernel_dim_out
@@ -100,10 +94,7 @@ class KernelNetwork(BaseGenerativeModel):
             matern=matern
         )
 
-        return KernelNetworkOutput(
-            dirichlet_features=features_large,
-            gp_params=gp_params
-        )
+        return gp_params, features_large
 
     def init_weights_nkn(self):
         nn.init.orthogonal_(self.linear.weight_orig, gain=1.0)

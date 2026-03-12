@@ -13,7 +13,6 @@ from tqdm import tqdm
 
 from deepkernels.models.variationalautoencoder import SpectralVAE, StateSpaceOutput
 from deepkernels.models.gaussianprocess import AcceleratedKernelGP
-from deepkernels.models.NKN import GPParams
 from typing import NamedTuple, Optional
 import logging
 
@@ -44,18 +43,18 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
                 likelihood=self.likelihood
             )
     
-    def pack_features(self, gp_params, pi):
+    def pack_features(self, gates, linear, periodic, rational, polynomial, matern, pi):
         """Safely pool any 4D tensors to 3D and concatenate the 198D payload."""
         def process_param(p):
             return p.mean(dim=2) if p.dim() == 4 else p
 
         packed = torch.cat([
-            process_param(gp_params.gates), 
-            process_param(gp_params.linear), 
-            process_param(gp_params.periodic), 
-            process_param(gp_params.rational), 
-            process_param(gp_params.polynomial), 
-            process_param(gp_params.matern),
+            process_param(gates), 
+            process_param(linear), 
+            process_param(periodic), 
+            process_param(rational), 
+            process_param(polynomial), 
+            process_param(matern),
             pi
         ], dim=-1)
         
@@ -81,7 +80,15 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
             return state
         
         
-        gp_features = self.pack_features(state.gp_params, state.pi)
+        gp_features = self.pack_features(gates=state.gates, 
+                                         linear=state.linear, 
+                                         periodic=state.periodic, 
+                                         rational=state.rational, 
+                                         polynomial=state.polynomial, 
+                                         matern=state.matern, 
+                                         pi=state.pi
+                                         )
+        
         lmc_learned = state.lmc_matrices
         
         mvn = None

@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.parametrizations as P
-from deepkernels.models.encoder import ConvolutionalLoopEncoder, ConvolutionalNetwork1D, EncoderOutput, EncoderConfig
+from deepkernels.models.encoder import ConvolutionalLoopEncoder, EncoderConfig
 from deepkernels.models.decoder import SpectralDecoder, DecoderConfig
-from deepkernels.models.dirichlet import AmortisedDirichlet, DirichletOutput, DirichletConfig
+from deepkernels.models.dirichlet import AmortisedDirichlet, DirichletConfig
 from typing import Tuple, Optional, TypeAlias, Tuple, Union, NamedTuple
 import torch.nn.functional as F
 import numpy as np
@@ -19,10 +19,14 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 from deepkernels.models.parent import BaseGenerativeModel
-from deepkernels.models.NKN import GPParams
 
 class StateSpaceOutput(NamedTuple):
-    gp_params: GPParams
+    gates: torch.Tensor
+    linear: torch.Tensor
+    periodic: torch.Tensor
+    polynomial: torch.Tensor
+    matern: torch.Tensor
+    rational: torch.Tensor
     bottleneck: torch.Tensor
     alpha: torch.Tensor
     alpha_mu: torch.Tensor
@@ -46,11 +50,11 @@ class SpectralVAE(BaseGenerativeModel):
     def __init__(self, config_encoder=None, dirichlet_config=None, decoder_config=None, seq_len=32):
         super().__init__()
         self.config_encoder = config_encoder if config_encoder is not None else EncoderConfig()
-        self.dirichlet_config = dirichlet_config if dirichlet_config is not None else DirichletConfig()
         self.decoder_config = decoder_config if decoder_config is not None else DecoderConfig()
+        self.dirichlet_config = dirichlet_config if dirichlet_config is not None else DirichletConfig()
+        self.encoder = ConvolutionalLoopEncoder(config=self.config_encoder)
         self.dirichlet = AmortisedDirichlet(config=self.dirichlet_config)
         self.decoder = SpectralDecoder(config=self.decoder_config)
-        self.encoder = ConvolutionalLoopEncoder(config=config_encoder)
         self.eps = self.dirichlet_config.eps
         self.k_atoms = self.dirichlet_config.k_atoms
         self.num_latents = self.dirichlet_config.num_latents
@@ -102,15 +106,12 @@ class SpectralVAE(BaseGenerativeModel):
             logvar_z = torch.ones(batch_size, f, device=device) * 0.05,
             lmc_matrices=initial_lmc,
             real_x=x,
-            
-            gp_params=GPParams(
-                gates=torch.ones(batch_size, 8, device=device) * 0.125,
-                periodic=torch.randn(batch_size, 32, device=device) * 0.01,
-                linear=torch.randn(batch_size, 32, device=device) * 0.01,
-                matern=torch.randn(batch_size, 32, device=device) * 0.01,
-                rational=torch.randn(batch_size, 32, device=device) * 0.01,
-                polynomial=torch.randn(batch_size, 32, device=device) * 0.01
-            )
+            gates=torch.ones(batch_size, 8, device=device) * 0.125,
+            periodic=torch.randn(batch_size, 32, device=device) * 0.01,
+            linear=torch.randn(batch_size, 32, device=device) * 0.01,
+            matern=torch.randn(batch_size, 32, device=device) * 0.01,
+            rational=torch.randn(batch_size, 32, device=device) * 0.01,
+            polynomial=torch.randn(batch_size, 32, device=device) * 0.01
         )
 
     def init_pi_value(self, batch_size, device):
@@ -170,15 +171,12 @@ class SpectralVAE(BaseGenerativeModel):
                 logvar_z = decoder_out.logvar_z,
                 lmc_matrices=decoder_out.lmc_matrices,
                 real_x=encoder_out.real_x,
-            
-                gp_params=GPParams(
-                    gates=decoder_out.gp_params.gates,
-                    periodic=decoder_out.gp_params.periodic,
-                    linear=decoder_out.gp_params.linear,
-                    matern=decoder_out.gp_params.matern,
-                    rational=decoder_out.gp_params.rational,
-                    polynomial=decoder_out.gp_params.polynomial
-                )
+                gates=decoder_out.gp_params.gates,
+                periodic=decoder_out.gp_params.periodic,
+                linear=decoder_out.gp_params.linear,
+                matern=decoder_out.gp_params.matern,
+                rational=decoder_out.gp_params.rational,
+                polynomial=decoder_out.gp_params.polynomial
             )
             
         return current_state
