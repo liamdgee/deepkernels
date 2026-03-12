@@ -75,7 +75,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
         self.max_ls = self.kwargs.get("max_ls", 15.0)
         self.noise_scalar = self.kwargs.get("noise_scalar", 0.316)
         self.num_experts = self.kwargs.get("num_experts", 8)
-        
+        self.n_data = kwargs.get('n_data', 76674.0)
         self.sigma_lower_bound = self.kwargs.get("sigma_lower_bound", 1e-4)
         self.sigma_upper_bound = self.kwargs.get("sigma_upper_bound", 5.0)
         self.mu_lower_bound = self.kwargs.get("mu_lower_bound", -17.0)
@@ -90,7 +90,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
         self.bottleneck_mixer = nn.Sequential(
             nn.utils.spectral_norm(nn.Linear(self.latent_dim, self.bottleneck_dim)), 
             nn.LayerNorm(self.bottleneck_dim), 
-            nn.Tanh()
+            nn.SiLU()
         )
         
         self.kernel_network = KernelNetwork(**kwargs)
@@ -99,11 +99,6 @@ class AmortisedDirichlet(BaseGenerativeModel):
         scale_constraint = gpytorch.constraints.GreaterThan(1e-4)
         jitter_constraint = gpytorch.constraints.GreaterThan(1e-6)
         positive_constraint = gpytorch.constraints.Positive()
-
-        atom_mu_upper_scale = self.mu_upper_bound / 100
-        atom_sigma_lower_scale = self.sigma_lower_bound / 100
-        atom_mu_lower_scale = self.mu_lower_bound / 100
-        atom_sigma_upper_scale = self.sigma_upper_bound / 100
 
         
         mu_constraint = gpytorch.constraints.Interval(lower_bound=-30.0, upper_bound=20.0)
@@ -251,7 +246,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
         """Helper to ensure we always pass a tensor to the inverse transform"""
         return value if torch.is_tensor(value) else torch.tensor(value)
     
-    def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params) -> DirichletOutput:
+    def forward(self, x, vae_out, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params) -> DirichletOutput:
         """
         performs nonparametric clustering according to a hierarchical dirichlet process using learned lengthscale
         and concentration param refinement
@@ -283,7 +278,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
             alpha_diag = getattr(vae_out, 'diag', None)
         
         if alpha_diag is None:
-            alpha_factor = torch.ones(batch_size, self.k_atoms, device=device)
+            alpha_diag = torch.ones(batch_size, self.k_atoms, device=device)
         
         
         alpha_factor = params.get('alpha_factor', None)
@@ -318,7 +313,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
 
         self.update_added_loss_term("inverse_wishart", LossTerm(iw_loss))
 
-        self.update_added_loss_term("local_divergence", LossTerm(local_kl.sum()))
+        self.update_added_loss_term("local_divergence", LossTerm(local_kl))
         
         ls_pred, bw_learned, ls_logvar = self.predict_kernel_lengthscales(ls)
         
@@ -460,8 +455,9 @@ class AmortisedDirichlet(BaseGenerativeModel):
             taylor_sum += 1.0 / (m * (m * q_b + q_a))
             
         kl += (gamma_conc - 1.0) * q_b * taylor_sum
+        global_kl = kl.sum(dim=-1) / self.n_data
         
-        return beta, gamma_conc, kl.sum(dim=-1)
+        return beta, gamma_conc, global_kl
 
     ##def global_stick_breaking(self, **params):
         #-variational inference-#
@@ -541,8 +537,8 @@ class AmortisedDirichlet(BaseGenerativeModel):
         pi_posterior = torch.clamp(dist_post.rsample(), min=self.posterior_eps)
         pi_posterior = pi_posterior / pi_posterior.sum(dim=-1, keepdim=True)
         local_divergence = torch.distributions.kl_divergence(dist_post, dist_prior)
-        
-        return pi_posterior, local_divergence
+        kl = local_divergence.mean()
+        return pi_posterior, kl
     
     def get_local_evidence(self, mu, factor, diag):
         """NB: this is actually alpha logits -- do not recalc in decoder from same value"""
@@ -590,8 +586,3 @@ class LossTerm(gpytorch.mlls.AddedLossTerm):
         
     def loss(self):
         return self.loss_tensor
-
-    
-    
-   
-

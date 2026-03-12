@@ -40,6 +40,7 @@ class StateSpaceOutput(NamedTuple):
     mu_z: torch.Tensor
     logvar_z: torch.Tensor
     lmc_matrices: torch.Tensor
+    real_x: torch.Tensor
 
 class SpectralVAE(BaseGenerativeModel):
     def __init__(self, **kwargs):
@@ -50,7 +51,7 @@ class SpectralVAE(BaseGenerativeModel):
         self.eps = kwargs.get('eps_dirichlet', 1e-4)
         self.kwargs=kwargs
     
-    def get_zero_state(self, device, batch_size):
+    def get_zero_state(self, x, device, batch_size):
         k = self.kwargs.get("k_atoms", 30)
         e = self.kwargs.get("num_latents", 8)
         f = self.kwargs.get("latent_dim", 16)
@@ -89,6 +90,7 @@ class SpectralVAE(BaseGenerativeModel):
             mu_z = torch.randn(batch_size, f, device=device) * self.eps,
             logvar_z = torch.ones(batch_size, f, device=device) * 0.05,
             lmc_matrices=initial_lmc,
+            real_x=x,
             
             gp_params=GPParams(
                 gates=torch.ones(batch_size, 8, device=device) * 0.125,
@@ -106,9 +108,9 @@ class SpectralVAE(BaseGenerativeModel):
         pi = F.softmax(pi, dim=-1)
         return pi
 
-    def refinement_loop(self, x, steps, current_state=None, generative_mode:bool=False):
+    def refinement_loop(self, x, steps, indices=None, current_state=None, generative_mode:bool=False):
         if current_state is None:
-            current_state = self.get_zero_state(x.device, batch_size=x.size(0))
+            current_state = self.get_zero_state(x, x.device, batch_size=x.size(0))
 
         #hist_recons, hist_pis = [], []
         #hist_gp_features, hist_bottlenecks, hist_expert_params = [], [], []
@@ -124,7 +126,7 @@ class SpectralVAE(BaseGenerativeModel):
                 x_t = current_state.recon 
             else:
                 x_t = x[:, t, :] if x.dim() == 3 else x
-            encoder_out = self.encoder(x_t, vae_out=current_state)
+            encoder_out = self.encoder(x_t, vae_out=current_state, indices=indices)
             
             
             dirichlet_out = self.dirichlet(
@@ -133,12 +135,14 @@ class SpectralVAE(BaseGenerativeModel):
                 ls=encoder_out.ls,
                 alpha_mu=encoder_out.alpha_mu,
                 alpha_diag=encoder_out.alpha_diag,
-                alpha_factor=encoder_out.alpha_factor
+                alpha_factor=encoder_out.alpha_factor,
+                indices=indices
             )
             
             decoder_out = self.decoder(
                 dirichlet_out.features,
-                dirichlet_out
+                dirichlet_out,
+                indices=indices
             )
             
             current_state = StateSpaceOutput(
@@ -159,6 +163,7 @@ class SpectralVAE(BaseGenerativeModel):
                 mu_z = decoder_out.mu_z,
                 logvar_z = decoder_out.logvar_z,
                 lmc_matrices=decoder_out.lmc_matrices,
+                real_x=x,
             
                 gp_params=GPParams(
                     gates=decoder_out.gp_params.gates,
@@ -172,7 +177,7 @@ class SpectralVAE(BaseGenerativeModel):
             
         return current_state
     
-    def forward(self, x, vae_out=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
+    def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         steps = steps if steps is not None else 3
-        current_state = self.refinement_loop(x=x, steps=steps, current_state=vae_out, generative_mode=False)
+        current_state = self.refinement_loop(x=x, steps=steps, indices=indices, current_state=vae_out, generative_mode=False)
         return current_state

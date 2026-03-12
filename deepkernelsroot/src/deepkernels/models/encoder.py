@@ -51,7 +51,7 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         self.fusion_net = nn.Sequential(
             torch.nn.utils.spectral_norm(nn.Linear(fusion_in_dim, 64)),
             nn.LayerNorm(64),
-            nn.Tanh()
+            nn.GELU()
         )
 
         #-wide base filter for rough trends-#
@@ -75,7 +75,7 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         self.latent_mu = nn.Linear(self.bottleneck_dim, self.latent_dim)
         self.latent_logvar = nn.Linear(self.bottleneck_dim, self.latent_dim)
 
-    def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
+    def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         """
         Args:
             x: Input features [Batch, seq_len, 30] or recon_x
@@ -140,7 +140,7 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         
         mu_data, logvar_data = self.run_convolutional_layers(x) #-outputs 64-#
 
-        conv_bottleneck = self.reparameterise(mu_data, logvar_data)
+        conv_bottleneck = self.reparameterise(mu_data, logvar_data, eps_min=-3.3, eps_max=3.3)
 
         log_pi = torch.log(pi + self.jitter) #-30-#
 
@@ -153,7 +153,7 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         
         mu_z = self.latent_mu(post_bottleneck)
         logvar_z = self.latent_logvar(post_bottleneck)
-
+        logvar_z = torch.clamp(logvar_z, min=-10.0, max=3.0)
         z = self.reparameterise(mu_z, logvar_z, eps_min=-3.3, eps_max=3.3)
         
         return EncoderOutput(
@@ -193,7 +193,7 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         mu = self.fc_mu(x)
         
         logvar = self.fc_logvar(x)
-        logvar = torch.clamp(logvar, min=-30.0, max=20.0)
+        logvar = torch.clamp(logvar, min=-10.0, max=3.0)
         return mu, logvar
     
 

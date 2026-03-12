@@ -63,7 +63,7 @@ class BaseGenerativeModel(gpytorch.Module):
         eps = torch.clamp(eps,  min=eps_min, max=eps_max)
         return mu + eps * std
     
-    def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
+    def forward(self, x, vae_out, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         raise NotImplementedError("Subclass must implement forward()")
         
     def get_variational_strategy(self):

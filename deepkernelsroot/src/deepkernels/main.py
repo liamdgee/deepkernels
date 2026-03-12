@@ -77,7 +77,7 @@ def parse_args():
     parser.add_argument("--target_col", type=str, default="lmean_rejected", help="The ground truth target variable")
     parser.add_argument("--seq_len", type=int, default=32, help="Sequence length for the state-space model")
     parser.add_argument("--batch_size", type=int, default=128, help="Mini-batch size for Stage 1 (VAE)")
-    parser.add_argument("--test_pct", type=float, default=0.2, help="test split")
+    parser.add_argument("--test_pct", type=float, default=0.1, help="test split")
     parser.add_argument("--num_workers", type=int, default=4, help="gpu optimisation")
     parser.add_argument(
         "--drop_cols", 
@@ -224,24 +224,31 @@ def main():
     logger.info("Running Data Orchestrator (Parallel Cleaning -> Merging -> Harmonising -> Sequencing)...")
     
     orchestrator = DataOrchestrator()
-
-    train_loader, val_loader, test_loader = orchestrator.run_pipeline(
+    x_tensor, y_tensor = orchestrator.run_pipeline(
         df1=df1,
         df2=df2,
         target_col=args.target_col,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
         drop_cols=args.drop_cols,
-        test_pct=args.test_pct,
-        num_workers=args.num_workers
+        float_64=True
     )
 
+    seq_x, seq_y = orchestrator.to_seq_data(
+        x_tensor,
+        y_tensor, 
+        seq_len=args.seq_len
+    )
+
+    train_loader, val_loader, test_loader = orchestrator.prepare_data(
+            seq_x, seq_y, seq_len=args.seq_len, val_pct=0.1, test_pct=0.1, 
+            batch_size=args.batch_size, num_workers=4
+        )
+    
     N = len(train_loader.dataset)
     args.n_data = N
     logger.info(f"Dataset loaded. Total training samples (N) = {N}")
 
     # ---------------------------------------------------------
-    #-- init ExactGP & model -- #
+    #-- init Variational GP & model -- #
     # ---------------------------------------------------------
     logger.info("Building StateSpaceKernelProcess...")
     model = StateSpaceKernelProcess(**vars(args)).to(device=device, dtype=torch.float64)

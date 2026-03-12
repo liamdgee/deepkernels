@@ -11,23 +11,15 @@ import gpytorch
 import torch
 
 from torch.distributions import LowRankMultivariateNormal, Independent, Normal, kl_divergence
+from typing import NamedTuple, List, Union, Optional
+import logging
 from deepkernels.models.NKN import GPParams
 
-from typing import NamedTuple, List, Union, Optional
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class LossTerm(gpytorch.mlls.AddedLossTerm):
-    """
-    A concrete implementation of an AddedLossTerm that simply 
-    returns a pre-calculated scalar tensor.
-    """
-    def __init__(self, loss_tensor):
-        self.loss_tensor = loss_tensor
-        
-    def loss(self):
-        return self.loss_tensor
-
-class DecoderOutput(NamedTuple):
-    """Structured output for the SpectralDecoder."""
+class StateSpaceOutput(NamedTuple):
     gp_params: GPParams
     bottleneck: torch.Tensor
     alpha: torch.Tensor
@@ -46,7 +38,7 @@ class DecoderOutput(NamedTuple):
     mu_z: torch.Tensor
     logvar_z: torch.Tensor
     lmc_matrices: torch.Tensor
-
+    real_x: torch.Tensor
 
 class SpectralDecoder(BaseGenerativeModel):
     def __init__(self,
@@ -69,7 +61,7 @@ class SpectralDecoder(BaseGenerativeModel):
         self.num_latents = self.kwargs.get("num_latents", 8)
         self.spectral_compressions = self.kwargs.get("spectral_compressions", [1024, 512, 128, 64])
         self.eps = self.kwargs.get("eps", 1e-3)
-        
+        self.n_data = kwargs.get('n_data', 76674.0)
         self.min_ls = self.kwargs.get("min_ls", 0.05)
         self.max_ls = self.kwargs.get("max_ls", 15.0)
         self.beta = self.kwargs.get("beta", 1.0)
@@ -79,12 +71,7 @@ class SpectralDecoder(BaseGenerativeModel):
         split_override = self.kwargs.get("disentangle_split_override", None)
         self.disentangle_split = split_override if split_override is not None else [4, 30, 30]
         
-        # ---Safety Check ---
-        if sum(self.disentangle_split) != self.bottleneck_dim:
-            raise ValueError(
-                f"Architecture mismatch! bottleneck_dim is {self.bottleneck_dim}, "
-                f"but disentangle_split sums to {sum(self.disentangle_split)} {self.disentangle_split}."
-            )
+    
         
         #--# safeguard
         self.num_experts = self.kwargs.get("num_experts", 8)
@@ -93,7 +80,7 @@ class SpectralDecoder(BaseGenerativeModel):
         current_dim = self.spectral_emb_dim
 
         for compression in self.spectral_compressions:
-            layers.append(torch.nn.utils.spectral_norm(nn.Linear(current_dim, compression)))
+            layers.append((nn.Linear(current_dim, compression)))
             layers.append(nn.LayerNorm(compression))
             layers.append(nn.SiLU())
             layers.append(nn.Dropout(self.dropout))
@@ -103,19 +90,9 @@ class SpectralDecoder(BaseGenerativeModel):
         #-current_dim is now 64
         self.compression_network = nn.Sequential(*layers)
 
-        self.ls_head_recon = nn.Sequential(
-            nn.Linear(4, self.input_dim), #-where input dim is input to the encoder i.e. num_features in real_x
-            nn.Tanh()            
-        )
-        self.pi_head_recon = nn.Sequential(
-            nn.Linear(30, self.input_dim),
-            nn.LayerNorm(self.input_dim),
-            nn.Sigmoid()
-        )
-        self.data_head_recon = nn.Sequential(
-            nn.LayerNorm(30),
-            nn.utils.spectral_norm(nn.Linear(30, self.input_dim))
-        )
+        self.ls_head_recon = TemporalReconDecoder(4, self.input_dim)
+        self.pi_head_recon = TemporalReconDecoder(30, self.input_dim)
+        self.data_head_recon = TemporalReconDecoder(30, self.input_dim)
 
         self.expert_variational_heads = nn.ModuleList([
             torch.nn.utils.spectral_norm(
@@ -138,12 +115,12 @@ class SpectralDecoder(BaseGenerativeModel):
         
         self.lengthscale_mu = nn.Linear(self.bottleneck_dim, self.k_atoms)
         self.lengthscale_logvar = nn.Linear(self.bottleneck_dim, self.k_atoms)
-        self.scale_head_per_expert = torch.nn.utils.spectral_norm(nn.Linear(self.k_atoms, self.num_latents))
+        self.scale_head_per_expert = nn.Linear(self.k_atoms, self.num_latents)
 
         self.register_added_loss_term("lengthscale_kl")
         self.register_added_loss_term("alpha_kl")
+        self.register_added_loss_term("recon_term")
         self.register_added_loss_term("recon_kl")
-
         self._init_weights()
     
     def _init_weights(self):
@@ -153,7 +130,7 @@ class SpectralDecoder(BaseGenerativeModel):
                 nn.init.orthogonal_(module.weight, gain=1.41)
 
 
-    def forward(self, x, vae_out, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
+    def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         """
         Args:
             spectral_features: [Batch, K*M*2] OR [Batch, K, M*2] as 'x' (embedded dim = 2048)
@@ -163,18 +140,29 @@ class SpectralDecoder(BaseGenerativeModel):
         ls_logvar_prior = getattr(vae_out, 'ls_logvar', None)
         mu_z = getattr(vae_out, 'mu_z', None)
         logvar_z = getattr(vae_out, 'logvar_z', None)
+        
         real_x = getattr(vae_out, 'real_x', None)
-        
-
-        spectral_bottleneck = self.compression_network(x)
-        
-        bottleneck = torch.tanh(spectral_bottleneck)
-
+        bottleneck = self.compression_network(x)
         recon, trend, amp, residuals = self.disentangle(bottleneck)
+        if real_x is not None:
+            if real_x.dim() == 2:
+                raise ValueError(f"CRITICAL: real_x is 2D {real_x.shape}. "
+                                 f"Expected 3D [Batch, Seq, Feat]. Check Encoder output.")
+            if real_x.dim() == 3 and real_x.shape[0] == self.kwargs.get('seq_len', 32):
+                real_x = real_x.transpose(0, 1).contiguous()
 
-        lossterm = self.log_recon_kl(real_x, recon, mu_z, logvar_z, beta=self.beta)
+            real_x = real_x.to(recon.dtype)
+            
+            if recon.shape != real_x.shape:
+                logger.warning(f"Shape mismatch in Recon: {recon.shape} vs {real_x.shape}. Forcing alignment.")
+                real_x = real_x.view_as(recon)
+        
 
-        self.update_added_loss_term("recon_kl", LossTerm(lossterm))
+        reconloss, reconkl = self.log_recon(real_x, recon, mu_z, logvar_z)
+
+        self.update_added_loss_term("recon_term", LossTerm(reconloss))
+
+        self.update_added_loss_term("recon_kl", LossTerm(reconkl))
 
         latent_expert_functions = [variational(bottleneck) for variational in self.expert_variational_heads]
 
@@ -188,15 +176,15 @@ class SpectralDecoder(BaseGenerativeModel):
         
         ls_sample, kl_div = self.predict_lengthscale_and_log_kl(bottleneck, ls_pred_prior, ls_logvar_prior)
 
-        self.update_added_loss_term("lengthscale_kl", LossTerm(kl_div.sum()))
+        self.update_added_loss_term("lengthscale_kl", LossTerm(kl_div))
 
-        bandwidth_mod = torch.sigmoid(self.scale_head_per_expert(ls_sample)) * 2.0
+        bandwidth_mod = self.scale_head_per_expert(ls_sample) * 2.0
 
         latent_features_per_expert = [head(var_state) for head, var_state in zip(self.expert_logit_heads, latent_expert_functions)]
 
         gp_features = torch.stack(latent_features_per_expert, dim=1)
 
-        vae_out = DecoderOutput(
+        vae_out = StateSpaceOutput(
             gp_params=vae_out.gp_params,
             bottleneck=bottleneck,
             alpha=vae_out.local_conc,
@@ -214,7 +202,8 @@ class SpectralDecoder(BaseGenerativeModel):
             ls=ls_sample,
             mu_z=mu_z,
             logvar_z=logvar_z,
-            lmc_matrices=vae_out.lmc_matrices
+            lmc_matrices=vae_out.lmc_matrices,
+            real_x=vae_out.real_x
         )
         
         return vae_out
@@ -234,23 +223,13 @@ class SpectralDecoder(BaseGenerativeModel):
         factor = self.factor_alpha(bottleneck).view(-1, self.k_atoms, self.rank)
         diag = F.softplus(self.diag_alpha(bottleneck)) + 1e-6
         return mu, factor, diag
-
-    def log_recon_kl(self, x, recon, mu_z, logvar_z, beta=1.0):
-        loss = F.mse_loss(recon, x, reduction='sum')
-        kl = -0.5 * torch.sum(1 + logvar_z - mu_z.pow(2) - logvar_z.exp())
-        lossterm = loss + (beta * kl)
-        return lossterm
-    
     
     def disentangle(self, bottleneck):
-        disentangle_split = self.disentangle_split or [4, 30, 30]
+        disentangle_split = [4, 30, 30]
         z_ls, z_pi, z_dt = torch.split(bottleneck, disentangle_split, dim=-1)
-        
-        trend     = self.ls_head_recon(z_ls) # (-1 to 1)
-        amplitude = self.pi_head_recon(z_pi) # (0 to 1)
-        residual  = self.data_head_recon(z_dt) # Unbounded
-        
-        # Physics-Informed Composition: Base trend + (Local Amplitude * High Frequency Details)
+        trend     = self.ls_head_recon(z_ls) 
+        amplitude = self.pi_head_recon(z_pi) 
+        residual  = self.data_head_recon(z_dt)
         recon = trend + (amplitude * residual)
         return recon, trend, amplitude, residual
     
@@ -277,7 +256,7 @@ class SpectralDecoder(BaseGenerativeModel):
             cov_diag=cov_diag
         )
         
-        prior_logit = self.inverse_softplus(1.0).to(mu.device)
+        prior_logit = torch.tensor(math.log(math.e - 1.0), device=mu.device)
         
         p_dist = torch.distributions.LowRankMultivariateNormal(
             loc=torch.full_like(mu, prior_logit), 
@@ -285,7 +264,11 @@ class SpectralDecoder(BaseGenerativeModel):
             cov_diag=torch.ones_like(cov_diag)
         )
         
-        return kl_divergence(q_dist, p_dist)
+        kl = kl_divergence(q_dist, p_dist)
+
+        scaled_alpha_kl = kl.sum(dim=-1).mean()
+
+        return scaled_alpha_kl
     
     def dirichlet_sample(self, alpha):
         alpha = F.softplus(alpha)
@@ -293,6 +276,11 @@ class SpectralDecoder(BaseGenerativeModel):
         q_alpha= torch.distributions.Dirichlet(alpha)
         pi_sample = q_alpha.rsample()
         return pi_sample
+    
+    def log_recon(self, x, recon, mu_z, logvar_z):
+        loss = F.mse_loss(recon, x, reduction='mean')
+        kl = -0.5 * torch.sum(1 + logvar_z - mu_z.pow(2) - logvar_z.exp(), dim=-1).mean()
+        return loss, kl
 
     def predict_lengthscale_and_log_kl(self, bottleneck, ls_pred_prior=None, ls_logvar_prior=None):
         """
@@ -325,5 +313,39 @@ class SpectralDecoder(BaseGenerativeModel):
         p_log_ls = dist.Normal(prior_loc, prior_scale)
         
         kl_div = dist.kl_divergence(q_log_ls, p_log_ls)
+        total_kl = kl_div.sum(dim=-1)
+        scaled_global_kl = total_kl / self.n_data
+        return ls_sample, scaled_global_kl
+    
+class TemporalReconDecoder(nn.Module):
+    def __init__(self, in_dim, out_features, seq_len=32):
+        super().__init__()
+        self.init_channels = 64
+        self.init_length = 4
+        self.fc = nn.Linear(in_dim, self.init_channels * self.init_length)
+        self.deconv = nn.Sequential(
+            nn.ConvTranspose1d(64, 32, kernel_size=4, stride=2, padding=1), 
+            nn.LayerNorm([32, 8]),
+            nn.GELU(),
+            nn.ConvTranspose1d(32, 32, kernel_size=4, stride=2, padding=1), 
+            nn.LayerNorm([32, 16]),
+            nn.GELU(),
+            nn.ConvTranspose1d(32, out_features, kernel_size=4, stride=2, padding=1)
+        )
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        x = self.fc(x).view(batch_size, self.init_channels, self.init_length)
+        x = self.deconv(x)
+        return x.transpose(1, 2)
+
+class LossTerm(gpytorch.mlls.AddedLossTerm):
+    """
+    A concrete implementation of an AddedLossTerm that simply 
+    returns a pre-calculated scalar tensor.
+    """
+    def __init__(self, loss_tensor):
+        self.loss_tensor = loss_tensor
         
-        return ls_sample, kl_div.sum(dim=-1)
+    def loss(self):
+        return self.loss_tensor

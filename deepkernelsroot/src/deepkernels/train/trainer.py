@@ -213,10 +213,11 @@ class ParameterIsolate:
             routed_params += 1
         
         base_lr_adamw = self.kwargs.get('base_lr_adamw', 1.175e-3)
-        base_decay_adamw = base_lr_adamw / 10
-        slow_decay_adamw = base_decay_adamw / 10
-        slow_lr = (base_lr_adamw / 10) * 4.77    #~-5e-4
-        very_slow_lr = (base_lr_adamw / 250) * 2.77 #~1.3e-5
+        
+        slow_lr = base_lr_adamw / 10    
+        
+        base_decay_adamw = self.kwargs.get('base_decay_adamw', 0.05)
+        slow_decay_adamw = self.kwargs.get('slow_decay_adamw', 0.001)
         gp_global_hyper_lr = self.kwargs.get('gp_global_hyper_lr', 3e-3)
         gp_mean_lr = self.kwargs.get('gp_mean_lr', 2e-3)
         gp_likelihood_lr = self.kwargs.get('gp_likelihood_lr', 5e-3)

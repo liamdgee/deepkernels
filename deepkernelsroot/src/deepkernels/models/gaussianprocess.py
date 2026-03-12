@@ -67,12 +67,11 @@ class AcceleratedKernelGP(gpytorch.models.ApproximateGP):
         
         self.covar_module = GenerativeKernel(batch_shape=latent_batch_shape)
 
-    def forward(self, x, lmc_learned=None, diag=None, **kwargs):
+    def forward(self, x, lmc_learned=None, diag=None, indices=None, **kwargs):
         """
         x: The PACKED feature tensor [..., N, 168] coming from the decoder.
         kwargs: Contains 'pi' for the Mixture Mean.
         """
-
         if lmc_learned is not None:
             if lmc_learned.dim() == 3:
                 lmc_learned = lmc_learned.mean(dim=0)

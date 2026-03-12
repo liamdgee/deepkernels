@@ -15,6 +15,12 @@ from deepkernels.models.variationalautoencoder import SpectralVAE, StateSpaceOut
 from deepkernels.models.gaussianprocess import AcceleratedKernelGP
 from deepkernels.models.NKN import GPParams
 from typing import NamedTuple, Optional
+import logging
+
+#---Init logger---#
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class ModelOutput(NamedTuple):
     state: StateSpaceOutput
@@ -60,18 +66,22 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
         
         return packed.contiguous()
 
-    def forward(self, x, vae_out=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
+    def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         batch_size = x.size(0)
         steps = steps if steps is not None else 3
-        
+
+        updated_params = {**params, "indices": indices}
         if vae_out is None:
-            vae_out = self.vae.get_zero_state(x.device, batch_size=batch_size)
+            vae_out = self.vae.get_zero_state(x, x.device, batch_size=batch_size)
         
+        
+
         state = self.vae(
             x,
             vae_out=vae_out,
             steps=steps,
             batch_shape=batch_shape,
+            indices=indices,
             **params
         )
         
@@ -81,15 +91,17 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
         
         gp_features = self.pack_features(state.gp_params, state.pi)
         lmc_learned = state.lmc_matrices
+        
         mvn = None
+
         if self.gp is not None and self.run_gp:
-            
-            mvn = self.gp(gp_features, x=gp_features, lmc_learned=lmc_learned)
+            mvn = self.gp(gp_features, x=gp_features, lmc_learned=lmc_learned, indices=indices, **self.kwargs)
         
         return ModelOutput(
             state=state,
             gp_out=mvn, 
-            gp_in=gp_features #-dim 168
+            gp_in=gp_features,
+            **updated_params
         )
     
     

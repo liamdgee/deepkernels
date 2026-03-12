@@ -88,7 +88,6 @@ class DataOrchestrator:
         Input: [Total_Rows, Features] -> Output: [Num_Windows, Seq_Len, Features]
         """
         logger.info(f"Unfolding sequences of length {seq_len}...")
-        
         seq_x = tensor_x.unfold(dimension=0, size=seq_len, step=1).transpose(1, 2)
         
         if tensor_y.dim() == 1:
@@ -118,23 +117,29 @@ class DataOrchestrator:
         train_x, train_y = seq_x[:train_end], seq_y[:train_end]
         val_x, val_y = seq_x[val_start:val_end], seq_y[val_start:val_end]
         test_x, test_y = seq_x[test_start:], seq_y[test_start:]
-        
+        train_y_point = train_y[:, -1, :]
+        val_y_point = val_y[:, -1, :]
+        test_y_point = test_y[:, -1, :]
         logger.info(f"Chronological Split (Purged Overlaps) -> Train: {train_x.size(0)} | Val: {val_x.size(0)} | Test: {test_x.size(0)}")
         loader_kwargs = {
             "batch_size": batch_size,
             "shuffle": False,
             "pin_memory": True,
             "num_workers": num_workers,
+            "drop_last": True,
             "prefetch_factor": 2 if num_workers > 0 else None,
             "persistent_workers": True if num_workers > 0 else False  # <--- ADD THIS
         }
-        train_loader = DataLoader(TensorDataset(train_x, train_y), **loader_kwargs)
-        val_loader = DataLoader(TensorDataset(val_x, val_y), **loader_kwargs)
-        test_loader = DataLoader(TensorDataset(test_x, test_y), **loader_kwargs)
+        indices_train = torch.arange(train_x.size(0))
+        indices_val = torch.arange(val_x.size(0))
+        indices_test = torch.arange(test_x.size(0))
+        train_loader = DataLoader(TensorDataset(train_x, train_y_point, indices_train), **loader_kwargs)
+        val_loader = DataLoader(TensorDataset(val_x, val_y_point, indices_val), **loader_kwargs)
+        test_loader = DataLoader(TensorDataset(test_x, test_y_point, indices_test), **loader_kwargs)
         
         return train_loader, val_loader, test_loader
     
-    def run_pipeline(self, df1: pd.DataFrame, df2:pd.DataFrame, float_64:bool=False, val_pct:float=0.1, test_pct:float=0.1, target_col: str='lmean_rejected', drop_cols: Optional[list[str]]=None, seq_len: int = 64, batch_size:int = 128, num_workers: int = 4):
+    def run_pipeline(self, df1: pd.DataFrame, df2:pd.DataFrame, float_64:bool=False, target_col: str='lmean_rejected', drop_cols: Optional[list[str]]=None):
         """Runs the entire pipeline end-to-end smoothly."""
         df1_clean = self.cleaner_df1.fit_transform(df1)
         df2_clean = self.cleaner_df2.fit_transform(df2)
@@ -166,12 +171,4 @@ class DataOrchestrator:
             X_tensor = torch.tensor(X_numeric.to_numpy(), dtype=torch.float32)
             y_tensor = torch.tensor(y_sorted.to_numpy(), dtype=torch.float32)
         
-        seq_x, seq_y = self.to_seq_data(X_tensor, y_tensor, seq_len=seq_len)
-        
-        train_loader, val_loader, test_loader = self.prepare_data(
-            seq_x, seq_y, seq_len=seq_len, val_pct=val_pct, test_pct=test_pct, 
-            batch_size=batch_size, num_workers=num_workers
-        )
-        
-        logger.info("Pipeline execution complete. DataLoaders ready for training.")
-        return train_loader, val_loader, test_loader
+        return X_tensor, y_tensor

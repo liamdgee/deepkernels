@@ -46,7 +46,7 @@ traininghypers:
   warmup_gp_epochs: 150
   gp_epochs: 500
   em_macro_cycles: 8
-  joint_epochs: 1500
+  joint_epochs: 500
   e_epochs_per_cycle: 3
   m_epochs_per_cycle: 5
 
@@ -54,27 +54,29 @@ traininghypers:
 # Optimizers & Learning Rates
 # ==========================================
 optimisertuning:
-  base_lr: 0.00001175
-  fast_dir: 0.00005
-  med_dir: 0.000007
-  slow_dir: 0.00000033
-  gamma_dir: 0.00000001
-  ultrasensitive_lr: 0.000005
-  sensitive_lr: 0.00001
-  gp_mean_lr: 0.000777
-  gp_likelihood_lr: 0.000177
-  gp_global_hyper_lr: 0.00035
-  lmc_lr: 0.0000075
-  gp_lengthscale_lr: 0.000035
-  gp_kernel_nkn_lr: 0.00008
+  base_lr_adamw: 0.001175
+  slow_decay_adamw: 0.001
+  base_decay_adamw: 0.05
+  fast_dir: 0.0015
+  med_dir: 0.0017
+  slow_dir: 0.000533
+  gamma_dir: 0.00031
+  ultrasensitive_lr: 0.0005
+  sensitive_lr: 0.0001
+  gp_mean_lr: 0.002777
+  gp_likelihood_lr: 0.002177
+  gp_global_hyper_lr: 0.00235
+  lmc_lr: 0.001175
+  gp_lengthscale_lr: 0.00035
+  gp_kernel_nkn_lr: 0.0001
 
 # ==========================================
 # Langevin & Gradient Norm Limits
 # ==========================================
 langevindynamics:
-  temp: 0.000000071375
-  max_grad_norm: 1.1245
-  clip_norm: 1.86
+  temp: 0.00000171375
+  max_grad_norm: 2.2245
+  langevin_clip_norm: 5.86
 
 # ==========================================
 # Model Dimensions & Architecture
@@ -109,19 +111,19 @@ spectralfeatures:
 # ==========================================
 lossesandpenalties:
   beta: 0.9
-  iw_stop_beta: 0.1
-  kl_stop_beta: 0.1
+  iw_stop_beta: 0.07
+  kl_stop_beta: 0.05
   kl_cycles: 4
-  kl_weights: {} ##{"global_divergence": 2e-6, "local_divergence": 1.3e-5, "alpha_kl": 2e-2, "lengthscale_kl": 3e-3, "inverse_wishart": 3e-4}
+  kl_weights: {"global_divergence": 0.0, "local_divergence": 0.0, "alpha_kl": 0.0, "lengthscale_kl": 0.0, "inverse_wishart": 0.0, "recon_kl": 0.0}
 
 # ==========================================
 # Numerical Stability & Bounds
 # ==========================================
 numericalstability:
   dropout: 0.05
-  jitter: 0.0000015
-  cholesky_jitter: 0.000002
-  cholesky_jitter_large: 0.003
+  jitter: 0.000015
+  cholesky_jitter: 0.0002
+  cholesky_jitter_large: 0.0043
   eps: 0.00015
   eps_dirichlet: 0.0001
   large_eps: 0.045
@@ -129,7 +131,7 @@ numericalstability:
   min_ls: 0.1
   max_ls: 8.0
   conc_clamp: 10.0
-  min_noise: 0.00015
+  min_noise: 0.0015
   
 # ==========================================
 # Environment & Hardware Detection

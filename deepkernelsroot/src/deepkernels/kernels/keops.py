@@ -320,12 +320,10 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
         base_diag = base_diag * os_view
         
         base_diag = base_diag.unsqueeze(0)
+        os_view = self.outputscale.view(*self.batch_shape, 1)
+        amp_view = self.latent_amplitude.view(*self.batch_shape, 1)
         
-        num_latents = self.latent_amplitude.size(0)
-        amp_shape = [num_latents] + [1] * (base_diag.dim() - 1)
-        amp_view = self.latent_amplitude.view(*amp_shape)
-        
-        return base_diag * amp_view
+        return base_diag * os_view * amp_view
 
 
 class ProbabilisticMixtureMean(gpytorch.means.Mean):
@@ -343,7 +341,7 @@ class ProbabilisticMixtureMean(gpytorch.means.Mean):
         """
         target_shape = x.shape[:-1]
         pi = x[..., 168: 198]
-        c_T = self.cluster_constants.t() 
+        c_T = self.cluster_constants.transpose(0, 1)
         for _ in range(pi.dim() - c_T.dim()):
             c_T = c_T.unsqueeze(-2)
         latent_means = (pi * c_T).sum(dim=-1)
