@@ -83,7 +83,7 @@ class SpectralVAE(BaseGenerativeModel):
         alpha_factor += torch.randn_like(alpha_factor) * 0.001
         #-pi init-#
         init_pi = self.init_pi_value(batch_size=batch_size, device=device)
-        initial_lmc = torch.zeros(k, e, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+        initial_lmc = torch.zeros(batch_size, k, e, device=device)
         symmetry_breaker = torch.randn_like(initial_lmc) * 1e-4
         initial_lmc = initial_lmc + symmetry_breaker
 
@@ -171,12 +171,12 @@ class SpectralVAE(BaseGenerativeModel):
                 logvar_z = decoder_out.logvar_z,
                 lmc_matrices=decoder_out.lmc_matrices,
                 real_x=encoder_out.real_x,
-                gates=decoder_out.gp_params.gates,
-                periodic=decoder_out.gp_params.periodic,
-                linear=decoder_out.gp_params.linear,
-                matern=decoder_out.gp_params.matern,
-                rational=decoder_out.gp_params.rational,
-                polynomial=decoder_out.gp_params.polynomial
+                gates=decoder_out.gates,
+                periodic=decoder_out.periodic,
+                linear=decoder_out.linear,
+                matern=decoder_out.matern,
+                rational=decoder_out.rational,
+                polynomial=decoder_out.polynomial
             )
             
         return current_state

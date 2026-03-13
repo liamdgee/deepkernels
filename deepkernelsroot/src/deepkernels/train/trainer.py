@@ -33,10 +33,10 @@ from dataclasses import dataclass
 class TrainerConfig:
     # --- Dataset & Epochs ---
     n_data: float = 76674.0
-    warmup_vae_epochs: int = 50
-    vae_epochs: int = 250
-    warmup_gp_epochs: int = 100
-    gp_epochs: int = 200
+    warmup_vae_epochs: int = 0
+    vae_epochs: int = 0
+    warmup_gp_epochs: int = 120
+    gp_epochs: int = 300
 
     # --- AdamW Optimiser (VAE / Encoder / Decoder) ---
     base_lr_adamw: float = 1.175e-3
@@ -70,9 +70,9 @@ class TrainerConfig:
     rmspropeps: float = 1e-7
 
     #-epochs-#
-    em_macro_cycles: int = 8
-    e_epochs_per_cycle: int = 3
-    m_epochs_per_cycle: int = 5
+    em_macro_cycles: int = 0
+    e_epochs_per_cycle: int = 0
+    m_epochs_per_cycle: int = 0
     joint_epochs: int = 0
 
 class ParameterIsolate:
@@ -110,6 +110,10 @@ class ParameterIsolate:
         self.encoder_module = self.model.vae.encoder
         self.decoder_module = self.model.vae.decoder
         self.dirichlet_module = self.model.vae.dirichlet
+
+        self.langevin_optimiser = None
+        self.adamw_optimiser = None
+        self.adam_optimiser = None
 
     def seperate_params_and_build_optimisers(self):
         """Executes the massive parameter routing and returns the two optimizers."""
@@ -278,7 +282,7 @@ class ParameterIsolate:
             routed_params += 1
         
 
-        adamw_optimiser = torch.optim.AdamW([
+        self.adamw_optimiser = torch.optim.AdamW([
             {'params': conv_params, 'lr': self.base_lr_adamw, 'weight_decay': self.base_decay_adamw},
             {'params': fusion_params, 'lr': self.base_lr_adamw, 'weight_decay': self.base_decay_adamw},
             {'params': latent_params, 'lr': self.slow_lr, 'weight_decay': self.slow_decay_adamw},
@@ -286,7 +290,7 @@ class ParameterIsolate:
             {'params': probabilistic_nn_params, 'lr': self.base_lr_adamw, 'weight_decay': self.slow_decay_adamw},
         ])
 
-        langevin_optimiser = torch.optim.RMSprop([
+        self.langevin_optimiser = torch.optim.RMSprop([
             {'params': dirichlet_atom_params, 'lr': self.med_dir},
             {'params': dirichlet_global_dist_params, 'lr': self.slow_dir},
             {'params': dirichlet_gamma_params, 'lr': self.gamma_lr},
@@ -296,7 +300,7 @@ class ParameterIsolate:
             {'params': dirichlet_lmc_params, 'lr': self.lmc_lr},
         ], alpha=self.rmspropalpha, eps=self.rmspropeps)
 
-        adam_optimiser = torch.optim.Adam([
+        self.adam_optimiser = torch.optim.Adam([
             {'params': likelihood_params, 'lr': self.gp_likelihood_lr},
             {'params': gp_mean_params, 'lr': self.gp_mean_lr},
             {'params': gp_kernel_global_params, 'lr': self.gp_global_hyper_lr},
@@ -311,7 +315,7 @@ class ParameterIsolate:
             {'params': gp_other_params, 'lr': self.base_lr_adamw}
         ], weight_decay=0.0)
         
-        total_opt_params = sum(len(group['params']) for opt in [adamw_optimiser, langevin_optimiser, adam_optimiser] for group in opt.param_groups)
+        total_opt_params = sum(len(group['params']) for opt in [self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser] for group in opt.param_groups)
         logger.info(f"Parameter Isolation Complete. {total_opt_params}/{total_trainable_params} tensors strictly routed into 3 Optimizers.")
         
         if total_trainable_params != total_opt_params:
@@ -325,7 +329,7 @@ class ParameterIsolate:
             "gp_total": all_gp_params
         }
 
-        return adamw_optimiser, langevin_optimiser, adam_optimiser, self.module_groups
+        return self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser, self.module_groups
     
     def _set_group_grad(self, group_name: str, requires_grad: bool):
         """Helper to cleanly flip gradients for a specific parameter list."""

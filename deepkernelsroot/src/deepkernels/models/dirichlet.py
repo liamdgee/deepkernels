@@ -178,7 +178,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
         self.register_parameter(name="raw_h_mu", parameter=nn.Parameter(torch.zeros(1, 1, self.latent_dim)))
         self.register_constraint("raw_h_mu", mu_constraint)
 
-        self.register_parameter(name="raw_h_sigma", parameter=nn.Parameter(torch.zeros(1)))
+        self.register_parameter(name="raw_h_sigma", parameter=nn.Parameter(torch.zeros(1, 1, self.latent_dim)))
         self.register_constraint("raw_h_sigma", sigma_constraint)
         
         #-atoms for spectral features (gaussian)-#
@@ -408,13 +408,25 @@ class AmortisedDirichlet(BaseGenerativeModel):
             return raw
         safe = math.log(math.expm1(raw))
         return safe
-    
     def get_omega(self, bw, **params):
-        # Broadcasting: [1, 1, D] + [K, 1, D] + ([K, M, D] * [B, K, 1, D])
-        noise_weights = self.noise_weights
-        omega = self.h_mu + self.atom_loc + noise_weights.unsqueeze(0) * bw
+        # 1. h_mu is [1, 1, 16] -> Already perfect
+        h = self.h_mu
+        
+        # 2. atom_loc is [30, 1, 16] -> Swap to [1, 30, 16]
+        a = self.atom_loc.transpose(0, 1)
+        
+        # 3. bw is [128, 30, 16] -> Already perfect
+        # 4. noise_weights is [30, 128, 16] -> Swap to [128, 30, 16]
+        w = self.noise_weights.transpose(0, 1)
+        
+        # 5. Math is now perfectly aligned:
+        # [128, 30, 16] * [128, 30, 16] = [128, 30, 16]
+        dynamic_part = bw * w
+        
+        # [1, 1, 16] + [1, 30, 16] + [128, 30, 16] = [128, 30, 16]
+        omega = h + a + dynamic_part
+        
         return torch.clamp(omega, -100.0, 100.0)
-    
     
     def coregionalisation_matrix(self, pi):
         batch_size = pi.size(0)
@@ -547,22 +559,29 @@ class AmortisedDirichlet(BaseGenerativeModel):
         #beta = torch.clamp(beta, min=1e-7)
         #beta = beta / beta.sum(dim=-1, keepdim=True)
         #return beta, log_pv, log_qv, gamma_conc
-    
     def predict_kernel_lengthscales(self, ls, **params):
         
-        # NB: Multiply standard variances, don't add logs. No softplus needed!
         bw_base = (self.h_sigma * self.atom_scale) + self.jitter
+        
+        bw_base = bw_base.squeeze(1)
         
         if ls is None:
             ls_pred = bw_base.mean(dim=-1, keepdim=True)
             ls_pred = torch.clamp(ls_pred, min=self.min_ls, max=self.max_ls)
-            ls_logvar = torch.zeros(1, self.k_atoms, device=ls_pred.device)
-            bw_learned = bw_base.unsqueeze(0) 
+            ls_logvar = torch.zeros(1, self.k_atoms, device=bw_base.device)
+            bw_learned = bw_base.unsqueeze(0) # [1, 30, 16]
         else:
             ls_pred = torch.clamp(ls, min=self.min_ls, max=self.max_ls)
             batch_size = ls_pred.size(0)
-            precision = 1.0 / (ls_pred.view(batch_size, self.k_atoms, 1, 1) + self.eps)
-            bw_learned = bw_base.unsqueeze(0) * precision
+            
+            # ls_pred is [128, 30]. We unsqueeze to [128, 30, 1]
+            precision = 1.0 / (ls_pred.unsqueeze(-1) + self.eps)
+            
+            # bw_base is [30, 16]. We unsqueeze to [1, 30, 16]
+            bw_base_expanded = bw_base.unsqueeze(0)
+            
+            # Perfect Broadcast: [1, 30, 16] * [128, 30, 1] -> [128, 30, 16]
+            bw_learned = bw_base_expanded * precision
             
             ls_logvar = self.lengthscale_uncertainty.expand(batch_size, -1)
 

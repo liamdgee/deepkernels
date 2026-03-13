@@ -9,7 +9,15 @@ import logging
 import argparse
 import mlflow
 import torch
-torch.cuda.empty_cache()
+import mlflow.pytorch
+import logging
+
+#---Init logger---#
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+#torch.cuda.empty_cache()
 
 torch.set_default_dtype(torch.float64)
 import sys
@@ -24,6 +32,7 @@ import os
 if 'CONDA_PREFIX' in os.environ:
     os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
     os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -218,6 +227,31 @@ def main():
     trainer_dynamics = {k: v for k, v in vars(args).items() if k in model_keys_with_seq_len}
     
     model = StateSpaceKernelProcess().to(device=device, dtype=torch.float64)
+    run_id = "3c034b2a02714eca813777236750f1a0"
+    model_uri = f"runs:/{run_id}/model_stage2_vae_full"
+    logger.info(f"Loading pretrained VAE from {model_uri}...")
+    pretrained_vae = mlflow.pytorch.load_model(model_uri)
+
+
+    pretrained_dict = pretrained_vae.state_dict()
+    bad_keys = ['gp.mean_module.cluster_constants', 'gp.variational_strategy.lmc_coefficients', 'gp.likelihood', 'gp.likelihood.raw_task_noises', 'gp.variational_strategy.base_variational_strategy.inducing_points']
+    for key in bad_keys:
+        if key in pretrained_dict:
+            del pretrained_dict[key]
+
+    sigma_key = 'vae.dirichlet.raw_h_sigma'
+    nkn_key = 'gp.covar_module.raw_inv_bandwidth'
+    if sigma_key in pretrained_dict:
+        old_sigma = pretrained_dict[sigma_key]
+        if old_sigma.shape == torch.Size([1]):
+            pretrained_dict[sigma_key] = old_sigma.view(1, 1, 1).repeat(1, 1, 16)
+            print(f"DEBUG: Successfully expanded {sigma_key} from [1] to [1, 1, 16]")
+    if nkn_key in pretrained_dict:
+        old_bw = pretrained_dict[nkn_key]
+        if old_bw.shape == torch.Size([1, 32]):
+            pretrained_dict[nkn_key] = old_bw.view(32)
+            print(f"DEBUG: Successfully expanded {nkn_key} from [1, 32] to [32]")
+    model.load_state_dict(pretrained_dict, strict=False)
     
     trainer = LangevinTrainer(
         model=model,

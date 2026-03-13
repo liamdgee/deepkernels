@@ -12,7 +12,7 @@ if 'CONDA_PREFIX' in os.environ:
 from tqdm import tqdm
 
 from deepkernels.models.variationalautoencoder import SpectralVAE, StateSpaceOutput
-from deepkernels.models.gaussianprocess import AcceleratedKernelGP
+from deepkernels.models.gaussianprocess import AcceleratedKernelGP, DynamicStrategy
 from typing import NamedTuple, Optional
 import logging
 
@@ -21,50 +21,34 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class ModelOutput(NamedTuple):
-    state: StateSpaceOutput
-    gp_out: Optional[gpytorch.distributions.MultivariateNormal]
-    gp_in: torch.Tensor
-
 class StateSpaceKernelProcess(BaseGenerativeModel):
-    def __init__(self, likelihood=None, gp=None, run_gp:bool=False, k_atoms=30, min_noise=1e-3):
+    def __init__(self, likelihood=None, gp=None, k_atoms=30, num_latents=8, min_noise=3e-3):
         super().__init__()
         self.vae = SpectralVAE()
-        if likelihood is not None:
-            self.likelihood = likelihood
-        else:
-            self.likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=k_atoms, noise_constraint=gpytorch.constraints.GreaterThan(min_noise))
-        
-        self.run_gp = run_gp
-        if gp is not None:
-            self.gp = gp(likelihood=self.likelihood)
-        else:
-            self.gp = AcceleratedKernelGP(
-                likelihood=self.likelihood
+        self.gp = AcceleratedKernelGP(
+                likelihood=gpytorch.likelihoods.MultitaskGaussianLikelihood(
+                    num_tasks=k_atoms,
+                    noise_constraint=gpytorch.constraints.GreaterThan(min_noise))
             )
-    
-    def pack_features(self, gates, linear, periodic, rational, polynomial, matern, pi):
-        """Safely pool any 4D tensors to 3D and concatenate the 198D payload."""
-        def process_param(p):
-            return p.mean(dim=2) if p.dim() == 4 else p
+    def pack_features(self, gates, linear, periodic, rational, polynomial, matern):
+        def to_3d(p):
+            if p.dim() == 4:
+                return p.squeeze(1) if p.size(1) == 1 else p.squeeze(2)
+            if p.dim() == 2:
+                return p.unsqueeze(0).expand(8, -1, -1)
+            return p
 
         packed = torch.cat([
-            process_param(gates), 
-            process_param(linear), 
-            process_param(periodic), 
-            process_param(rational), 
-            process_param(polynomial), 
-            process_param(matern),
-            pi
+            to_3d(gates), to_3d(linear), to_3d(periodic),
+            to_3d(rational), to_3d(polynomial), to_3d(matern)
         ], dim=-1)
         
         return packed.contiguous()
 
     def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
-        batch_size = x.size(0)
         steps = steps if steps is not None else 3
         if vae_out is None:
-            vae_out = self.vae.get_zero_state(x, x.device, batch_size=batch_size)
+            vae_out = self.vae.get_zero_state(x, x.device, batch_size=x.size(0))
         
         
 
@@ -77,29 +61,21 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
         )
         
         if features_only:
-            return state
+            return state, None, None
         
+        gp_features = torch.cat([state.gates, state.linear, state.periodic, state.rational,state.polynomial, state.matern], dim=1)
+        gp_input = gp_features.unsqueeze(0).expand(8, -1, -1)
+        # --- CATCH THE MUTATION ---
+        print(f"DEBUG: periodic shape right before KeOps: {state.periodic.shape}, gates: {state.gates.shape}, linear: {state.linear.shape}, rational: {state.rational.shape}, poly: {state.polynomial.shape}, matern: {state.matern.shape}, lmc: {state.lmc_matrices.shape}")
+        # --------------------------
         
-        gp_features = self.pack_features(gates=state.gates, 
-                                         linear=state.linear, 
-                                         periodic=state.periodic, 
-                                         rational=state.rational, 
-                                         polynomial=state.polynomial, 
-                                         matern=state.matern, 
-                                         pi=state.pi
-                                         )
-        
-        lmc_learned = state.lmc_matrices
+        #lmc = state.lmc_matrices
+        #lmc_param = lmc.view(-1).contiguous()
         
         mvn = None
 
-        if self.gp is not None and self.run_gp:
-            mvn = self.gp(gp_features, x=gp_features, lmc_learned=lmc_learned, indices=indices)
-        
-        return ModelOutput(
-            state=state,
-            gp_out=mvn, 
-            gp_in=gp_features
-        )
+        mvn = self.gp(gp_features, indices=indices)
+
+        return state, mvn, gp_features
     
     

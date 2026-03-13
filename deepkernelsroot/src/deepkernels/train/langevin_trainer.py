@@ -160,12 +160,15 @@ class LangevinTrainer:
         """Standard mini-batch step for Stage 1."""
         self.adamw_optimiser.zero_grad()
         self.langevin_optimiser.zero_grad()
-        state = self.model(x, indices=ind, run_gp=False)
+        state, mvn, _ = self.model.forward(x, indices=ind, steps=3, features_only=True)
         loss, metrics = self.objective(
-            model=self.model, state_out=state, global_step=global_step, annealers=annealers,
+            model=self.model, 
+            state_out=state, 
+            global_step=global_step, 
+            annealers=annealers,
             total_steps=total_steps,
-            gp_output= state.gp_out if hasattr(state, 'gp_out') else None, 
-            gp_target=y
+            gp_output=mvn, 
+            gp_target=y.view(-1) if y.dim() > 1 else y
         )
 
         if not torch.isfinite(loss):
@@ -184,7 +187,7 @@ class LangevinTrainer:
         
         return metrics
     
-    def step_gp(self, x, y, ind, annealers, global_step, total_steps, cholesky_jitter_val = 1e-3):
+    def step_gp(self, x, y, ind, annealers, global_step, total_steps, cholesky_jitter_val = 1e-2):
         """Full-batch exact step for Stage 2."""
         self.adam_optimiser.zero_grad()
         
@@ -195,12 +198,12 @@ class LangevinTrainer:
             gpytorch.settings.cg_tolerance(2.4), \
             gpytorch.settings.num_trace_samples(2):
             
-            state = self.model(x, indices=ind, run_gp=True)
+            state, mvn, _ = self.model.forward(x, indices=ind, steps=1, features_only=False)
             loss, metrics = self.objective(
-                model=self.model,
-                gp_output=state.gp_out if hasattr(state, 'gp_out') else None,
-                state_out = state,
-                gp_target=y,
+                model =self.model,
+                gp_output=mvn,
+                state_out=state,
+                gp_target=y.view(-1) if y.dim() > 1 else y,
                 global_step=global_step,
                 annealers=annealers,
                 total_steps=total_steps
@@ -243,25 +246,26 @@ class LangevinTrainer:
                 y = y.to(self.device, dtype=torch.float64)
                 ind = ind.to(self.device)
                 
-                state = self.model(x, indices=ind, run_gp=True)
+                state, mvn, _ = self.model.forward(x, indices=ind, features_only=False)
                 
                 _, metrics = self.objective(
                     model=self.model,
-                    x_target=x,
-                    gp_output=state.gp_out if hasattr(state, 'gp_out') else None,
+                    gp_output=mvn,
                     state_out=state,
-                    gp_target=y
+                    gp_target=y.view(-1) if y.dim() > 1 else y,
+                    total_steps=None,
+                    annealers=None,
+                    global_step=None
                 )
-                
                 
                 for k, v in metrics.items():
                     test_stats[k] += v
                 
-                if state.gp_out is not None:
-                    W_mat = state.state.lmc_matrices 
-                    latent_mean = state.gp_out.mean.t().unsqueeze(-1)
+                if mvn is not None:
+                    W_mat = state.lmc_matrices 
+                    latent_mean = mvn.mean.t().unsqueeze(-1)
                     projected_mean = torch.bmm(W_mat, latent_mean).squeeze(-1)
-                    latent_var = state.gp_out.variance.t().unsqueeze(-1)
+                    latent_var = mvn.variance.t().unsqueeze(-1)
                     W_mat_squared = W_mat ** 2
                     projected_var = torch.bmm(W_mat_squared, latent_var).squeeze(-1)
                     batch_y = y.t() if (y.dim() == 2 and y.size(0) == k) else y
@@ -291,10 +295,6 @@ class LangevinTrainer:
 
     @tracker(experiment="deepkernels")
     def fit(self, train_loader, test_loader=None):
-        """
-        full_x: [38003, Features] (Your entire dataset tensor)
-        full_y: [30, 38003] (Your entire targets tensor)
-        """
         logger.info(f"Starting Two-Stage Training on {self.device}")
         total_steps_gp_warmup = self.warmup_gp_epochs * len(train_loader)
         total_steps_gp_full = self.gp_epochs * len(train_loader)
@@ -338,6 +338,9 @@ class LangevinTrainer:
             self.model.train()
             self.objective.train()
             train_stats = defaultdict(float)
+            self.vae_scheduler.step()
+            current_lr = self.adamw_optimiser.param_groups[0]['lr']
+            mlflow.log_metric("vae_lr", current_lr, step=epoch)       
             
             for x, y, ind in train_loader:
                 x = x.to(self.device, dtype=torch.float64)
@@ -347,10 +350,7 @@ class LangevinTrainer:
                 metrics = self.step_vae(x, y, ind, annealers=warmup_annealers, global_step=vae_steps, total_steps=total_steps_warmup)
                 for k, v in metrics.items(): 
                     train_stats[k] += v
-                
-            self.vae_scheduler.step()
-            current_lr = self.adamw_optimiser.param_groups[0]['lr']
-            mlflow.log_metric("vae_lr", current_lr, step=epoch)       
+            
             mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()}
             self._log_metrics(epoch, mean_train_stats, prefix="warmup")
             logger.info(f"Warmup Epoch {epoch}/{self.warmup_vae_epochs} | Recon Loss: {mean_train_stats.get('loss_recon', 0.0):.4f}")
@@ -366,6 +366,9 @@ class LangevinTrainer:
             self.model.train()
             self.objective.train()
             train_stats = defaultdict(float)
+            self.vae_scheduler.step()
+            current_lr = self.adamw_optimiser.param_groups[0]['lr']
+            mlflow.log_metric("vae_lr", current_lr, step= (epoch + self.warmup_vae_epochs))
             for x, y, ind in train_loader:
                 x = x.to(self.device, dtype=torch.float64)
                 y = y.to(self.device, dtype=torch.float64)
@@ -374,10 +377,7 @@ class LangevinTrainer:
                 metrics = self.step_vae(x, y, ind, global_step=vae_steps_full, total_steps=total_steps_full, annealers=vae_annealers)
                 for k, v in metrics.items(): 
                     train_stats[k] += v
-                
-            self.vae_scheduler.step()
-            current_lr = self.adamw_optimiser.param_groups[0]['lr']
-            mlflow.log_metric("vae_lr", current_lr, step= (epoch + self.warmup_vae_epochs))
+            
             mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()}
             self._log_metrics((epoch + self.warmup_vae_epochs), mean_train_stats, prefix="vae_train")
             logger.info(f"VAE Epoch {epoch}/{self.vae_epochs} | Recon Loss: {mean_train_stats.get('loss_recon', 0.0):.4f}")
@@ -398,47 +398,47 @@ class LangevinTrainer:
             self.model.train()
             self.objective.train()
             train_stats = defaultdict(float)
+            epoch_idx = epoch + self.warmup_vae_epochs + self.vae_epochs
+            self.gp_scheduler.step()
+            current_lr = self.adam_optimiser.param_groups[0]['lr']
+            mlflow.log_metric("gp_lr", current_lr, step=epoch_idx)
             for x, y, ind in train_loader:
                 x = x.to(self.device, dtype=torch.float64)
                 y = y.to(self.device, dtype=torch.float64)
                 ind = ind.to(self.device)
                 gp_steps += 1
-                metrics = self.step_gp(x, y, ind, annealers=gp_annealers, global_step=gp_steps, total_steps=total_steps_gp_warmup, cholesky_jitter_val=2e-3)
+                metrics = self.step_gp(x, y, ind, annealers=gp_annealers, global_step=gp_steps, total_steps=total_steps_gp_warmup, cholesky_jitter_val=1e-2)
                 for k, v in metrics.items(): 
                     train_stats[k] += v
-            epoch_idx = epoch + self.warmup_vae_epochs + self.vae_epochs
-            self.gp_scheduler.step()
-            current_lr = self.adam_optimiser.param_groups[0]['lr']
-            mlflow.log_metric("gp_lr", current_lr, step=epoch_idx)
             mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()}
             self._log_metrics(epoch_idx, mean_train_stats, prefix="gp_warmup")
-            logger.info(f"GP Warmup Epoch {epoch}/{self.warmup_gp_epochs} | Exact MLL: {mean_train_stats.get('loss_gp', 0.0):.4f}")
+            logger.info(f"GP Warmup Epoch {epoch}/{self.warmup_gp_epochs} | VariationalELBO: {mean_train_stats.get('loss_gp', 0.0):.4f}")
         mlflow.pytorch.log_model(self.model, "model_stage3_warmup")
         # ==========================================
         # STAGE 3
         # ==========================================
         self.orchestrator.train_gp_only() #-nkn is now unfrozen-#
         
-        logger.info(f"--- Entering Stage 3: Full ExactGP ({self.gp_epochs} Epochs) ---")
+        logger.info(f"--- Entering Stage 3: Full GP ({self.gp_epochs} Epochs) ---")
         for epoch in range(1, self.gp_epochs + 1):
             self.model.train()
             self.objective.train()
             train_stats = defaultdict(float)
+            epoch_idx = epoch + self.warmup_vae_epochs + self.vae_epochs + self.warmup_gp_epochs
+            self.gp_scheduler.step()
+            current_lr = self.adam_optimiser.param_groups[0]['lr']
+            mlflow.log_metric("gp_lr", current_lr, step=epoch_idx)
             for x, y, ind in train_loader:
                 x = x.to(self.device, dtype=torch.float64)
                 y = y.to(self.device, dtype=torch.float64)
                 ind = ind.to(self.device)
                 gp_steps += 1
-                metrics = self.step_gp(x, y, ind, global_step=gp_steps, annealers=gp_annealers, total_steps=total_steps_gp_full, cholesky_jitter_val=3e-4)
+                metrics = self.step_gp(x, y, ind, global_step=gp_steps, annealers=gp_annealers, total_steps=total_steps_gp_full, cholesky_jitter_val=4e-3)
                 for k, v in metrics.items():
-                    train_stats[k] += v     
-            epoch_idx = epoch + self.warmup_vae_epochs + self.vae_epochs + self.warmup_gp_epochs
-            self.gp_scheduler.step()
-            current_lr = self.adam_optimiser.param_groups[0]['lr']
-            mlflow.log_metric("gp_lr", current_lr, step=epoch_idx)
+                    train_stats[k] += v
             mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()}
             self._log_metrics(epoch_idx, mean_train_stats, prefix="gp_train")
-            logger.info(f"GP Epoch {epoch}/{self.gp_epochs} | Exact MLL: {mean_train_stats.get('loss_gp', 0.0):.4f}")
+            logger.info(f"GP Epoch {epoch}/{self.gp_epochs} | MLL: {mean_train_stats.get('loss_gp', 0.0):.4f}")
         
             if test_loader and epoch % 10 == 0:
                 self.evaluate(test_loader, epoch_idx)
@@ -463,7 +463,7 @@ class LangevinTrainer:
                 # --------------------------------------------------
                 self.orchestrator.train_vae_and_dirichlet()
                 for e_epoch in range(1, self.e_epochs_per_cycle + 1):
-                    self.model.train()      # <--- ADD THIS
+                    self.model.train()
                     self.objective.train()
                     current_epoch += 1 # Step forward in MLflow time
                     train_stats = defaultdict(float)
@@ -522,7 +522,6 @@ class LangevinTrainer:
                     gpytorch.settings.num_trace_samples(2):
                         
                         for x, y, ind in train_loader:
-                            # 1. Zero grads INSIDE the loop
                             self.adam_optimiser.zero_grad()
                             self.adamw_optimiser.zero_grad()
                             self.langevin_optimiser.zero_grad()
@@ -530,8 +529,8 @@ class LangevinTrainer:
                             x = x.to(self.device, dtype=torch.float64)
                             y = y.to(self.device, dtype=torch.float64)
                             ind = ind.to(self.device)
-                            state = self.model(x, indices=ind, run_gp=True)
-                            loss, metrics = self.objective(self.model, gp_output=state.gp_out, state_out=state, gp_target=y, annealers=gp_annealers, global_step=cycles, total_steps=total_joint_steps)
+                            state, mvn, _ = self.model.forward(x, indices=ind, features_only=False)
+                            loss, metrics = self.objective(self.model, gp_output=mvn, state_out=state, gp_target=y.view(-1) if y.dim() > 1 else y, annealers=gp_annealers, global_step=cycles, total_steps=total_joint_steps)
                             
                             if not torch.isfinite(loss):
                                 logger.warning("NaN/Inf loss detected. Skipping batch.")
