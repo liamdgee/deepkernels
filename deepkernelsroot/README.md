@@ -1,5 +1,3 @@
-![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
-![PyTorch](https://img.shields.io/badge/backend-PyTorch-orange.svg)
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 ![PyTorch](https://img.shields.io/badge/backend-PyTorch-orange.svg)
