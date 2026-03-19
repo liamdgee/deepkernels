@@ -94,8 +94,8 @@ $$\sum_{i=1}^{6} \mathcal{D}_{KL}^{(i)} = \mathcal{D}_{Global} + \mathcal{D}_{Lo
 * **Local KL:** $\mathcal{D}_{KL}(q(c) \parallel p(c))$ penalises the deviation of local latent clusters.
 * **Alpha KL:** $\mathcal{D}_{KL}(q(\alpha) \parallel p(\alpha))$ enforces the prior on the Dirichlet concentration parameter, controlling cluster 'atom' sparsity.
 * **Lengthscale KL:** $\mathcal{D}_{KL}(q(\ell) \parallel p(\ell))$ acts on the intermediate GP kernel hyperparameters, preventing the Neural Kernel Network from overfitting the covariance surface. The GP never directly sees this covariance structure, but dictates kernel nonstationarity across heterogenous clusters.
-* **Recon (Latent) KL:** $\mathcal{D}_{KL}(q_{\phi}(Z|X) \parallel p(Z))$ regularises the VAE encoder's variational distribution against a low-rank multivariate normal prior.
-* **Inverse Wishart KL:** $\mathcal{D}_{KL}(q(\Sigma_{T}) \parallel \mathcal{IW}(\Psi, \nu))$ enforces the Inverse Wishart prior on the Multitask GP's task-covariance matrix (Often referred to as the B matrix in Linear Model of Coregionalisation Theory). This acts as a regulariser on positive-semi-definiteness in the output covariance matrix and dynamic mixing weights.
+* **Recon (Latent) KL:** ![Equation](https://latex.codecogs.com/svg.latex?\mathcal{D}_{KL}(q_{\phi}(Z|X)&space;\parallel&space;p(Z))) regularises the VAE encoder's variational distribution against a low-rank multivariate normal prior.
+* **Inverse Wishart KL:** ![Equation](https://latex.codecogs.com/svg.latex?\mathcal{D}_{KL}(q(\Sigma_{T})&space;\parallel&space;\mathcal{IW}(\Psi,&space;\nu))) enforces the Inverse Wishart prior on the Multitask GP's task-covariance matrix (Often referred to as the B matrix in Linear Model of Coregionalisation Theory). This acts as a regulariser on positive-semi-definiteness in the output covariance matrix and dynamic mixing weights.
 
 ### 3. Stage 5: Cyclical E-step M-step Maximum Likelihood Estimation
 
