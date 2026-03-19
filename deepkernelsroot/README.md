@@ -81,9 +81,7 @@ The likelihood term bridges the unsupervised dimensionality reduction with the s
 $$\mathcal{L}_{Likelihood} = \mathbb{E}_{q_{\phi}(Z|X)}[\log p_{\theta}(X|Z)] + \mathbb{E}_{q(F|Z)}[\log p(Y|F)]$$
 
 * **VAE Reconstruction Loss:**
-$$
-\mathbb{E}_{q_{\phi}(Z|X)}[\log p_{\theta}(X|Z)]
-$$
+* $\mathbb{E}_{q_{\phi}(Z|X)}[\log p_{\theta}(X|Z)]$ 
 ensures the latent projection retains the topological structure of the high-dimensional time-variant input $X$.
 
 * **Multitask GP Gaussian Likelihood:** $\mathbb{E}_{q(F|Z)}[\log p(Y|F)]$ evaluates the probability of the target variables $Y$ given the latent GP function $F$. We utilize a Rank-1 Intrinsic Coregionalization Model (ICM) to handle multi-output covariance, computed via our CUDA-optimised KeOps engine to maintain $O(n)$ or $O(n \log n)$ scaling.
