@@ -1,6 +1,6 @@
 import os
 import sys
-KEOPS_CACHE_PATH = "/home/liam/deepkernels/deepkernelsroot/mlruns/2/e0512de7583146329a010afc984a25a5/artifacts/keops_cache"
+KEOPS_CACHE_PATH = ""
 if 'CONDA_PREFIX' in os.environ:
     os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
     os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
@@ -46,8 +46,8 @@ def parse_args():
     # ==========================================
     # --- Data & Pipeline Execution ---
     # ==========================================
-    parser.add_argument("--data_path1", type=str, default="/home/liam/deepkernels/deepkernelsroot/data/lendio_all_methods_sociocorr_lender.dta", help="Path to the primary lender data")
-    parser.add_argument("--data_path2", type=str, default="/home/liam/deepkernels/deepkernelsroot/data/appr_reg_data.dta", help="Path to the secondary regression data")
+    parser.add_argument("--data_path1", type=str, default="", help="Path to the primary lender data")
+    parser.add_argument("--data_path2", type=str, default="", help="Path to the secondary regression data")
     parser.add_argument("--target_col", type=str, default="lmean_rejected", help="The ground truth target variable")
     parser.add_argument("--seq_len", type=int, default=32, help="Sequence length for the state-space model")
     parser.add_argument("--batch_size", type=int, default=2048, help="Mini-batch size for Stage 1 (VAE)")
@@ -278,7 +278,7 @@ def main():
     # ---------------------------------------------------------
     
     # 1. ALWAYS set the URI first!
-    mlflow.set_tracking_uri("file:///home/liam/deepkernels/deepkernelsroot/mlruns")
+    mlflow.set_tracking_uri("//mlflow.db")
     
     experiment_name = "deepkernels"
     mlflow.set_experiment(experiment_name)
