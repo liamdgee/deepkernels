@@ -4,15 +4,10 @@ import torch.nn as nn
 
 from deepkernels.models.parent import BaseGenerativeModel
 
-import os
-if 'CONDA_PREFIX' in os.environ:
-    os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
-    os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
-
 from tqdm import tqdm
 
 from deepkernels.models.variationalautoencoder import SpectralVAE, StateSpaceOutput
-from deepkernels.models.gaussianprocess import AcceleratedKernelGP, DynamicStrategy
+from deepkernels.models.gaussianprocess import AcceleratedKernelGP
 from typing import NamedTuple, Optional
 import logging
 
@@ -22,14 +17,13 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class StateSpaceKernelProcess(BaseGenerativeModel):
-    def __init__(self, likelihood=None, gp=None, k_atoms=30, num_latents=8, min_noise=3e-3):
+    def __init__(self, likelihood=None, gp=None, k_atoms=30, num_latents=8, min_noise=0.07, device='cuda', **kwargs):
         super().__init__()
+        self.device = self.get_device(device)
         self.vae = SpectralVAE()
-        self.gp = AcceleratedKernelGP(
-                likelihood=gpytorch.likelihoods.MultitaskGaussianLikelihood(
-                    num_tasks=k_atoms,
-                    noise_constraint=gpytorch.constraints.GreaterThan(min_noise))
-            )
+        self.gp = AcceleratedKernelGP(likelihood=gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=1, rank=0, noise_constraint=gpytorch.constraints.GreaterThan(min_noise)))
+        self.input_dim = kwargs.get("input_dim", 30)
+        self.n_data = kwargs.get('n_data', 76674.0)
     def pack_features(self, gates, linear, periodic, rational, polynomial, matern):
         def to_3d(p):
             if p.dim() == 4:
@@ -63,18 +57,17 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
         if features_only:
             return state, None, None
         
-        gp_features = torch.cat([state.gates, state.linear, state.periodic, state.rational,state.polynomial, state.matern], dim=1)
+        gp_features = torch.cat([state.gates, state.linear, state.periodic, state.rational, state.polynomial, state.matern, state.pi], dim=1)
         gp_input = gp_features.unsqueeze(0).expand(8, -1, -1)
         # --- CATCH THE MUTATION ---
-        print(f"DEBUG: periodic shape right before KeOps: {state.periodic.shape}, gates: {state.gates.shape}, linear: {state.linear.shape}, rational: {state.rational.shape}, poly: {state.polynomial.shape}, matern: {state.matern.shape}, lmc: {state.lmc_matrices.shape}")
+        #print(f"DEBUG: periodic shape right before KeOps: {state.periodic.shape}, gates: {state.gates.shape}, linear: {state.linear.shape}, rational: {state.rational.shape}, poly: {state.polynomial.shape}, matern: {state.matern.shape}, lmc: {state.lmc_matrices.shape}")
         # --------------------------
-        
-        #lmc = state.lmc_matrices
-        #lmc_param = lmc.view(-1).contiguous()
+        lmc = state.lmc_matrices
+        lmc_param = 2.0 * torch.tanh(lmc / 2.0)
         
         mvn = None
 
-        mvn = self.gp(gp_features, indices=indices)
+        mvn = self.gp(gp_input, lmc_learned=lmc_param, indices=indices)
 
         return state, mvn, gp_features
     

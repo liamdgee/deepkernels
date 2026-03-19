@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DeepKernels Dashboard -- an end-to-end probabilistic modelling framework</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+        body { background-color: #111; color: white; font-family: sans-serif; }
+        #money-graph { width: 100%; height: 600px; }
+    </style>
+</head>
+<body>
+    <h1>NKN-GP Model Pulse</h1>
+    <div id="money-graph"></div>
+    
+    <script src="dashboard.js"></script>
+</body>
+<style>
+    /* The Dark Mode "Frontier" Aesthetic */
+    body {
+        background-color: #0b0e14;
+        color: #e0e6ed;
+        margin: 0;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+    }
+
+    .dashboard-container {
+        width: 95%;
+        max-width: 1200px;
+    }
+
+    .gauge-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        margin-bottom: 20px;
+    }
+
+    .card {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 12px;
+        padding: 10px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    }
+
+    #money-graph {
+        width: 100%;
+        height: 600px;
+    }
+</style>
+
+<div class="dashboard-container">
+    <header style="margin-bottom: 30px; border-bottom: 1px solid #30363d;">
+        <h1 style="margin: 0;">Deep Kernel Process <span style="color: #58a6ff;">Live Stream</span></h1>
+        <p style="color: #8b949e;">A100 Compute Engine & Uncertainty Calibration</p>
+    </header>
+
+    <div class="gauge-row">
+        <div class="card" id="gpu-gauge"></div>
+        <div class="card" id="efficiency-gauge"></div>
+        <div class="card" id="step-counter" style="width: 300px; display: flex; flex-direction: column; justify-content: center; align-items: center;">
+            <h3 style="margin: 0; color: #8b949e;">Current Step</h3>
+            <div id="step-value" style="font-size: 48px; font-weight: bold; color: #58a6ff;">--</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div id="money-graph"></div>
+    </div>
+</div>
+
+<div class="card" style="margin-top: 20px; background: #000; height: 150px; overflow-y: auto; font-family: 'Courier New', Courier, monospace; font-size: 13px; color: #00ff00; padding: 15px; border: 1px solid #333;" id="log-console">
+    <div>[System] Initializing Frontier NKN-GP Monitor...</div>
+    <div>[System] Awaiting data from A100 Compute Engine...</div>
+</div>
+
+</html>

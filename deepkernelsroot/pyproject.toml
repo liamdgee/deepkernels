@@ -34,7 +34,9 @@ dev = [
     "jupyterlab",
     "black",
     "isort",
-    "safety"
+    "safety",
+    "fastapi",
+    "sqlalchemy"
 ]
 
 [tool.setuptools.packages.find]

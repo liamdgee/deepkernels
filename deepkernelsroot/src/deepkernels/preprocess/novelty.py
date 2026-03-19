@@ -279,7 +279,7 @@ class FeatureTransformer(BaseEstimator, TransformerMixin):
                 logger.warning(f"Source {source} missing for {alias}")
         return df
 
-    def _create_interactions(self, X: pd.DataFrame) -> pd.DataFrame:
+    def _create_interactions(self, X: pd.DataFrame):
         """Derives multi-order interaction terms"""
         df = X.copy()
         created = []

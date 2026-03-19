@@ -34,13 +34,13 @@ class KernelNetwork(BaseGenerativeModel):
         self.num_primitives = self.config.num_primitives
         
         
-        self.primitives_total_dim = self.num_primitives * self.individual_kernel_dim_out # 8 * 32 = 160
+        self.primitives_total_dim = self.num_primitives * self.individual_kernel_dim_out # 5 * 32 = 160
         
-        self.linear = nn.utils.spectral_norm(nn.Linear(self.bottleneck_dim, self.individual_kernel_dim_out))
-        self.periodic = nn.utils.spectral_norm(nn.Linear(self.bottleneck_dim, self.individual_kernel_dim_out))
-        self.matern = nn.utils.spectral_norm(nn.Linear(self.bottleneck_dim, self.individual_kernel_dim_out))
-        self.rational = nn.utils.spectral_norm(nn.Linear(self.bottleneck_dim, self.individual_kernel_dim_out))
-        self.polynomial = nn.utils.spectral_norm(nn.Linear(self.bottleneck_dim, self.individual_kernel_dim_out, bias=False))
+        self.linear = self._build_primitive(self.bottleneck_dim, self.individual_kernel_dim_out)
+        self.periodic = self._build_primitive(self.bottleneck_dim, self.individual_kernel_dim_out)
+        self.matern = self._build_primitive(self.bottleneck_dim, self.individual_kernel_dim_out)
+        self.rational = self._build_primitive(self.bottleneck_dim, self.individual_kernel_dim_out)
+        self.polynomial = self._build_primitive(self.bottleneck_dim, self.individual_kernel_dim_out, is_poly=True)
         
         dims = [self.primitives_total_dim, 512, 1024, self.spectral_emb_dim]
         layers = []
@@ -56,28 +56,41 @@ class KernelNetwork(BaseGenerativeModel):
 
         self.spectral_feedback_loop = nn.Sequential(*layers)
         
+        gate_last_linear = nn.Linear(64, 8)
 
         self.gate_head = nn.Sequential(
             nn.Linear(self.primitives_total_dim, 64),
             nn.LayerNorm(64),
-            nn.Tanh(),
-            nn.utils.spectral_norm(nn.Linear(64, 8)),
+            nn.Softsign(),
+            P.weight_norm(gate_last_linear),
             SafeSoftplus()                  
         )
         
 
         self.init_weights_nkn()
     
+    def _build_primitive(self, in_dim, out_dim, is_poly=False):
+        """Helper to safely init weights BEFORE applying weight_norm"""
+        layer = nn.Linear(in_dim, out_dim, bias=not is_poly)
+        
+        if is_poly:
+            nn.init.normal_(layer.weight, mean=0.005, std=0.01)
+        else:
+            nn.init.orthogonal_(layer.weight, gain=0.8)
+            nn.init.zeros_(layer.bias)
+            
+        return P.weight_norm(layer)
+
     def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
         """
         inputs the latent bottleneck dim (64)
         """
         #-kernels-#
-        matern = self.matern(x)
-        linear = self.linear(x)
-        periodic = self.periodic(x)
-        rational = self.rational(x)
-        polynomial = self.polynomial(x)
+        matern = F.softsign(self.matern(x))
+        linear = F.softsign(self.linear(x))
+        periodic = F.softsign(self.periodic(x))
+        rational = F.softsign(self.rational(x))
+        polynomial = F.softsign(self.polynomial(x))
 
         kernel_features = torch.cat([linear, periodic, rational, polynomial, matern], dim=-1) #-[B,160]
 
@@ -97,21 +110,13 @@ class KernelNetwork(BaseGenerativeModel):
         return gp_params, features_large
 
     def init_weights_nkn(self):
-        nn.init.orthogonal_(self.linear.weight_orig, gain=1.0)
-        nn.init.uniform_(self.linear.bias, 0.0, 2.0)
-        
-        nn.init.orthogonal_(self.periodic.weight_orig, gain=1.41)
-        
-        nn.init.orthogonal_(self.rational.weight_orig, gain=1.41)
-        
-        nn.init.orthogonal_(self.matern.weight_orig, gain=1.0)
-        nn.init.uniform_(self.matern.bias, -0.1, 0.1)
-        
-        nn.init.normal_(self.polynomial.weight_orig, mean=0.005, std=0.01)
-        
+        # --- Gate Head: Neutral weights, positive bias ---
         for module in self.gate_head.modules():
             if isinstance(module, nn.Linear):
                 if hasattr(module, 'weight_orig'):
                     nn.init.orthogonal_(module.weight_orig, gain=1.0)
                 else:
                     nn.init.orthogonal_(module.weight, gain=1.0)
+                
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.1)

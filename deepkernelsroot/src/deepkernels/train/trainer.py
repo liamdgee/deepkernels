@@ -17,11 +17,6 @@ from typing import Union, Optional, Iterable
 import gpytorch
 from tqdm import tqdm
 
-import os
-if 'CONDA_PREFIX' in os.environ:
-    os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
-    os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
-
 #---Init logger---#
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -35,45 +30,45 @@ class TrainerConfig:
     n_data: float = 76674.0
     warmup_vae_epochs: int = 0
     vae_epochs: int = 0
-    warmup_gp_epochs: int = 120
-    gp_epochs: int = 300
-
-    # --- AdamW Optimiser (VAE / Encoder / Decoder) ---
-    base_lr_adamw: float = 1.175e-3
-    base_decay_adamw: float = 0.05
-    slow_decay_adamw: float = 0.001
-
-    # --- Adam Optimiser (GPyTorch / Kernel Network) ---
-    gp_global_hyper_lr: float = 3e-3
-    gp_mean_lr: float = 2e-3
-    gp_likelihood_lr: float = 5e-3
-    gp_lengthscale_lr: float = 2e-4
-    gp_kernel_nkn_lr: float = 2e-6
-    gp_variational_lr: float = 7e-4
-    gp_inducing_lr: float = 1e-3
-
-    # --- SGLD Optimiser (Dirichlet / Latent Variables) ---
-    fast_dir: float = 1e-3
-    med_dir: float = 5e-4
-    slow_dir: float = 1e-4
-    gamma_lr: float = 1e-5
-    lmc_lr: float = 8e-4
-    ultrasensitive_lr: float = 5e-5
-    sensitive_lr: float = 1e-4
-    langevin_temp: float = 7.5e-6
-    k_atoms: int = 30
+    warmup_gp_epochs: int = 10
     
-    # --- Gradient Clipping ---
-    max_grad_norm: float = 2.0
-    langevin_clip_norm: float = 4.0
-    rmspropalpha: float = 0.98
-    rmspropeps: float = 1e-7
-
+    gp_epochs: int = 120
     #-epochs-#
     em_macro_cycles: int = 0
     e_epochs_per_cycle: int = 0
     m_epochs_per_cycle: int = 0
     joint_epochs: int = 0
+
+    # --- AdamW Optimiser (VAE / Encoder / Decoder) ---
+    base_lr_adamw: float = 0.0003
+    base_decay_adamw: float = 0.000001
+    slow_decay_adamw: float = 0.0000001
+
+    # --- Adam Optimiser (GPyTorch / Kernel Network) ---
+    gp_global_hyper_lr: float = 1e-4
+    gp_mean_lr: float = 1e-4
+    gp_likelihood_lr: float = 1e-4
+    gp_lengthscale_lr: float = 2e-4
+    gp_kernel_nkn_lr: float = 2e-5
+    gp_variational_lr: float = 3e-4
+    gp_inducing_lr: float = 4e-4
+
+    # --- SGLD Optimiser (Dirichlet / Latent Variables) ---
+    fast_dir: float = 1e-3
+    med_dir: float = 5e-4
+    slow_dir: float = 1e-4
+    gamma_lr: float = 8e-5
+    lmc_lr: float = 1e-4
+    ultrasensitive_lr: float = 5e-5
+    sensitive_lr: float = 1e-4
+    langevin_temp: float = 5e-5
+    k_atoms: int = 30
+    
+    # --- Gradient Clipping ---
+    max_grad_norm: float = 2.0
+    langevin_clip_norm: float = 7.0
+    rmspropalpha: float = 0.93
+    rmspropeps: float = 1e-6
 
 class ParameterIsolate:
     def __init__(self, model, config=None, objective=None, device='cuda'):
@@ -309,10 +304,10 @@ class ParameterIsolate:
             {'params': sensitive_ls_params, 'lr': self.sensitive_lr},
             {'params': ultrasensitive_spectral_params, 'lr': self.ultrasensitive_lr},
             {'params': primitive_params, 'lr': self.base_lr_adamw},
-            {'params': combinatorics_params, 'lr': self.slow_lr},
+            {'params': combinatorics_params, 'lr': self.base_lr_adamw},
             {'params': gp_variational_params, 'lr': self.gp_variational_lr},
             {'params': gp_inducing_params, 'lr': self.gp_inducing_lr},
-            {'params': gp_other_params, 'lr': self.base_lr_adamw}
+            {'params': gp_other_params, 'lr': self.gp_variational_lr}
         ], weight_decay=0.0)
         
         total_opt_params = sum(len(group['params']) for opt in [self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser] for group in opt.param_groups)

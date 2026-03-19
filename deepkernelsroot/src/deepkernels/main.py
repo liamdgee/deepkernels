@@ -1,4 +1,11 @@
-
+import os
+import sys
+KEOPS_CACHE_PATH = "/home/liam/deepkernels/deepkernelsroot/mlruns/2/e0512de7583146329a010afc984a25a5/artifacts/keops_cache"
+if 'CONDA_PREFIX' in os.environ:
+    os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
+    os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
+    os.environ['LD_LIBRARY_PATH'] = f"{os.environ['CONDA_PREFIX']}/lib:{os.environ.get('LD_LIBRARY_PATH', '')}"
+    os.environ['KEOPS_BUILD_DIR'] = KEOPS_CACHE_PATH
 import yaml
 from pathlib import Path
 import gpytorch
@@ -18,21 +25,17 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 #torch.cuda.empty_cache()
+#python -c "import pykeops; pykeops.clean_pykeops(); import torch; torch.cuda.empty_cache()"
+import pykeops
 
 torch.set_default_dtype(torch.float64)
-import sys
+
 
 
 # --- Internal imports ---
 from deepkernels.models.model import StateSpaceKernelProcess
 from deepkernels.train.langevin_trainer import LangevinTrainer
 from deepkernels.preprocess.pipe import DataOrchestrator
-
-import os
-if 'CONDA_PREFIX' in os.environ:
-    os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
-    os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -47,7 +50,7 @@ def parse_args():
     parser.add_argument("--data_path2", type=str, default="/home/liam/deepkernels/deepkernelsroot/data/appr_reg_data.dta", help="Path to the secondary regression data")
     parser.add_argument("--target_col", type=str, default="lmean_rejected", help="The ground truth target variable")
     parser.add_argument("--seq_len", type=int, default=32, help="Sequence length for the state-space model")
-    parser.add_argument("--batch_size", type=int, default=128, help="Mini-batch size for Stage 1 (VAE)")
+    parser.add_argument("--batch_size", type=int, default=2048, help="Mini-batch size for Stage 1 (VAE)")
     parser.add_argument("--test_pct", type=float, default=0.1, help="test split")
     parser.add_argument("--num_workers", type=int, default=4, help="gpu optimisation")
     parser.add_argument(
@@ -175,6 +178,11 @@ def main():
     #-- device config --#
     # ---------------------------------------------------------
     args, _ = parse_args()
+    torch.set_num_threads(6)
+    torch.set_num_interop_threads(6) # Helps with parallelizing non-kernel ops
+    os.environ["OMP_NUM_THREADS"] = "6"
+    os.environ["MKL_NUM_THREADS"] = "6"
+    # ---------------------------------------------
     os.environ['KEOPS_CHROOT'] = "./.cache/keops"
     device = torch.device('cuda') or torch.device('cuda:0')
     logger.info(f"Initializing pipeline on device: {device}")
@@ -196,8 +204,7 @@ def main():
         df1=df1,
         df2=df2,
         target_col=args.target_col,
-        drop_cols=args.drop_cols,
-        float_64=True
+        drop_cols=args.drop_cols
     )
 
     seq_x, seq_y = orchestrator.to_seq_data(        
@@ -208,7 +215,7 @@ def main():
 
     train_loader, val_loader, test_loader = orchestrator.prepare_data(
             seq_x, seq_y, seq_len=args.seq_len, val_pct=0.1, test_pct=0.1, 
-            batch_size=args.batch_size, num_workers=args.num_workers
+            batch_size=args.batch_size, num_workers=4
         )
     
     N = len(train_loader.dataset)
@@ -226,54 +233,74 @@ def main():
     dynamics = {k: v for k, v in vars(args).items() if k in model_keys}
     trainer_dynamics = {k: v for k, v in vars(args).items() if k in model_keys_with_seq_len}
     
-    model = StateSpaceKernelProcess().to(device=device, dtype=torch.float64)
-    run_id = "3c034b2a02714eca813777236750f1a0"
-    model_uri = f"runs:/{run_id}/model_stage2_vae_full"
-    logger.info(f"Loading pretrained VAE from {model_uri}...")
-    pretrained_vae = mlflow.pytorch.load_model(model_uri)
+    pykeops.clean_pykeops()
+    pykeops.set_build_folder(KEOPS_CACHE_PATH)
+    print(f"Ready for Joint Training. Using cache at: {pykeops.get_build_folder()}")
 
+    model = StateSpaceKernelProcess(device=device, **dynamics)
 
-    pretrained_dict = pretrained_vae.state_dict()
-    bad_keys = ['gp.mean_module.cluster_constants', 'gp.variational_strategy.lmc_coefficients', 'gp.likelihood', 'gp.likelihood.raw_task_noises', 'gp.variational_strategy.base_variational_strategy.inducing_points']
-    for key in bad_keys:
-        if key in pretrained_dict:
-            del pretrained_dict[key]
-
-    sigma_key = 'vae.dirichlet.raw_h_sigma'
-    nkn_key = 'gp.covar_module.raw_inv_bandwidth'
-    if sigma_key in pretrained_dict:
-        old_sigma = pretrained_dict[sigma_key]
-        if old_sigma.shape == torch.Size([1]):
-            pretrained_dict[sigma_key] = old_sigma.view(1, 1, 1).repeat(1, 1, 16)
-            print(f"DEBUG: Successfully expanded {sigma_key} from [1] to [1, 1, 16]")
-    if nkn_key in pretrained_dict:
-        old_bw = pretrained_dict[nkn_key]
-        if old_bw.shape == torch.Size([1, 32]):
-            pretrained_dict[nkn_key] = old_bw.view(32)
-            print(f"DEBUG: Successfully expanded {nkn_key} from [1, 32] to [32]")
-    model.load_state_dict(pretrained_dict, strict=False)
+    model_path = "/home/liam/deepkernels/deepkernelsroot/mlruns/2/e0512de7583146329a010afc984a25a5/artifacts/model_checkpoints/best_val_model.pth"
+    
+    model.to(device)
+    
+    model.train()
     
     trainer = LangevinTrainer(
         model=model,
-        device=device
+        device=device,
+        **trainer_dynamics
     )
 
-    experiment_name = "deep-kernels"
+    if os.path.exists(model_path):
+        logger.info(f"Attempting to load partial checkpoint from {model_path}...")
+        try:
+            checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+            old_state_dict = checkpoint['model_state_dict']
+            
+            # Filter out ALL old NKN weights
+            filtered_state_dict = {
+                k: v for k, v in old_state_dict.items() 
+                if "vae.dirichlet.kernel_network" not in k
+            }
+            
+            # Load the filtered weights (strict=False lets it ignore the missing NKN keys)
+            missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
+            
+            logger.info(f"[+] Successfully loaded VAE and base GP weights.")
+            logger.info(f"[+] Initialized fresh weights for {len(missing_keys)} NKN parameters.")
+            logger.warning("[!] Architecture changed: Using FRESH optimizers to prevent momentum shape crashes.")
+        except Exception as e:
+            logger.error(f"Failed to load partial checkpoint: {e}. Starting entirely fresh.")
+    else:
+        logger.info("No checkpoint found. Starting fresh training run.")
+    # ---------------------------------------------------------
+    # -- MLflow Setup & Execution --
+    # ---------------------------------------------------------
+    
+    # 1. ALWAYS set the URI first!
+    mlflow.set_tracking_uri("file:///home/liam/deepkernels/deepkernelsroot/mlruns")
+    
+    experiment_name = "deepkernels"
     mlflow.set_experiment(experiment_name)
-    with mlflow.start_run():
-        run_params = vars(args)
-        mlflow.log_params(run_params)
-        logger.info("Starting Experiment. Check MLflow dashboard for live metrics!")
+
+    logger.info("Starting Experiment. Check MLflow dashboard for live metrics!")
+    
+    try:
         trainer.fit(
             train_loader=train_loader,
-            test_loader=val_loader
+            test_loader=val_loader,
+            joint_training=False
         )
-
-        final_model_path = "final_model_weights.pt"
+    except Exception as e:
+        logger.error(f"Training interrupted by error: {e}")
+        raise
+    finally:
+        # --- THIS IS YOUR INSURANCE POLICY ---
+        logger.info("Performing safety-save of model weights...")
+        final_model_path = "final_model_weights_emergency_save.pt"
         torch.save(model.state_dict(), final_model_path)
-        mlflow.log_artifact(final_model_path)
-        os.remove(final_model_path)
-        logger.info("Training complete and artifacts uploaded to MLflow.")
+        logger.info(f"Saved emergency weights to {final_model_path}")
+    logger.info("Training session concluded successfully.")
 
 if __name__ == "__main__":
     main()

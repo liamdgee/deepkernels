@@ -11,7 +11,8 @@ if not logger.handlers:
 
 class EvidenceLowerBound(nn.Module):
     def __init__(self, 
-                 model, 
+                 model,
+                 device='cuda', 
                  **kwargs):
         """
         Args:
@@ -21,24 +22,21 @@ class EvidenceLowerBound(nn.Module):
         """
         super().__init__()
         self.mll = gpytorch.mlls.VariationalELBO(
-            likelihood=model.gp.likelihood, 
-            model=model.gp, 
+            likelihood=model.gp.likelihood,
+            model=model.gp,
             num_data=kwargs.get('n_data', 76674)
         )
+        self.device = self.get_device(device)
         
-        base_kl_weights = {
-            "lengthscale_kl": 1.0,
-            "alpha_kl": 1.0,
-            "global_divergence": 0.1,
-            "local_divergence": 0.1,
-            "inverse_wishart": 1.0,
-            "recon_kl": 0.005
-        }
-
-        self.kl_weights = kwargs.get('kl_weights', None)
-
-        if self.kl_weights is None:
-            self.kl_weights = base_kl_weights
+    def _resolve_annealer_key(self, name):
+        """Maps model loss term names to annealer dictionary keys."""
+        if 'global' in name: return 'global_divergence'
+        if 'local' in name: return 'local_divergence'
+        if 'recon_kl' in name: return 'recon_kl'
+        if 'alpha' in name: return 'alpha_kl'
+        if 'lengthscale' in name: return 'lengthscale_kl'
+        if 'inverse_wishart' in name: return 'inverse_wishart'
+        return name
     
     def _get_cyclic_beta(self, global_step, total_steps, n_cycles=4, ratio=0.4):
         if global_step is None or total_steps is None:
@@ -49,81 +47,91 @@ class EvidenceLowerBound(nn.Module):
         return min(1.0, step_in_cycle / ramp_length) if ramp_length > 0 else 1.0
     
     def forward(self, model, gp_output, gp_target, state_out, global_step=None, total_steps=None, annealers=None):
-        """
-        Args:
-            model: overarching SpectralVAE model (to pull added loss terms).
-            x_target: ground-truth data sequence [Batch, SeqLen, Features].
-            ss_history: VAE state space history namedtuple
-            gp_output: The MultivariateNormal returned by your GP.
-            gp_target: The sequence the GP is supposed to be predicting. (ground truth)
-        """
         device = gp_target.device if gp_target is not None else next(model.parameters()).device
         kl_metrics = {}
-        
-        cyclic_beta = self._get_cyclic_beta(global_step, total_steps)
-        kl_metrics['master_cyclic_beta'] = cyclic_beta
-
+        kl_sum = 0.0
+        total_recon = 0.0
         if gp_output is not None and gp_target is not None:
-            gp_loss = -self.mll(gp_output, gp_target)
+            target = gp_target.view(-1).contiguous()
+            gp_loss = -self.mll(gp_output, target)
         else:
             gp_loss = torch.tensor(0.0, device=device)
-        
-        kl_sum = 0.0
-
-        total_recon = 0.0
-
         for name, added_loss_term in model.named_added_loss_terms():
             if 'gp' in name: continue
-            raw_loss = added_loss_term.loss().sum()
-            if 'recon_term' in name:
-                total_recon = total_recon + raw_loss
-                kl_metrics[f'loss_{name}'] = raw_loss.item()
-                continue
-            base_weight = self.kl_weights.get(name, 1.0)
-            current_beta = cyclic_beta
-            if annealers is not None and global_step is not None:
-                if name in annealers:
-                    current_beta = annealers[name].get_beta(global_step)
-                elif 'divergence' in name:
-                    target = 'global_divergence' if 'global' in name else 'local_divergence'
-                    annealer = annealers.get(target)
-                    if annealer:
-                        current_beta = annealer.get_beta(global_step)
-                elif 'recon' in name:
-                    target = 'recon_kl'
-                    annealer = annealers.get(target)
-                    if annealer:
-                        current_beta = annealer.get_beta(global_step)
-                elif 'kl' in name:
-                    target = 'alpha_kl' if 'alpha' in name else 'lengthscale_kl'
-                    annealer = annealers.get(target)
-                    if annealer:
-                        current_beta = annealer.get_beta(global_step)
-                        
-                elif 'inverse_wishart' in name:
-                    annealer = annealers.get('inverse_wishart')
-                    if annealer:
-                        current_beta = annealer.get_beta(global_step)
             
-            scaled_kl = base_weight * current_beta * raw_loss
-            kl_sum = kl_sum + scaled_kl
+            raw_loss = added_loss_term.loss().sum()
+            
+            if 'recon_term' in name:
+                weight = 1.0
+                total_recon += weight * raw_loss
+                kl_metrics[f'loss_{name}'] = raw_loss.item()
+                kl_metrics[f'weight_{name}'] = weight
+                continue
+
+            # 3. Resolve Weight from Annealers
+            annealer_key = self._resolve_annealer_key(name)
+            
+            if annealers is not None and global_step is not None:
+                if annealer_key in annealers:
+                    # Pull weight directly from your StochasticAnnealer
+                    current_weight = annealers[annealer_key].get_beta(global_step)
+                else:
+                    # Fail-safe: if training and key is missing, we don't apply the penalty
+                    logger.warning(f"No annealer found for {annealer_key} (from {name}). Defaulting to 0.0")
+                    current_weight = 0.0
+            else:
+                current_weight = 1.0
+
+            scaled_kl = current_weight * raw_loss
+            kl_sum += scaled_kl
         
             kl_metrics[f'loss_{name}'] = raw_loss.item()
-            kl_metrics[f'beta_{name}'] = current_beta
+            kl_metrics[f'weight_{name}'] = current_weight
             
-        
-        # --- GP Marginal Log Likelihood (Variational ELBO)-- negative for gradient descent --- #
+        # --- Total Objective ---
         total_loss = total_recon + kl_sum + gp_loss
         
-        def to_item(val):
-            return val.item() if isinstance(val, torch.Tensor) else val
         metrics = {
-            'loss_total': to_item(total_loss),
-            'loss_kls': to_item(kl_sum),
-            'loss_gp': to_item(gp_loss),
-            'loss_recon': to_item(total_recon),
-            'master_beta': cyclic_beta,
+            'loss_total': total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss,
+            'loss_kls': kl_sum.item() if isinstance(kl_sum, torch.Tensor) else kl_sum,
+            'loss_gp': gp_loss.item() if isinstance(gp_loss, torch.Tensor) else gp_loss,
+            'loss_recon': total_recon.item() if isinstance(total_recon, torch.Tensor) else total_recon,
             **kl_metrics
         }
     
-        return total_loss, metrics
+        return total_loss, gp_loss, metrics
+    
+    
+    
+    def get_device(self, device_request: Union[str, torch.device, None] = None) -> torch.device:
+
+            """
+            Resolves the optimal available device for PyTorch operations.
+            
+            Priority:
+            1. explicit device_request (if provided and valid)
+            2. cuda:0 (NVIDIA GPU)
+            3. mps (Apple Silicon Metal Performance Shaders)
+            4. cpu
+            
+            Args:
+                device_request: Optional string ('cuda', 'mps', 'cpu') or torch.device 
+                                to force a specific device.
+            
+            Returns:
+                torch.device: The resolved device.
+            """
+            if device_request is not None:
+                device = torch.device(device_request)
+                if device.type == 'cuda' and not torch.cuda.is_available():
+                    logging.warning(f"CUDA requested but unavailable. Falling back to CPU.")
+                    return torch.device('cpu')
+                if device.type == 'mps' and not torch.backends.mps.is_available():
+                    logging.warning(f"MPS (Apple Silicon) requested but unavailable. Falling back to CPU.")
+                    return torch.device('cpu')
+                return device
+            if torch.cuda.is_available():
+                return torch.device('cuda:0')
+            if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+                return torch.device('mps')
+            return torch.device('cpu')

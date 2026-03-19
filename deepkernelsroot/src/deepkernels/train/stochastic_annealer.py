@@ -47,18 +47,18 @@ class StochasticAnnealer:
         return max(self.start_beta, min(self.stop_beta, beta))
     
     def get_beta(self, step):
-        # Cyclical Annealing Logic
         if self.total_steps == 0: return self.stop_beta
         
-        cycle_len = self.total_steps // self.n_cycles
-        step_in_cycle = step % cycle_len
+        # Use float period for better precision in short epochs
+        period = self.total_steps / self.n_cycles
+        step_in_cycle = step % period
         
-        tau = step_in_cycle / cycle_len
+        tau = step_in_cycle / period
         if tau < self.ratio:
-            return self.stop_beta * (tau / self.ratio)
+            return self.start_beta + (self.stop_beta - self.start_beta) * (tau / self.ratio)
         else:
             return self.stop_beta
-
+    
     def get_noise(self, step):
         # Now it calls the method confirmed above
         beta = self.get_beta(step)

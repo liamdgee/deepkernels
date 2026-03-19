@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Deep Kernel Dashboard</title>
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+    <style>
+        /* The Dark Mode "Frontier" Aesthetic */
+        body {
+            background-color: #0b0e14;
+            color: #e0e6ed;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        .dashboard-container {
+            width: 95%;
+            max-width: 1400px; /* Widened slightly to fit side-by-side metrics */
+        }
+
+        /* Header & Dropdown Alignment */
+        header {
+            margin-bottom: 30px;
+            border-bottom: 1px solid #30363d;
+            padding-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+        }
+
+        .header-titles h1 { margin: 0; font-size: 28px; }
+        .header-titles p { color: #8b949e; margin: 5px 0 0 0; }
+
+        select#runSelector {
+            padding: 10px 15px;
+            font-size: 16px;
+            background-color: #161b22;
+            color: #58a6ff;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            cursor: pointer;
+            outline: none;
+        }
+
+        /* Card & Layout Structure */
+        .gauge-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+        }
+
+        .gauge-card {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 120px;
+        }
+
+        .gauge-card h3 { margin: 0; color: #8b949e; font-size: 14px; text-transform: uppercase; letter-spacing: 1px;}
+        .gauge-value { font-size: 42px; font-weight: bold; margin-top: 10px; }
+
+        /* Graph Containers */
+        .graph-container {
+            width: 100%;
+            height: 500px;
+        }
+
+        /* The Hacker Console */
+        #log-console {
+            background: #0d1117;
+            height: 150px;
+            overflow-y: auto;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 13px;
+            color: #3fb950;
+            padding: 15px;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="dashboard-container">
+        
+        <header>
+            <div class="header-titles">
+                <h1>Deep Kernel Process <span style="color: #58a6ff;">Live Stream</span></h1>
+                <p>A100 Compute Engine & Uncertainty Calibration</p>
+            </div>
+            
+            <div class="controls">
+                <select id="runSelector">
+                    {% if run_ids %}
+                        {% for run in run_ids %}
+                            <option value="{{ run }}" {% if run == current_run %}selected{% endif %}>
+                                Run: {{ run[:8] }}...
+                            </option>
+                        {% endfor %}
+                    {% else %}
+                        <option value="">No Runs Found</option>
+                    {% endif %}
+                </select>
+            </div>
+        </header>
+
+        <div class="gauge-row">
+            <div class="card gauge-card">
+                <h3>A100 GPU Util</h3>
+                <div id="gpu-value" class="gauge-value" style="color: #58a6ff;">--%</div>
+            </div>
+            <div class="card gauge-card">
+                <h3>KeOps Status</h3>
+                <div id="keops-value" class="gauge-value" style="color: #3fb950; font-size: 28px;">AWAITING</div>
+            </div>
+            <div class="card gauge-card">
+                <h3>Current Step</h3>
+                <div id="step-value" class="gauge-value" style="color: #d2a8ff;">--</div>
+            </div>
+        </div>
+
+        <div class="card" style="margin-bottom: 20px;">
+            <div id="money-graph" class="graph-container"></div>
+        </div>
+        
+        <div class="card">
+            <div id="kl-graph" class="graph-container"></div>
+        </div>
+
+        <div id="log-console">
+            <div>[System] Initializing Frontier NKN-GP Monitor...</div>
+            <div>[System] Awaiting data from A100 Compute Engine...</div>
+        </div>
+
+    </div>
+
+    <script>
+        window.ACTIVE_RUN_ID = "{{ current_run | default('') }}";
+    </script>
+
+    <script src="/static/script.js"></script>
+
+</body>
+</html>

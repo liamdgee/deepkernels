@@ -12,12 +12,10 @@ from gpytorch.module import Module
 from gpytorch.constraints import Positive, GreaterThan, Interval
 
 import linear_operator
-from linear_operator.operators import RootLinearOperator, MatmulLinearOperator, DiagLinearOperator, AddedDiagLinearOperator
 
 from deepkernels.models.parent import BaseGenerativeModel
 from deepkernels.models.NKN import KernelNetwork, GPParams
 from deepkernels.kernels.keops import CustomLaplacePrior
-from pydantic import BaseModel
 import torch.distributions as dist
 
 #---Init logger---#
@@ -362,7 +360,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
 
         iw_loss = self.inverse_wishart_penalty(B_mat_current_state)
 
-        self.update_added_loss_term("inverse_wishart", LossTerm(iw_loss, t_index=t))
+        self.update_added_loss_term("inverse_wishart", LossTerm(iw_loss / self.n_data, t_index=t))
 
         self.update_added_loss_term("local_divergence", LossTerm(local_kl, t_index=t))
         
@@ -409,37 +407,50 @@ class AmortisedDirichlet(BaseGenerativeModel):
         safe = math.log(math.expm1(raw))
         return safe
     def get_omega(self, bw, **params):
-        # 1. h_mu is [1, 1, 16] -> Already perfect
-        h = self.h_mu
+        # 1. Expand h_mu: [1, 1, 16] -> [1, 1, 1, 16]
+        h = self.h_mu.unsqueeze(2)
         
-        # 2. atom_loc is [30, 1, 16] -> Swap to [1, 30, 16]
-        a = self.atom_loc.transpose(0, 1)
+        # 2. Expand atom_loc: [30, 1, 16] -> [1, 30, 1, 16]
+        a = self.atom_loc.transpose(0, 1).unsqueeze(2)
         
-        # 3. bw is [128, 30, 16] -> Already perfect
-        # 4. noise_weights is [30, 128, 16] -> Swap to [128, 30, 16]
-        w = self.noise_weights.transpose(0, 1)
+        # 3. noise_weights is [30, 128, 16] (k_atoms, M, latent_dim). 
+        # Add a batch dimension: [1, 30, 128, 16]
+        w = self.noise_weights.unsqueeze(0)
         
-        # 5. Math is now perfectly aligned:
-        # [128, 30, 16] * [128, 30, 16] = [128, 30, 16]
-        dynamic_part = bw * w
+        # 4. bw is [Batch, 30, 16]. 
+        # Add the M dimension: [Batch, 30, 1, 16]
+        bw_4d = bw.unsqueeze(2)
         
-        # [1, 1, 16] + [1, 30, 16] + [128, 30, 16] = [128, 30, 16]
+        # 5. Multiply safely: [Batch, 30, 1, 16] * [1, 30, 128, 16] = [Batch, 30, 128, 16]
+        dynamic_part = bw_4d * w
+        
+        # 6. Final output is beautifully, reliably 4D
         omega = h + a + dynamic_part
         
         return torch.clamp(omega, -100.0, 100.0)
-    
-    def coregionalisation_matrix(self, pi):
+        ###dynamic_part = torch.einsum('bkd, kmd -> bkm', bw, self.noise_weights)
+    def coregionalisation_matrix(self, pi, jitter=1e-5):
+        target_dtype = pi.dtype
+        target_device = pi.device
+
         batch_size = pi.size(0)
         pi_bc = pi.unsqueeze(-1)
-        W_current_state = pi_bc * self.lmc_matrix
+        
+        lmc_matrix = self.lmc_matrix.to(device=target_device, dtype=target_dtype)
+        lmc_var = self.lmc_var.to(device=target_device, dtype=target_dtype)
+        
+        v = lmc_var + jitter
+
+        # W_current_state shape: [Batch, 30, 8]
+        W_current_state = pi_bc * lmc_matrix
         W_consensus = W_current_state.mean(dim=0)
-        cholesky_jitter = 1e-4 
-        v = self.lmc_var + cholesky_jitter
+        
         v_bc = v.unsqueeze(0).expand(batch_size, -1)
-        lazyroot = RootLinearOperator(W_current_state)
-        lazydiag = DiagLinearOperator(v_bc)
-        B_lazy = AddedDiagLinearOperator(lazydiag, lazyroot)
-        return B_lazy.to_dense(), W_consensus
+        W_W_T = torch.bmm(W_current_state, W_current_state.transpose(-1, -2))
+        
+        B_dense = W_W_T + torch.diag_embed(v_bc)
+
+        return B_dense, W_consensus
     
     def random_fourier_features(self, z, omega, pi, **params):
         """inputs latent dim z"""
@@ -628,23 +639,37 @@ class AmortisedDirichlet(BaseGenerativeModel):
         local_conc = F.softplus(alpha_logits) + self.jitter
         
         return local_conc
-    def inverse_wishart_penalty(self, B_dense):
+    def inverse_wishart_penalty(self, B_dense, k_atoms=30):
         batch_size = B_dense.size(0)
+        dtype = B_dense.dtype
+        device = B_dense.device
+        jitter = torch.eye(k_atoms, dtype=dtype, device=device).expand(batch_size, -1, -1) * 1e-5
+        B_psd = B_dense + jitter
+        pr_nu = torch.as_tensor(self.pr_nu, dtype=dtype, device=device)
+        psi_scale = torch.as_tensor(self.psi_scale, dtype=dtype, device=device)
         
-        # 1. Dense LogDet (Extremely fast and stable for small KxK)
-        # slogdet returns (sign, logabsdet). Since B is positive definite, sign is 1.
-        _, logdet_B = torch.linalg.slogdet(B_dense) 
+        L, info = torch.linalg.cholesky_ex(B_psd)
         
-        # 2. Dense Solve (No GPyTorch CG approximations)
-        identity = torch.eye(self.k_atoms, dtype=B_dense.dtype, device=B_dense.device)
-        identity = identity.expand(batch_size, self.k_atoms, self.k_atoms)
+        if info.any():
+            B_psd = B_psd + torch.eye(k_atoms, dtype=dtype, device=device).expand(batch_size, -1, -1) * 1e-3
+            L = torch.linalg.cholesky(B_psd) 
+
+        #-Log Determinant-
+        # log|B| = 2 * sum(log(diag(L)))
+        diag_L = torch.diagonal(L, dim1=-2, dim2=-1)
+        logdet_B = 2.0 * torch.log(diag_L).sum(dim=-1)
         
-        B_inverse = torch.linalg.solve(B_dense, identity)
+        #- chol trace inverse-#
+        # Tr(B^-1) = Tr((L L^T)^-1) = ||L^-1||_F^2
+        # We solve L * X = I to get L^-1. Solving a triangular matrix is very fast and stable.
+        identity = torch.eye(k_atoms, dtype=dtype, device=device).expand(batch_size, -1, -1)
+        L_inv = torch.linalg.solve_triangular(L, identity, upper=False)
         
-        trace_B_inv = torch.diagonal(B_inverse, dim1=-2, dim2=-1).sum(-1)
+        trace_B_inv = (L_inv ** 2).sum(dim=(-1, -2))
         
-        term1 = 0.5 * (self.pr_nu + self.k_atoms + 1) * logdet_B
-        term2 = 0.5 * self.psi_scale * trace_B_inv
+        term1 = 0.5 * (pr_nu + k_atoms + 1) * logdet_B
+        term2 = 0.5 * psi_scale * trace_B_inv
+        
         iw_penalty = term1 + term2
         
         return iw_penalty.mean()

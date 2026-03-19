@@ -189,7 +189,8 @@ class SpectralDecoder(BaseGenerativeModel):
                 recon_to_loss = recon
                 target_to_loss = real_x
 
-        reconloss = F.mse_loss(recon_to_loss, target_to_loss, reduction='mean')
+        recon_raw = F.mse_loss(recon_to_loss, target_to_loss, reduction='none')
+        reconloss = recon_raw.sum(dim=-1).mean()
         
         reconkl = self.log_recon_kl(mu_z, logvar_z)
 
@@ -205,11 +206,11 @@ class SpectralDecoder(BaseGenerativeModel):
 
         kl = self.log_alpha_kl_low_rank(mu, factor, diag)
 
-        self.update_added_loss_term("alpha_kl", LossTerm(kl))
+        self.update_added_loss_term("alpha_kl", LossTerm(kl/self.n_data, t_index=t))
         
         ls_sample, kl_div = self.predict_lengthscale_and_log_kl(bottleneck, ls_pred_prior, ls_logvar_prior)
 
-        self.update_added_loss_term("lengthscale_kl", LossTerm(kl_div))
+        self.update_added_loss_term("lengthscale_kl", LossTerm(kl_div, t_index=t))
 
         bandwidth_mod = self.scale_head_per_expert(ls_sample) * 2.0
 

@@ -127,7 +127,7 @@ class DataOrchestrator:
             "num_workers": num_workers,
             "drop_last": True,
             "prefetch_factor": 2 if num_workers > 0 else None,
-            "persistent_workers": True if num_workers > 0 else False  # <--- ADD THIS
+            "persistent_workers": True if num_workers > 0 else False
         }
         indices_train = torch.arange(train_x.size(0))
         indices_val = torch.arange(val_x.size(0))
@@ -138,7 +138,7 @@ class DataOrchestrator:
         
         return train_loader, val_loader, test_loader
     
-    def run_pipeline(self, df1: pd.DataFrame, df2:pd.DataFrame, float_64:bool=False, target_col: str='lmean_rejected', drop_cols: Optional[list[str]]=None):
+    def run_pipeline(self, df1: pd.DataFrame, df2:pd.DataFrame, target_col: str='lmean_rejected', drop_cols: Optional[list[str]]=None):
         """Runs the entire pipeline end-to-end smoothly."""
         df1_clean = self.cleaner_df1.fit_transform(df1)
         df2_clean = self.cleaner_df2.fit_transform(df2)
@@ -161,13 +161,8 @@ class DataOrchestrator:
             dropped = set(X_norm.columns) - set(X_numeric.columns)
             logger.warning(f"Dropping non-numeric columns before tensor conversion: {dropped}")
         # ---------------------------
-        if float_64:
-            # Change X_norm to X_numeric here
-            X_tensor = torch.tensor(X_numeric.to_numpy(), dtype=torch.float64)
-            y_tensor = torch.tensor(y_sorted.to_numpy(), dtype=torch.float64)
-        else:
-            # And change X_norm to X_numeric here
-            X_tensor = torch.tensor(X_numeric.to_numpy(), dtype=torch.float32)
-            y_tensor = torch.tensor(y_sorted.to_numpy(), dtype=torch.float32)
+      
+        X_tensor = torch.tensor(X_numeric.to_numpy(), dtype=torch.float64)
+        y_tensor = torch.tensor(y_sorted.to_numpy(), dtype=torch.float64)
         
         return X_tensor, y_tensor
