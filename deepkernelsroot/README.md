@@ -75,12 +75,12 @@ The total objective to be maximized is formulated as:
 
 $$\mathcal{L}_{ELBO} = \mathcal{L}_{Likelihood} - \sum_{i=1}^{6} \mathcal{D}_{KL}^{(i)}$$
 
-### 1. The Likelihood Component (Data Fit)
+### 1. The Likelihood Component (Data Fit / Uncertainty)
 The likelihood term bridges the unsupervised dimensionality reduction with the supervised predictive task. It consists of two expectations:
 
 $$\mathcal{L}_{Likelihood} = \mathbb{E}_{q_{\phi}(Z|X)}[\log p_{\theta}(X|Z)] + \mathbb{E}_{q(F|Z)}[\log p(Y|F)]$$
 
-* **VAE Reconstruction Loss:** $\mathbb{E}_{q_{\phi}(Z|X)}[\log p_{\theta}(X|Z)]$ ensures the latent projection retains the topological structure of the high-dimensional input $X$.
+* **VAE Reconstruction Loss:** $$\mathbb{E}_{q_{\phi}(Z|X)}[\log p_{\theta}(X|Z)]$$ ensures the latent projection retains the topological structure of the high-dimensional input $X$.
 * **Multitask GP Gaussian Likelihood:** $\mathbb{E}_{q(F|Z)}[\log p(Y|F)]$ evaluates the probability of the target variables $Y$ given the latent GP function $F$. We utilize a Rank-1 Intrinsic Coregionalization Model (ICM) to handle multi-output covariance, computed via our CUDA-optimised KeOps engine to maintain $O(n)$ or $O(n \log n)$ scaling.
 
 ### 2. The 6-Term KL Divergence Penalty
