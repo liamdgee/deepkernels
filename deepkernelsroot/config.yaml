@@ -27,8 +27,8 @@ logging:
 # Data & Pipeline Execution
 # ==========================================
 datapipeline:
-  path_primary: "/home/liam/deepkernels/data/lendio_all_methods_sociocorr_lender.dta"
-  path_secondary: "/home/liam/deepkernels/data/appr_reg_data.dta"
+  path_primary: ""
+  path_secondary: ""
   target_col: "lmean_rejected"
   seq_len: 32
   batch_size: 128
