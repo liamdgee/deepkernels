@@ -5,7 +5,7 @@
 # **deepkernels** — A Unified Probabilistic Modelling Framework
 ---
 
-> **Note — Quick inference is not available yet. This is an alpha release to preview the model architecture, training loops, and the theory behind the methodology.** ---
+> **Note — Quick inference is not available yet. This is an alpha release to preview the model architecture, training loops, and the theory behind the methodology. Final Model weights will be uploaded upon training completion.** ---
 
 *deepkernels* is an end-to-end probabilistic inference engine which leverages **Multitask State-Space Gaussian Processes** with dynamic covariance structures provided by **Neural Kernel Networks** and autonomous nonparametric clustering driven by **Amortised Hierarchical Dirichlet Processes**. The **StateSpaceKernelProcess** in `src/deepkernels/model.py` is optimised for large-scale inference via **PyKeOps CUDA-JIT compilation** as symbolically defined in the custom **GenerativeKernel** covariance module in `src/deepkernels/kernels/keops.py`.
 
