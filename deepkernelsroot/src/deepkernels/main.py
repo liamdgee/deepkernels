@@ -257,13 +257,11 @@ def main():
             checkpoint = torch.load(model_path, map_location=device, weights_only=True)
             old_state_dict = checkpoint['model_state_dict']
             
-            # Filter out ALL old NKN weights
             filtered_state_dict = {
                 k: v for k, v in old_state_dict.items() 
                 if "vae.dirichlet.kernel_network" not in k
             }
             
-            # Load the filtered weights (strict=False lets it ignore the missing NKN keys)
             missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
             
             logger.info(f"[+] Successfully loaded VAE and base GP weights.")
@@ -277,7 +275,6 @@ def main():
     # -- MLflow Setup & Execution --
     # ---------------------------------------------------------
     
-    # 1. ALWAYS set the URI first!
     mlflow.set_tracking_uri("//mlflow.db")
     
     experiment_name = "deepkernels"
@@ -295,7 +292,6 @@ def main():
         logger.error(f"Training interrupted by error: {e}")
         raise
     finally:
-        # --- THIS IS YOUR INSURANCE POLICY ---
         logger.info("Performing safety-save of model weights...")
         final_model_path = "final_model_weights_emergency_save.pt"
         torch.save(model.state_dict(), final_model_path)
