@@ -19,7 +19,6 @@
 * **Final MLL:** **1.0615** (Optimized down from 1.1279)
 * **Throughput:** **7s / epoch (E-step) // 5s / Epoch (M-step)** (// 26s / Batch (14 min epochs) during joint training with unfrozen kernel network + langevin dynamics (posterior sampling stage))
 * **Last Logic Update:** March 26, 2026
-* **Val RMSE** 0.
 
 ---
 
