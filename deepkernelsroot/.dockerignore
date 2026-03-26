@@ -12,6 +12,7 @@ notebooks/
 /unused/*
 #-Artifacts-#
 models/*.pt
+
 models/*.onnx
 *.pt
 *.pth
@@ -30,6 +31,11 @@ __pycache__/
 venv/
 .env
 .ipynb_checkpoints/
+
+unused/*
+/unused/*
+./unused/
+unused/
 
 #-sys-
 .git
