@@ -11,10 +11,15 @@
 
 ---
 
-### 🌌 Project Status: Active Training
-* **Current Epoch:** 3/120 of stage 4 (full GP stage)
-* **A100 Load:** 99%  
-* **Last Logic Update:** March 18, 2026
+### 🌌 Project Status: Inference & Front End Refinement (TRAINING COMPLETE)
+* **Current Epoch:** Finished epoch 40 / 40 of E-M refinement (5 Macro-Cycles)
+* **A100 Load:** 99% (Compute efficiently bound via KeOps CUDA kernels)
+* **Last Logic Update:** March 26, 2026
+* **Validation RMSE:** **0.2889** (Peak) / 0.2895 (Final Cycle)
+* **Final MLL:** **1.0615** (Optimized down from 1.1279)
+* **Throughput:** **7s / epoch (E-step) // 5s / Epoch (M-step)** (// 26s / Batch (14 min epochs) during joint training with unfrozen kernel network + langevin dynamics (posterior sampling stage))
+* **Last Logic Update:** March 26, 2026
+* **Val RMSE** 0.
 
 ---
 
