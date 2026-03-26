@@ -44,6 +44,7 @@ class DecoderOutput(NamedTuple):
     logvar_z: torch.Tensor
     lmc_matrices: torch.Tensor
     real_x: torch.Tensor
+    lmc_consensus: torch.Tensor
 
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -63,7 +64,7 @@ class DecoderConfig:
     n_data: float = 76674.0
     alpha_factor_rank: int = 3
     spectral_compressions: List[int] = field(default_factory=lambda: [1024, 512, 128, 64])
-    dropout: float = 0.05
+    dropout: float = 0.0
     beta: float = 1.0
     jitter: float = 1e-6
     eps: float = 1e-3
@@ -72,6 +73,7 @@ class DecoderConfig:
     max_ls: float = 15.0
     conc_clamp: float = 30.0
     num_experts: int = 8
+    evidence_dim: int = 58
 
 class SpectralDecoder(BaseGenerativeModel):
     def __init__(self,
@@ -82,7 +84,7 @@ class SpectralDecoder(BaseGenerativeModel):
         self.config = config if config is not None else DecoderConfig()
         #-global & dynamic:
         self.input_dim = kwargs.get("input_dim", 30)
-        self.n_data = kwargs.get('n_data', 76674.0)
+        self.n_data = kwargs.get('n_data', 87636.0)
 
         self.jitter = self.config.jitter
         self.dropout = self.config.dropout
@@ -103,6 +105,7 @@ class SpectralDecoder(BaseGenerativeModel):
         self.large_eps = self.config.large_eps
         self.disentangle_split = [4, 30, 30]
         self.rank = self.alpha_factor_rank or 3
+        self.evidence_dim = self.config.evidence_dim
         
         layers = []
         current_dim = self.spectral_emb_dim
@@ -110,7 +113,7 @@ class SpectralDecoder(BaseGenerativeModel):
         for compression in self.spectral_compressions:
             layers.append((nn.Linear(current_dim, compression)))
             layers.append(nn.LayerNorm(compression))
-            layers.append(nn.SiLU())
+            layers.append(nn.ELU(inplace=True))
             layers.append(nn.Dropout(self.dropout))
             current_dim = compression
         
@@ -136,10 +139,9 @@ class SpectralDecoder(BaseGenerativeModel):
         ])
 
         
-
-        self.mu_alpha = nn.Linear(self.bottleneck_dim, self.k_atoms)
-        self.factor_alpha = nn.Linear(self.bottleneck_dim, self.k_atoms * self.rank)
-        self.diag_alpha = nn.Linear(self.bottleneck_dim, self.k_atoms)
+        self.mu_alpha = nn.Linear(self.bottleneck_dim, self.evidence_dim)
+        self.factor_alpha = nn.Linear(self.bottleneck_dim, self.rank * self.evidence_dim)
+        self.diag_alpha = nn.Linear(self.bottleneck_dim, self.evidence_dim)
         
         self.lengthscale_mu = nn.Linear(self.bottleneck_dim, self.k_atoms)
         self.lengthscale_logvar = nn.Linear(self.bottleneck_dim, self.k_atoms)
@@ -149,16 +151,22 @@ class SpectralDecoder(BaseGenerativeModel):
         self.register_added_loss_term("alpha_kl")
         self.register_added_loss_term("recon_term")
         self.register_added_loss_term("recon_kl")
+        
         self._init_weights()
     
     def _init_weights(self):
-
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight, gain=1.41)
+                if hasattr(module, 'weight_orig'):
+                    nn.init.orthogonal_(module.weight_orig, gain=1.41)
+                else:
+                    nn.init.orthogonal_(module.weight, gain=1.41)
+                
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
 
-    def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
+    def forward(self, x, vae_out, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, generative_mode:bool=False, **params) -> DecoderOutput:
         """
         Args:
             spectral_features: [Batch, K*M*2] OR [Batch, K, M*2] as 'x' (embedded dim = 2048)
@@ -242,25 +250,16 @@ class SpectralDecoder(BaseGenerativeModel):
             mu_z=mu_z,
             logvar_z=logvar_z,
             lmc_matrices=vae_out.lmc_matrices,
-            real_x=vae_out.real_x
+            real_x=vae_out.real_x,
+            lmc_consensus=vae_out.lmc_consensus
         )
         
         return vae_out
     
-    def get_alpha_mvn_heads_decoder(self, bottleneck):
-        """
-        Returns parameters for a Low-Rank Multivariate Normal.
-        Covariance is parameterized as: Sigma = V @ V.T + diag
-        
-        Returns:
-            mu: Mean vector [Batch, k_atoms]
-            factor (V): Dense low-rank factor matrix [Batch, k_atoms, rank_r]
-            diag (D): Strictly positive diagonal variance [Batch, k_atoms]
-        """
-
+    def get_alpha_mvn_heads_decoder(self, bottleneck, jitter=1e-5):
         mu = self.mu_alpha(bottleneck)
-        factor = self.factor_alpha(bottleneck).view(-1, self.k_atoms, self.rank)
-        diag = F.softplus(self.diag_alpha(bottleneck)) + 1e-6
+        factor = self.factor_alpha(bottleneck).view(-1, self.evidence_dim, self.rank)
+        diag = F.softplus(self.diag_alpha(bottleneck)) + jitter
         return mu, factor, diag
     
     def disentangle(self, bottleneck):
@@ -272,22 +271,24 @@ class SpectralDecoder(BaseGenerativeModel):
         recon = trend + (amplitude * residual)
         return recon, trend, amplitude, residual
     
-
-    def log_alpha_kl_low_rank(self, mu, chol, diag):
+    def log_alpha_kl_low_rank(self, mu, chol, diag, min_diag=0.0417):
         batch_size = mu.size(0)
         r = self.alpha_factor_rank
-        k = self.k_atoms
+        e_dim = self.evidence_dim
         
-        factor = chol.view(batch_size, k, r)
+        factor = chol.view(batch_size, e_dim, r)
         
-        noise_factor = torch.zeros(batch_size, k, r, device=mu.device)
+        noise_factor = torch.zeros(batch_size, e_dim, r, device=mu.device)
+        
+        chunk_size = e_dim // r
         for j in range(r):
-            start, end = j * (k // r), (j + 1) * (k // r)
+            start = j * chunk_size
+            end = (j + 1) * chunk_size if j < (r - 1) else e_dim
             noise_factor[:, start:end, j] = 1.0
         
         cov_factor = factor + noise_factor 
 
-        cov_diag = torch.clamp(diag + self.jitter, min=0.035)
+        cov_diag = torch.clamp(diag + self.jitter, min=min_diag)
         
         q_dist = torch.distributions.LowRankMultivariateNormal(
             loc=mu,
@@ -295,7 +296,8 @@ class SpectralDecoder(BaseGenerativeModel):
             cov_diag=cov_diag
         )
         
-        prior_logit = torch.tensor(math.log(math.e - 1.0), device=mu.device)
+        neutral_logit = -4.0 
+        prior_logit = torch.tensor(neutral_logit, device=mu.device)
         
         p_dist = torch.distributions.LowRankMultivariateNormal(
             loc=torch.full_like(mu, prior_logit), 
@@ -303,18 +305,11 @@ class SpectralDecoder(BaseGenerativeModel):
             cov_diag=torch.ones_like(cov_diag)
         )
         
-        kl = kl_divergence(q_dist, p_dist)
+        kl = torch.distributions.kl_divergence(q_dist, p_dist)
 
         scaled_alpha_kl = kl.sum(dim=-1).mean()
 
         return scaled_alpha_kl
-    
-    def dirichlet_sample(self, alpha):
-        alpha = F.softplus(alpha)
-        alpha = torch.clamp(alpha, min=self.large_eps)
-        q_alpha= torch.distributions.Dirichlet(alpha)
-        pi_sample = q_alpha.rsample()
-        return pi_sample
     
     def log_recon_kl(self, mu_z, logvar_z):
         kl = -0.5 * torch.sum(1 + logvar_z - mu_z.pow(2) - logvar_z.exp(), dim=-1).mean()

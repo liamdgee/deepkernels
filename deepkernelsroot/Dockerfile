@@ -1,61 +1,49 @@
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel AS base
+FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel AS production
 
+# --- Environment Variables ---
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PYKEOPS_BUILD_DIR='/app/.cache/pykeops' \
+    PYKEOPS_CACHE_DIR='/app/.cache/pykeops' \
+    KEOPS_BIN_DIR='/app/.cache/pykeops' \
+    KEOPS_EXTRA_FLAGS='-O3 -frounding-math -ffp-contract=off' \
+    OMP_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    PORT=7860
+WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    git \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     build-essential \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-
-#-builder-#
-FROM base AS builder
-
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
 COPY pyproject.toml .
-RUN mkdir -p src/deepkernels && touch src/deepkernels/__init__.py
+COPY src/ /app/src/ 
 
 RUN pip install --upgrade pip && \
-    pip install .[dev]
+    pip install .
+# --- Application Code & Artifacts ---
+#--- copies app.py, app_pipe.py, mlflow.db, the .pkl, and the .pth files
+COPY . /app/
 
-#-test-#
-FROM builder AS test
-
-COPY . .
-RUN black --check src/
-RUN pytest tests/unit/test_cleaner.py
-RUN pip install safety && safety check --output bare
-
-#-prod-#
-FROM base AS production
-
-COPY --from=builder /opt/venv /opt/venv
-
-ENV PATH="/opt/venv/bin:$PATH" \
-    PYTHONPATH="/app/src" \
-    PYKEOPS_BUILD_DIR='/app/.cache/pykeops' \
-    NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility
-
-WORKDIR /app
-
-COPY src/ /app/src/
-COPY pyproject.toml /app/
-
+# --- Security & Permissions ---
+#---- ** KeOps WILL crash if it cannot write its compiled C++ files to the cache dir ** ----#
 RUN useradd -m deepkerneluser && \
     mkdir -p /app/.cache/pykeops && \
     chown -R deepkerneluser:deepkerneluser /app
 
 USER deepkerneluser
 
-LABEL maintainer="Liam Douglas Giles"
-LABEL version="0.1.0"
-LABEL description="deepkernels: Gaussian Process Regression Framework in O(N)"
+LABEL maintainer="Liam Douglas Giles (Machine Learning Engineer -- Sydney)"
+LABEL description="deepkernels -- A generative state space 'dreamer' model of systemic biases across US credit markets"
+LABEL version="1.0.0"
 
-ENTRYPOINT ["python", "-m", "deepkernels"]
+# --- Networking ---
+EXPOSE 7860
+
+#--- Server Entrypoint ---#
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]

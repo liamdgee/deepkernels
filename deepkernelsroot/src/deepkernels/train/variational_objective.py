@@ -24,7 +24,7 @@ class EvidenceLowerBound(nn.Module):
         self.mll = gpytorch.mlls.VariationalELBO(
             likelihood=model.gp.likelihood,
             model=model.gp,
-            num_data=kwargs.get('n_data', 76674)
+            num_data=kwargs.get('n_data', 87636.0)
         )
         self.device = self.get_device(device)
         
@@ -52,8 +52,7 @@ class EvidenceLowerBound(nn.Module):
         kl_sum = 0.0
         total_recon = 0.0
         if gp_output is not None and gp_target is not None:
-            target = gp_target.view(-1).contiguous()
-            gp_loss = -self.mll(gp_output, target)
+            gp_loss = -self.mll(gp_output, gp_target).sum()
         else:
             gp_loss = torch.tensor(0.0, device=device)
         for name, added_loss_term in model.named_added_loss_terms():

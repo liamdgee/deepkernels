@@ -20,6 +20,7 @@ class EncoderConfig:
     k_atoms: int = 30
     rank: int = 3
     jitter: float = 1e-6
+    evidence_dim: int = 58
 
 class EncoderOutput(NamedTuple):
     alpha_mu: torch.Tensor
@@ -51,10 +52,11 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         self.bottleneck_dim = self.config.bottleneck_dim
         self.k_atoms = self.config.k_atoms
         self.rank = self.config.rank
+        self.evidence_dim = self.config.evidence_dim
         
         #-global & dynamic:
         self.input_dim = kwargs.get("input_dim", 30)
-        self.n_data = kwargs.get('n_data', 76674.0)
+        self.n_data = kwargs.get('n_data', 87636.0)
 
         # --- Fusion Layer ---
         # conv_bottleneck (16 or 64) + Spectral_bottleneck (64) + Prev Pi (30) -> 110 or 158 or 222?
@@ -63,14 +65,14 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         self.fusion_net = nn.Sequential(
             torch.nn.utils.spectral_norm(nn.Linear(fusion_in_dim, 64)),
             nn.LayerNorm(64),
-            nn.GELU()
+            nn.ELU(inplace=True)
         )
 
         #-wide base filter for rough trends-#
         self.stem = nn.Sequential(
             nn.Conv1d(self.input_dim, 32, kernel_size=7, stride=2, padding=3, bias=False),
             nn.GroupNorm(8, 32),
-            nn.SiLU()
+            nn.ELU(inplace=True)
         )
         
         #- Convolutional layers capture sequentially tighter & higher frequencies)
@@ -87,7 +89,14 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         self.latent_mu = nn.Linear(self.bottleneck_dim, self.latent_dim)
         self.latent_logvar = nn.Linear(self.bottleneck_dim, self.latent_dim)
 
-    def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
+        self._init_weights()
+    
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=1.41)
+    
+    def forward(self, x, vae_out, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, generative_mode:bool=False, **params) -> EncoderOutput:
         """
         Args:
             x: Input features [Batch, seq_len, 30] or recon_x
@@ -115,33 +124,39 @@ class ConvolutionalLoopEncoder(BaseGenerativeModel):
         if bottleneck is None:
             bottleneck = torch.zeros(batch_size, self.bottleneck_dim, device=device, dtype=x.dtype)
         
+        evidence_dim = self.evidence_dim or 58
+
+        neutral_logit = -4.0
         alpha_mu = params.get('alpha_mu', None)
         if alpha_mu is None and vae_out is not None:
             alpha_mu = getattr(vae_out, 'alpha_mu', None)
+            
         
         if alpha_mu is None:
-            alpha_mu = torch.zeros(batch_size, self.k_atoms, device=device)
+            alpha_mu = torch.full((batch_size, evidence_dim), neutral_logit, device=device)
         
         alpha_diag = params.get('alpha_diag', None)
         if alpha_diag is None and vae_out is not None:
-            alpha_diag = getattr(vae_out, 'diag', None)
+            alpha_diag = getattr(vae_out, 'alpha_diag', None)
         
         if alpha_diag is None:
-            alpha_diag = torch.ones(batch_size, self.k_atoms, device=device)
+            alpha_diag = torch.full((batch_size, evidence_dim), -0.5413, device=device)
+        
         
         alpha_factor = params.get('alpha_factor', None)
         if alpha_factor is None and vae_out is not None:
             alpha_factor = getattr(vae_out, 'alpha_factor', None)
         
         if alpha_factor is None:
-            alpha_factor = torch.zeros(batch_size, self.k_atoms, self.rank, device=device)
+            alpha_factor = torch.zeros(batch_size, evidence_dim, self.rank, device=device)
         
+
         alpha = params.get('alpha', None)
         if alpha is None and vae_out is not None:
             alpha = getattr(vae_out, 'alpha', None)
         
         if alpha is None:
-            alpha = torch.zeros(batch_size, self.k_atoms, device=device)
+            alpha = torch.zeros(batch_size, evidence_dim, device=device)
         
         ls = params.get('ls', None)
 
@@ -218,11 +233,11 @@ class ConvolutionalNetwork1D(nn.Module):
         
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding, bias=False)
         self.norm1 = nn.GroupNorm(num_groups=8, num_channels=out_channels)
-        self.act1 = nn.SiLU()
+        self.act1 = nn.ELU(inplace=True)
         
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, 1, padding, bias=False)
         self.norm2 = nn.GroupNorm(num_groups=8, num_channels=out_channels)
-        self.act2 = nn.SiLU()
+        self.act2 = nn.ELU(inplace=True)
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
@@ -239,12 +254,12 @@ class ConvolutionalNetwork1D(nn.Module):
         out = self.conv2(out)
         out = self.norm2(out)
         
-        if residual.shape[-1] != out.shape[-1]:
-            diff = out.shape[-1] - residual.shape[-1]
-            if diff > 0:
-                residual = F.pad(residual, (0, diff))
-            else:
-                out = F.pad(out, (0, -diff))
+        #if residual.shape[-1] != out.shape[-1]:
+         #   diff = out.shape[-1] - residual.shape[-1]
+          #  if diff > 0:
+           #     residual = F.pad(residual, (0, diff))
+           # else:
+            #    out = F.pad(out, (0, -diff))
                 
         out += residual
         out = self.act2(out)

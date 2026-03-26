@@ -12,7 +12,6 @@ import mlflow
 from torch.optim import Adam, RMSprop, AdamW
 from torch.optim.lr_scheduler import LinearLR
 
-from deepkernels.train.variational_objective import EvidenceLowerBound
 from typing import Union, Optional, Iterable
 import gpytorch
 from tqdm import tqdm
@@ -27,16 +26,15 @@ from dataclasses import dataclass
 @dataclass
 class TrainerConfig:
     # --- Dataset & Epochs ---
-    n_data: float = 76674.0
+    n_data: float = 87636.0
     warmup_vae_epochs: int = 0
     vae_epochs: int = 0
-    warmup_gp_epochs: int = 10
-    
-    gp_epochs: int = 120
+    warmup_gp_epochs: int = 0
+    gp_epochs: int = 0
     #-epochs-#
-    em_macro_cycles: int = 0
-    e_epochs_per_cycle: int = 0
-    m_epochs_per_cycle: int = 0
+    em_macro_cycles: int = 20
+    e_epochs_per_cycle: int = 3
+    m_epochs_per_cycle: int = 5
     joint_epochs: int = 0
 
     # --- AdamW Optimiser (VAE / Encoder / Decoder) ---
@@ -45,13 +43,13 @@ class TrainerConfig:
     slow_decay_adamw: float = 0.0000001
 
     # --- Adam Optimiser (GPyTorch / Kernel Network) ---
-    gp_global_hyper_lr: float = 1e-4
-    gp_mean_lr: float = 1e-4
-    gp_likelihood_lr: float = 1e-4
-    gp_lengthscale_lr: float = 2e-4
-    gp_kernel_nkn_lr: float = 2e-5
-    gp_variational_lr: float = 3e-4
-    gp_inducing_lr: float = 4e-4
+    gp_global_hyper_lr: float = 5e-5
+    gp_mean_lr: float = 5e-4
+    gp_likelihood_lr: float = 2e-4
+    gp_lengthscale_lr: float = 8e-4
+    gp_kernel_nkn_lr: float = 1e-4
+    gp_variational_lr: float = 5e-4
+    gp_inducing_lr: float = 1e-5
 
     # --- SGLD Optimiser (Dirichlet / Latent Variables) ---
     fast_dir: float = 1e-3
@@ -75,7 +73,6 @@ class ParameterIsolate:
         self.model = model
         self.config = config if config is not None else TrainerConfig()
         self.device = self.get_device(device)
-        self.objective = objective if objective is not None else EvidenceLowerBound(self.model)
         # --- VAE LR ---
         self.base_lr_adamw = self.config.base_lr_adamw
         self.slow_lr = self.base_lr_adamw / 10  # Calculated safely here
@@ -238,6 +235,9 @@ class ParameterIsolate:
                     if 'inducing_points' in name:
                         gp_inducing_params.append(param)
                         all_gp_params.append(param)
+                    elif 'lmc' in name:
+                        gp_kernel_global_params.append(param)
+                        all_gp_params.append(param)
                     else:
                         gp_variational_params.append(param)
                         all_gp_params.append(param)  
@@ -282,7 +282,7 @@ class ParameterIsolate:
             {'params': fusion_params, 'lr': self.base_lr_adamw, 'weight_decay': self.base_decay_adamw},
             {'params': latent_params, 'lr': self.slow_lr, 'weight_decay': self.slow_decay_adamw},
             {'params': deterministic_recon_params, 'lr': self.base_lr_adamw, 'weight_decay': self.base_decay_adamw},
-            {'params': probabilistic_nn_params, 'lr': self.base_lr_adamw, 'weight_decay': self.slow_decay_adamw},
+            {'params': probabilistic_nn_params, 'lr': self.slow_lr, 'weight_decay': self.slow_decay_adamw},
         ])
 
         self.langevin_optimiser = torch.optim.RMSprop([
@@ -299,17 +299,19 @@ class ParameterIsolate:
             {'params': likelihood_params, 'lr': self.gp_likelihood_lr},
             {'params': gp_mean_params, 'lr': self.gp_mean_lr},
             {'params': gp_kernel_global_params, 'lr': self.gp_global_hyper_lr},
+            {'params': gp_variational_params, 'lr': self.gp_variational_lr},
             {'params': gp_kernel_ls_params, 'lr': self.gp_lengthscale_lr},
             {'params': gp_kernel_nkn_params, 'lr': self.gp_kernel_nkn_lr},
             {'params': sensitive_ls_params, 'lr': self.sensitive_lr},
             {'params': ultrasensitive_spectral_params, 'lr': self.ultrasensitive_lr},
-            {'params': primitive_params, 'lr': self.base_lr_adamw},
-            {'params': combinatorics_params, 'lr': self.base_lr_adamw},
-            {'params': gp_variational_params, 'lr': self.gp_variational_lr},
+            {'params': primitive_params, 'lr': self.gp_kernel_nkn_lr},
+            {'params': combinatorics_params, 'lr': self.gp_kernel_nkn_lr},
             {'params': gp_inducing_params, 'lr': self.gp_inducing_lr},
             {'params': gp_other_params, 'lr': self.gp_variational_lr}
         ], weight_decay=0.0)
-        
+
+        ##self.ngd_optimizer = gpytorch.optim.NGD(self.model.gp.variational_parameters(), lr=0.1)
+
         total_opt_params = sum(len(group['params']) for opt in [self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser] for group in opt.param_groups)
         logger.info(f"Parameter Isolation Complete. {total_opt_params}/{total_trainable_params} tensors strictly routed into 3 Optimizers.")
         
@@ -321,7 +323,9 @@ class ParameterIsolate:
             "decoder_total": all_decoder_params,
             "dirichlet_total": dirichlet_all_params,
             "hypernetwork_total": all_hypernetwork_params,
-            "gp_total": all_gp_params
+            "gp_kernels_only": all_gp_kernel_hyperparams,
+            "gp_total": all_gp_params,
+            "gp_warmup_safe": likelihood_params + gp_mean_params + gp_variational_params
         }
 
         return self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser, self.module_groups
@@ -359,25 +363,25 @@ class ParameterIsolate:
     def train_gp_warmup(self):
         """
         Stage 2: GP Warmup.
-        Freezes the VAE and the complex NKN Hypernetwork. 
-        Only trains the GP's core parameters (Mean and Likelihood noise) 
-        to stabilize the exact MLL before full covariance learning.
+        TRUE WARMUP: Freezes the VAE, NKN, Inducing Points, and Kernel Lengthscales.
+        ONLY trains the Variational Distribution, Mean, and Likelihood Noise.
         """
         self._set_group_grad("encoder_total", False)
         self._set_group_grad("decoder_total", False)
-        self._set_group_grad("dirichlet_total", True)    
-        self._set_group_grad("hypernetwork_total", False) # <-- FROZEN
-        self._set_group_grad("gp_total", True)
-        logger.info("Mode: GP Warmup. (Calibrating Mean and Likelihood Noise)")
+        self._set_group_grad("dirichlet_total", False)
+        self._set_group_grad("hypernetwork_total", False)
+        self._set_group_grad("gp_total", False)
+        self._set_group_grad("gp_warmup_safe", True)
+        
+        logger.info("Mode: GP Warmup. (Calibrating Variational Dist, Mean, and Noise Only)")
     
     def train_gp_only(self):
         """
-        Stage 3: Full-Batch KeOps ExactGP Training.
         Freezes the entire VAE to save VRAM. Unfreezes the Neural Kernel Network and GP.
         """
         self._set_group_grad("encoder_total", False)
         self._set_group_grad("decoder_total", False)
-        self._set_group_grad("dirichlet_total", True)    
+        self._set_group_grad("dirichlet_total", False)    
         self._set_group_grad("hypernetwork_total", True)
         self._set_group_grad("gp_total", True)
     
@@ -405,7 +409,31 @@ class ParameterIsolate:
         optimiser = Adam(params, lr=lr)
         scheduler = LinearLR(optimiser, start_factor=0.1, total_iters=warmup_epochs)
         return optimiser, scheduler
-
+    
+    def reset_variational_params(self):
+        """
+        Resets the Variational Distribution to the Identity Prior.
+        Uses named_parameters to safely bypass LMC/Multitask wrappers.
+        """
+        logger.info("♻️ Stage 3 Transition: Clearing Warmup noise...")
+        
+        with torch.no_grad():
+            # 1. Hunt down the exact parameters, no matter how deep they are wrapped
+            for name, param in self.model.gp.named_parameters():
+                if 'variational_mean' in name:
+                    param.data.zero_()
+                elif 'chol_variational_covar' in name:
+                    param.data.zero_()
+                    # Fill the diagonal with 1.0 (The Identity Prior)
+                    diag_idx = torch.arange(param.size(-1), device=param.device)
+                    param.data[..., diag_idx, diag_idx] = 1.0
+            
+            # 2. Clear GPyTorch Cache (forces recalculation on the new Stage 3 geometry)
+            if hasattr(self.model.gp, 'variational_strategy'):
+                self.model.gp.variational_strategy._memoize_cache.clear()
+                
+        logger.info("✅ Variational Reset Complete. Inducing points are now 'clean'.")
+    
     def get_device(self, device_request: Union[str, torch.device, None] = None) -> torch.device:
 
             """

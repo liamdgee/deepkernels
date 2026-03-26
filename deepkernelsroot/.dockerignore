@@ -9,7 +9,7 @@ data/
 *.ipynb
 logs/
 notebooks/
-
+/unused/*
 #-Artifacts-#
 models/*.pt
 models/*.onnx

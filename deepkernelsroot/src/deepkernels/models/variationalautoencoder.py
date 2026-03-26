@@ -45,6 +45,7 @@ class StateSpaceOutput(NamedTuple):
     logvar_z: torch.Tensor
     lmc_matrices: torch.Tensor
     real_x: torch.Tensor
+    lmc_consensus: torch.Tensor
 
 class SpectralVAE(BaseGenerativeModel):
     def __init__(self, config_encoder=None, dirichlet_config=None, decoder_config=None, seq_len=32):
@@ -73,30 +74,24 @@ class SpectralVAE(BaseGenerativeModel):
         x_in = self.input_dim or 30
         bottleneck = self.bottleneck_dim or 64
         seq_len = self.seq_len or 32
+        evidence_dim = 2 * (self.k_atoms - 1)
+        neutral_logit = -4.0
         
-        uniform_logit = self.inverse_softplus(1.0).item()
-
-        alpha_factor = torch.zeros(batch_size, k, r, device=device)
-        for j in range(r):
-            start, end = j * (k // r), (j + 1) * (k // r)
-            alpha_factor[:, start:end, j] = 1.0
-        alpha_factor += torch.randn_like(alpha_factor) * 0.001
-        #-pi init-#
         init_pi = self.init_pi_value(batch_size=batch_size, device=device)
-        initial_lmc = torch.zeros(batch_size, k, e, device=device)
-        symmetry_breaker = torch.randn_like(initial_lmc) * 1e-4
-        initial_lmc = initial_lmc + symmetry_breaker
+        initial_lmc = torch.randn(batch_size, k, k, device=device) * 1e-4
+        initial_consensus = torch.randn(batch_size, k, e, device=device) * 1e-4
 
+        
         return StateSpaceOutput(
             recon=torch.randn(batch_size, 1, x_in, device=device) * self.eps,
             amp=torch.ones(batch_size, 1, x_in, device=device),
             trend=torch.zeros(batch_size, 1, x_in, device=device),
             gp_features=torch.randn(batch_size, e, f, device=device) * self.eps,
             pi=init_pi,
-            alpha=torch.ones(batch_size, k, device=device),
-            alpha_mu=torch.full((batch_size, k), uniform_logit, device=device),
-            alpha_factor=alpha_factor,
-            alpha_diag = torch.full((batch_size, k), -0.45, device=device), #-jeffreys prior-#
+            alpha=torch.ones(batch_size, evidence_dim, device=device),
+            alpha_mu=torch.full((batch_size, evidence_dim), neutral_logit, device=device),
+            alpha_factor=torch.zeros(batch_size, evidence_dim, r, device=device),
+            alpha_diag = torch.full((batch_size, evidence_dim), -0.5413, device=device), #-jeffreys prior-#
             bottleneck=torch.randn(batch_size, bottleneck, device=device) * self.eps,
             parameters_per_expert=torch.randn(batch_size, e, f, device=device) * self.eps,
             bandwidth_mod=torch.ones(batch_size, e, device=device),
@@ -111,26 +106,21 @@ class SpectralVAE(BaseGenerativeModel):
             linear=torch.randn(batch_size, 32, device=device) * 0.01,
             matern=torch.randn(batch_size, 32, device=device) * 0.01,
             rational=torch.randn(batch_size, 32, device=device) * 0.01,
-            polynomial=torch.randn(batch_size, 32, device=device) * 0.01
+            polynomial=torch.randn(batch_size, 32, device=device) * 0.01,
+            lmc_consensus=initial_consensus
         )
-
-    def init_pi_value(self, batch_size, device):
-        pi = torch.full((batch_size, self.k_atoms), 1.0/self.k_atoms, device=device)
-        pi = pi + (torch.randn_like(pi) * 0.01)
-        pi = F.softmax(pi, dim=-1)
-        return pi
-
+    
     def refinement_loop(self, x, steps, indices=None, current_state=None, generative_mode:bool=False):
         if current_state is None:
             current_state = self.get_zero_state(x, x.device, batch_size=x.size(0))
+        if not generative_mode:
+            x_seq = x if x.dim() == 3 else x.unsqueeze(1)
 
-        
-        batch_size = x.size(0)
-        for t in range(steps): 
+        for t in range(steps):
             if generative_mode and t > 0:
                 x_t = current_state.recon 
             else:
-                x_t = x[:, t:t+1, :] if x.dim() == 3 else x.unsqueeze(1)
+                x_t = x_seq[:, t:t+1, :]
             
             encoder_out = self.encoder(x_t, vae_out=current_state, indices=indices)
             
@@ -176,12 +166,12 @@ class SpectralVAE(BaseGenerativeModel):
                 linear=decoder_out.linear,
                 matern=decoder_out.matern,
                 rational=decoder_out.rational,
-                polynomial=decoder_out.polynomial
+                polynomial=decoder_out.polynomial,
+                lmc_consensus = decoder_out.lmc_consensus
             )
             
         return current_state
     
-    def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
-        steps = steps if steps is not None else 3
-        current_state = self.refinement_loop(x=x, steps=steps, indices=indices, current_state=vae_out, generative_mode=False)
+    def forward(self, x, vae_out, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, generative_mode:bool=False, **params) -> StateSpaceOutput:
+        current_state = self.refinement_loop(x=x, steps=steps, indices=indices, current_state=vae_out, generative_mode=generative_mode)
         return current_state

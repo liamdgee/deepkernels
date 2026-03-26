@@ -1,7 +1,7 @@
 import torch
 import gpytorch
 import torch.nn as nn
-
+import torch.nn.functional as F
 from deepkernels.models.parent import BaseGenerativeModel
 
 from tqdm import tqdm
@@ -17,33 +17,18 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class StateSpaceKernelProcess(BaseGenerativeModel):
-    def __init__(self, likelihood=None, gp=None, k_atoms=30, num_latents=8, min_noise=0.07, device='cuda', **kwargs):
+    def __init__(self, likelihood=None, gp=None, k_atoms=30, num_latents=8, min_noise=1e-3, device='cuda', **kwargs):
         super().__init__()
         self.device = self.get_device(device)
         self.vae = SpectralVAE()
-        self.gp = AcceleratedKernelGP(likelihood=gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=1, rank=0, noise_constraint=gpytorch.constraints.GreaterThan(min_noise)))
+        self.gp = AcceleratedKernelGP(likelihood=gpytorch.likelihoods.GaussianLikelihood(noise_constraint=gpytorch.constraints.GreaterThan(min_noise)))
         self.input_dim = kwargs.get("input_dim", 30)
-        self.n_data = kwargs.get('n_data', 76674.0)
-    def pack_features(self, gates, linear, periodic, rational, polynomial, matern):
-        def to_3d(p):
-            if p.dim() == 4:
-                return p.squeeze(1) if p.size(1) == 1 else p.squeeze(2)
-            if p.dim() == 2:
-                return p.unsqueeze(0).expand(8, -1, -1)
-            return p
+        self.n_data = kwargs.get('n_data', 87636.0)
 
-        packed = torch.cat([
-            to_3d(gates), to_3d(linear), to_3d(periodic),
-            to_3d(rational), to_3d(polynomial), to_3d(matern)
-        ], dim=-1)
-        
-        return packed.contiguous()
-
-    def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
+    def forward(self, x, vae_out, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, generative_mode:bool=False, **params):
         steps = steps if steps is not None else 3
         if vae_out is None:
             vae_out = self.vae.get_zero_state(x, x.device, batch_size=x.size(0))
-        
         
 
         state = self.vae(
@@ -51,24 +36,26 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
             vae_out=vae_out,
             steps=steps,
             batch_shape=batch_shape,
-            indices=indices
+            indices=indices,
+            generative_mode=generative_mode
         )
         
         if features_only:
             return state, None, None
         
-        gp_features = torch.cat([state.gates, state.linear, state.periodic, state.rational, state.polynomial, state.matern, state.pi], dim=1)
-        gp_input = gp_features.unsqueeze(0).expand(8, -1, -1)
-        # --- CATCH THE MUTATION ---
-        #print(f"DEBUG: periodic shape right before KeOps: {state.periodic.shape}, gates: {state.gates.shape}, linear: {state.linear.shape}, rational: {state.rational.shape}, poly: {state.polynomial.shape}, matern: {state.matern.shape}, lmc: {state.lmc_matrices.shape}")
-        # --------------------------
-        lmc = state.lmc_matrices
-        lmc_param = 2.0 * torch.tanh(lmc / 2.0)
+        zz = self.pack_features(state.gates, state.linear, state.periodic, state.rational, state.polynomial, state.matern, state.pi)
         
         mvn = None
+        
+        lmc_raw = state.lmc_consensus.mean(dim=0)
+        top_val, _ = torch.topk(lmc_raw, k=4, dim=0)
+        min_val = top_val.min(dim=0, keepdim=True)[0]
+        lmc_sparse = torch.where(lmc_raw >= min_val, lmc_raw, torch.zeros_like(lmc_raw))
+        squashed_weights = lmc_sparse.sum(dim=0)
+        
+        final_weights = squashed_weights / (squashed_weights.sum() + 1e-7)
+        
+        self.gp.variational_strategy.lmc_coefficients = final_weights.contiguous()
+        mvn = self.gp(zz)
 
-        mvn = self.gp(gp_input, lmc_learned=lmc_param, indices=indices)
-
-        return state, mvn, gp_features
-    
-    
+        return state, mvn, zz

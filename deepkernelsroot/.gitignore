@@ -5,7 +5,11 @@ __pycache__
 *.py[cod]
 *$py.class
 .DS_Store
-
+ignored/*
+*/ignored/*
+*/unused/
+unused/*
+./unused/*
 .cache/
 .coverage*
 .mypy_cache/
@@ -16,17 +20,20 @@ __pycache__
 .idea/
 .vscode/
 .ipynb_checkpoints/
-
-
+mlflow.db
+mlruns.db
+mlruns/*
+.tmp.*
+.tmp.drive*
 .env
+./unused/
 .venv/
 venv/
-
+unused/*
 docs/*
 mlruns/*
 outputs/*
 !**/.gitkeep
-
 *.py[cod]
 __pycache__/
 
@@ -51,3 +58,22 @@ Thumbs.db
 mlruns/
 *.dta
 *.pth
+
+# Environments and Caches
+__pycache__/
+*.py[cod]
+.env
+keops_cache/
+pykeops_build/
+
+# MLflow and Logs
+mlruns/
+mlruns.db
+logs/
+*.log
+
+# Weights and Data
+*.pt
+*.pth
+*.ckpt
+data/

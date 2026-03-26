@@ -21,22 +21,23 @@ from deepkernels.train.trainer import ParameterIsolate, TrainerConfig
 import pykeops
 import shutil
 import os
+from tqdm import tqdm
+
 ##from deepkernels.train.keras import LossMonitor
-if 'CONDA_PREFIX' in os.environ:
-    os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
-    os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
 
 #---Init logger---#
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Wipe the local project cache
+#rm -rf ./keops_cache/*
 #--Tracking Function Decorator using mlflow--#
 def tracker(experiment):
     def decorator(fn):
         @functools.wraps(fn)
-        def wrapper(self, *args, **kwargs): # <--- Explicitly catch 'self'
-            mlflow.set_tracking_uri("file:///home/liam/deepkernels/deepkernelsroot/mlruns")
+        def wrapper(self, *args, **kwargs):
+            mlflow.set_tracking_uri("sqlite:////home/liam/deepkernels/deepkernelsroot/mlruns.db")
             mlflow.set_experiment(experiment)
             with mlflow.start_run(nested=True):
                 safe_params = {k: v for k, v in kwargs.items() 
@@ -44,6 +45,7 @@ def tracker(experiment):
                 mlflow.log_params(safe_params)
                 return fn(self, *args, **kwargs)
         return wrapper
+    
     return decorator
 #---Class Definition: Stochastic Gradient Optimiser with Adaptive Langevin Dynamics--#
 class LangevinTrainer:
@@ -51,13 +53,13 @@ class LangevinTrainer:
         self.device = self.get_device(device)
         self.model = model
         self.model = self.model.to(device=self.device, dtype=torch.float64)
-        self.n_data = kwargs.get('n_data', 76674.0)
+        self.n_data = kwargs.get('n_data', 87636.0)
         
         self.config = config if config is not None else TrainerConfig()
         
         self.temp = self.config.langevin_temp
         
-        self.objective = EvidenceLowerBound(self.model)
+        self.objective = EvidenceLowerBound(self.model, **kwargs)
         self.orchestrator = ParameterIsolate(model, device=self.device)
         self.adamw_optimiser, self.langevin_optimiser, self.adam_optimiser, self.debug = self.orchestrator.seperate_params_and_build_optimisers()
         self.max_grad_norm = self.config.max_grad_norm
@@ -172,15 +174,9 @@ class LangevinTrainer:
             gp_target=y
         )
 
-        if not torch.isfinite(loss):
-            logger.warning("NaN/Inf loss detected in VAE step. Skipping batch.")
-            self.adamw_optimiser.zero_grad()
-            self.langevin_optimiser.zero_grad()
-            return {}
-
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.adamw_params, max_norm=self.max_grad_norm)
-        torch.nn.utils.clip_grad_norm_(self.langevin_params, max_norm=self.langevin_clip_norm)
+        torch.nn.utils.clip_grad_norm_(self.adamw_params, max_norm=2.5)
+        torch.nn.utils.clip_grad_norm_(self.langevin_params, max_norm=7.0)
 
         self.adamw_optimiser.step()
         self.langevin_optimiser.step()
@@ -205,66 +201,63 @@ class LangevinTrainer:
     
     def step_gp(self, x, y, ind, annealers, global_step, total_steps):
         """Full-batch exact step for Stage 2."""
-        self.adam_optimiser.zero_grad()
-        #gpytorch.settings.fast_computations(covar_root_decomposition=False, log_prob=True, solves=False)
-        y_scaled = (y - self.y_mean) / self.y_std
-        with gpytorch.settings.cholesky_jitter(self.global_cholesky_jitter), \
-            gpytorch.settings.max_preconditioner_size(0), \
-            gpytorch.settings.max_cg_iterations(115), \
-            gpytorch.settings.cg_tolerance(0.02), \
-            gpytorch.settings.num_trace_samples(3), \
-            gpytorch.settings.max_root_decomposition_size(170), \
-            gpytorch.settings.eval_cg_tolerance(0.01), \
-            gpytorch.settings.fast_computations(True, True, True):
+        decay_factor = global_step / max(1, total_steps)
+        
+        current_jitter = 3e-3 * (0.005 ** decay_factor)
+        current_jitter = max(1e-4, current_jitter * 0.95)
 
+        with gpytorch.settings.max_cholesky_size(2048), \
+             gpytorch.settings.max_preconditioner_size(65), \
+             gpytorch.settings.num_trace_samples(13), \
+             gpytorch.settings.max_cg_iterations(888), \
+             gpytorch.settings.cg_tolerance(0.025), \
+             gpytorch.settings.cholesky_max_tries(7), \
+             gpytorch.settings.fast_computations(solves=True, log_prob=True, covar_root_decomposition=False), \
+            gpytorch.settings.cholesky_jitter(current_jitter):
+        
+            self.adam_optimiser.zero_grad()
+            target_aligned = y.view(-1).contiguous()
             state, mvn, gp_features = self.model.forward(x, indices=ind, steps=1, features_only=False)
             loss, gp_loss, metrics = self.objective(
                 model=self.model,
                 gp_output=mvn,
                 state_out=state,
-                gp_target=y_scaled,
+                gp_target=target_aligned,
                 global_step=global_step,
                 annealers=annealers,
                 total_steps=total_steps
             )
             
+            
+            gp_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(self.adam_params, max_norm=0.75
+            )
+            self.adam_optimiser.step()
         
-        if not torch.isfinite(gp_loss):
-            logger.info("\n" + "="*50)
-            logger.warning("🚨 SILENT INFINITY CAUGHT IN GP STEP 🚨")
-            logger.info(f"0a. Total Loss value         : {loss.item()}")
-            logger.info(f"0b. GP Loss value            : {gp_loss.item()}")
-            logger.info(f"1. Target (y_scaled) has NaNs? : {torch.isnan(y_scaled).any().item()}")
-            logger.info(f"2. Target Max/Min values     : Max={y_scaled.max().item():.3f}, Min={y_scaled.min().item():.3f}")
-            if gp_features is not None:
-                has_nans = torch.isnan(gp_features).any().item()
-                logger.info(f"3a. GP Features has NaNs?    : {has_nans}")
-                if not has_nans:
-                    logger.info(f"3b. GP Features Max/Min      : Max={gp_features.max().item():.3f}, Min={gp_features.min().item():.3f}")
-            if mvn is not None:
-                logger.info(f"3. GP Mean has NaNs?         : {torch.isnan(mvn.mean).any().item()}")
-                logger.info(f"4. GP Variance has NaNs?     : {torch.isnan(mvn.variance).any().item()}")
-            logger.info("="*50 + "\n")
-            logger.warning("NaN/Inf loss detected in GP step. Skipping batch.")
-            self.adam_optimiser.zero_grad()
-            return {}
-        gp_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.adam_params, max_norm=self.max_grad_norm)
-        self.adam_optimiser.step()
+        del loss, gp_loss, mvn, state, gp_features
+        torch.cuda.empty_cache()
+        
         for k, v in metrics.items():
-            if isinstance(v, float) and v > 1e10:
-                metrics[k] = torch.nan_to_num(v, nan=1e6, posinf=1e6)
+            if isinstance(v, torch.Tensor):
+                v = v.item()
+            if math.isnan(v) or math.isinf(v) or v > 1e10:
+                metrics[k] = 1e6
+            else:
+                metrics[k] = v
+        
         return metrics
     
     def _log_metrics(self, epoch, metrics, prefix="train"):
         """Dynamically logs any metric returned by EvidenceLowerBound to MLflow."""
         for key, value in metrics.items():
-            mlflow.log_metric(f"{prefix}_{key}", value, step=epoch)
+            clean_val = value.item() if hasattr(value, 'item') else value
+
+            mlflow.log_metric(f"{prefix}/{key}", clean_val, step=epoch)
     
     def evaluate(self, test_loader, epoch=0):
         self.model.eval()
         self.objective.eval()
-        k = self.k_atoms
         
         t_preds = []
         t_targets = []
@@ -273,17 +266,13 @@ class LangevinTrainer:
         n_batches = len(test_loader)
         logger.info(f"---Running test eval for epoch: {epoch}---")
         
-        with torch.no_grad(), \
-            gpytorch.settings.fast_pred_var(False), \
-            gpytorch.settings.fast_computations(covar_root_decomposition=False, log_prob=False, solves=False), \
-            gpytorch.settings.max_cg_iterations(200), \
-            gpytorch.settings.cholesky_jitter(self.global_cholesky_jitter * 5):
+        with torch.no_grad(), gpytorch.settings.cholesky_jitter(2e-3):
              
             for x, y, ind in test_loader:
                 x = x.to(self.device, dtype=torch.float64, non_blocking=True)
                 y = y.to(self.device, dtype=torch.float64, non_blocking=True)
-                y_scaled = (y - self.y_mean) / self.y_std
                 ind = ind.to(self.device, non_blocking=True)
+                target_aligned = y.view(-1).contiguous()
                 
                 state, mvn, _ = self.model.forward(x, indices=ind, features_only=False)
                 
@@ -291,64 +280,72 @@ class LangevinTrainer:
                     model=self.model,
                     gp_output=mvn,
                     state_out=state,
-                    gp_target=y_scaled,
+                    gp_target=target_aligned,
                     total_steps=None,
                     annealers=None,
                     global_step=None
                 )
                 
                 for k, v in metrics.items():
-                    test_stats[k] += v
+                    test_stats[k] += v if isinstance(v, float) else v.item()
+                
                 if mvn is not None:
-                    projected_mean = mvn.mean
-                    
-                    if hasattr(self.model.vae, 'dirichlet'):
-                        projected_var = mvn.variance + self.model.vae.dirichlet.lmc_var
-                    else:
-                        projected_var = mvn.variance
-                    
-                    #-stats to cpu-#
-                    t_preds.append(projected_mean.detach().cpu())
-                    t_targets.append(y_scaled.detach().cpu()) 
-                    t_vars.append(projected_var.detach().cpu())
+                    p_mean = mvn.mean
+                    p_var = mvn.variance
+                    if p_mean.dim() > 1 and p_mean.size(0) == 8:
+                        p_mean = p_mean.mean(dim=0)
+                        p_var = p_var.mean(dim=0) 
 
+                    t_preds.append(p_mean.detach().cpu().flatten())
+                    t_vars.append(p_var.detach().cpu().flatten())
+                    t_targets.append(target_aligned.detach().cpu().flatten())
         
         mean_test_stats = {k: v / n_batches for k, v in test_stats.items()}
 
         if len(t_preds) > 0:
-            preds = torch.cat(t_preds, dim=0)
-            targets = torch.cat(t_targets, dim=0)
-            vars = torch.cat(t_vars, dim=0)
-            targets = targets[:, :preds.size(-1)]
-            
-            valid_mask = torch.isfinite(preds) & torch.isfinite(targets)
-            if not valid_mask.any():
-                logger.error("CRITICAL: All validation predictions are NaN. KeOps kernel has collapsed.")
-                mean_test_stats['mse_accuracy'] = float('inf')
-                mean_test_stats['avg_predictive_variance'] = float('inf')
-                return mean_test_stats
-            
-            clean_preds = preds[valid_mask]
-            clean_targets = targets[valid_mask]
-            clean_vars = vars[valid_mask]
-            mse = F.mse_loss(clean_preds, clean_targets).item()
-            aggregate_uncertainty = clean_vars.mean().item()
-        return mean_test_stats
+            preds = torch.cat(t_preds, dim=0)    # Should be [N_total]
+            targets = torch.cat(t_targets, dim=0) # Should be [N_total]
+            vars = torch.cat(t_vars, dim=0)      # Should be [N_total]
+            valid_mask = torch.isfinite(preds) & torch.isfinite(targets) & torch.isfinite(vars)
+            if valid_mask.any():
+                clean_preds = preds[valid_mask]
+                clean_targets = targets[valid_mask]
+                
+                mean_test_stats['val_mse'] = F.mse_loss(clean_preds, clean_targets).item()
+                mean_test_stats['val_rmse'] = torch.sqrt(F.mse_loss(clean_preds, clean_targets)).item()
+                mean_test_stats['val_uncertainty'] = vars[valid_mask].mean().item()
+                
+                logger.info(f"EPOCH {epoch} | RMSE: {mean_test_stats['val_rmse']:.4f}")
 
-    @tracker(experiment="deepkernels")
-    def fit(self, train_loader, test_loader=None, joint_training: bool=False):
+        return mean_test_stats
+    
+    def evaluate_accuracy(self, x, y_val, model, steps=1, generative_mode=False):
+        model.eval()
+        model.gp.likelihood.eval()
+        state = model.vae.get_zero_state(x, device=x.device, batch_size=x.size(0))
+        with torch.no_grad(), gpytorch.settings.fast_pred_var(False), gpytorch.settings.cholesky_jitter(1e-3):
+            state, predictive_dist, _ = model.forward(x, state, steps=steps, features_only=False, generative_mode=generative_mode)
+            
+            nlpd = -predictive_dist.log_prob(y_val).mean().item()
+            
+            mean = predictive_dist.mean
+            std = torch.sqrt(predictive_dist.variance)
+            
+            in_1_sigma = ((y_val >= mean - std) & (y_val <= mean + std)).float().mean().item()
+            in_2_sigma = ((y_val >= mean - 1.96*std) & (y_val <= mean + 1.96*std)).float().mean().item()
+            
+            ece_1_sigma = abs(in_1_sigma - 0.6827)
+            ece_2_sigma = abs(in_2_sigma - 0.9545)
+            
+            ece = (ece_1_sigma + ece_2_sigma) / 2.0
+
+        return nlpd, ece
+    
+    @tracker(experiment="princess")
+    def fit(self, train_loader, test_loader=None, joint_training: bool=True, maniac_override: bool=False):
         logger.info(f"Starting Two-Stage Training on {self.device}")
         logger.info("Calculating global target statistics for GP scaling...")
-        all_y = []
-        for _, y_batch, _ in train_loader:
-            all_y.append(y_batch)
-        all_y = torch.cat(all_y, dim=0).to(self.device, dtype=torch.float64)
-        self.y_mean = all_y.mean(dim=0, keepdim=True)
-        self.y_std = all_y.std(dim=0, keepdim=True).clamp(min=1e-6)
         
-        ###live_plotter = LossMonitor(plot_every_n_epochs=1)
-        
-        logger.info(f"Target Global Mean: {self.y_mean.squeeze().tolist()} | Std: {self.y_std.squeeze().tolist()}")
         batches_per_epoch = len(train_loader)
         total_steps_vae_warmup = self.warmup_vae_epochs * batches_per_epoch
         total_steps_vae_full   = self.vae_epochs * batches_per_epoch
@@ -428,7 +425,9 @@ class LangevinTrainer:
                 logger.info(f"Warmup Epoch {epoch}/{self.warmup_vae_epochs} | Recon Loss: {mean_train_stats.get('loss_recon', 0.0):.4f}")
             
             self.clear_gpytorch_caches()
-            mlflow.pytorch.log_model(self.model, "model_stage1_vae_warmup")
+            local_save_path = "model_stage1_vae_warmup.pt"
+            torch.save(self.model.state_dict(), local_save_path)
+            mlflow.log_artifact(local_save_path, artifact_path="checkpoints")
         
         
         # ==========================================
@@ -461,7 +460,9 @@ class LangevinTrainer:
                 logger.info(f"VAE Epoch {epoch}/{self.vae_epochs} | Recon Loss: {mean_train_stats.get('loss_recon', 0.0):.4f}")
             
             self.clear_gpytorch_caches()
-            mlflow.pytorch.log_model(self.model, "model_stage2_vae_full")
+            local_save_path = "model_stage2_vae.pt"
+            torch.save(self.model.state_dict(), local_save_path)
+            mlflow.log_artifact(local_save_path, artifact_path="checkpoints")
 
         # ==========================================
         # STAGE 3: GP Warmup (Mean & Noise Calibration)
@@ -475,8 +476,9 @@ class LangevinTrainer:
                 self.objective.train()
                 train_stats = defaultdict(float)
                 global_epochs += 1
+                pbar = tqdm(train_loader, desc=f"WARMUP GP Epoch {epoch}/{self.warmup_gp_epochs}", dynamic_ncols=True, leave=True)
                 
-                for x, y, ind in train_loader:
+                for x, y, ind in pbar:
                     absolute_global_step += 1
                     stage_step += 1
                     x = x.to(self.device, dtype=torch.float64, non_blocking=True)
@@ -485,7 +487,12 @@ class LangevinTrainer:
                     metrics = self.step_gp(x, y, ind, annealers=gp_warmup_annealers, global_step=stage_step, total_steps=total_steps_gp_warmup)
                     for k, v in metrics.items(): 
                         train_stats[k] += v if isinstance(v, float) else v.item()
-                
+                    
+                    if stage_step % 10 == 0: # Updated to 10 so the bar feels more "alive"
+                        current_loss = metrics.get('loss_gp', 0.0)
+                        val = current_loss if isinstance(current_loss, float) else current_loss.item()
+                        
+                        pbar.set_postfix({"MLL": f"{val:.4f}"})
                 
                 mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()}
                 self._log_metrics(global_epochs, mean_train_stats, prefix="gp_warmup")
@@ -494,18 +501,21 @@ class LangevinTrainer:
 
                 
                 logger.info(f"GP Warmup Epoch {epoch}/{self.warmup_gp_epochs} | VariationalELBO: {mean_train_stats.get('loss_gp', 0.0):.4f}")
-                if test_loader and epoch % 10 == 0:
+                if test_loader:
                     val_stats = self.evaluate(test_loader, global_epochs)
                     self._log_metrics(global_epochs, val_stats, prefix="val")
-                    current_val_mse = val_stats.get('mse_accuracy', float('inf'))
-                    if torch.isfinite(torch.tensor(current_val_mse)) and current_val_mse < best_val_mse:
-                        best_val_mse = current_val_mse
-                        self.save_checkpoint("best_val_model.pth")
-                        self.export_keops_cache()
-                        mlflow.log_artifact("best_val_model.pth")
-                        logger.info(f"New best model saved with Val MSE: {best_val_mse:.4f}")
+                    if epoch % 10 == 0:
+                        current_val_mse = val_stats.get('val_mse', float('inf'))
+                        if torch.isfinite(torch.tensor(current_val_mse)) and current_val_mse < best_val_mse:
+                            best_val_mse = current_val_mse
+                            self.save_checkpoint("best_val_model.pth")
+                            self.export_keops_cache()
+                            mlflow.log_artifact("best_val_model.pth")
+                            logger.info(f"New best model saved with Val MSE: {best_val_mse:.4f}")
             self.clear_gpytorch_caches()
-            mlflow.pytorch.log_model(self.model, "model_stage3_warmup")
+            checkpoint_path = "model_stage3_warmup.pt"
+            torch.save(self.model.state_dict(), checkpoint_path)
+            mlflow.log_artifact(checkpoint_path, artifact_path="checkpoints")
         # ==========================================
         # STAGE 4
         # ==========================================
@@ -518,7 +528,8 @@ class LangevinTrainer:
                 self.objective.train()
                 train_stats = defaultdict(float)
                 global_epochs += 1
-                for x, y, ind in train_loader:
+                pbar = tqdm(train_loader, desc=f"FULL GP Epoch {epoch}/{self.gp_epochs}", dynamic_ncols=True, leave=True)
+                for x, y, ind in pbar:
                     absolute_global_step += 1
                     stage_step += 1
                     x = x.to(self.device, dtype=torch.float64, non_blocking=True)
@@ -533,7 +544,19 @@ class LangevinTrainer:
                     
                     for k, v in metrics.items(): 
                         train_stats[k] += v if isinstance(v, float) else v.item()
-                
+
+                    if stage_step % 10 == 0:
+                        current_loss = metrics.get('loss_gp', 0.0)
+                        val = current_loss if isinstance(current_loss, float) else current_loss.item()
+                        
+                        pbar.set_postfix({"MLL": f"{val:.4f}"})
+                    if absolute_global_step % 50 == 0:
+                        current_loss = metrics.get('loss_gp', 0.0)
+                        current_loss_val = current_loss if isinstance(current_loss, float) else current_loss.item()
+                        logger.info(f"Epoch {epoch} | Step {absolute_global_step} | Batch MLL: {current_loss_val:.4f}")
+                        for k, v in metrics.items():
+                            val = v if isinstance(v, float) else v.item()
+                            mlflow.log_metric(f"step_gp_train_{k}", val, step=absolute_global_step)
                 
                 mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()}
                 self._log_metrics(global_epochs, mean_train_stats, prefix="gp_train")
@@ -543,18 +566,32 @@ class LangevinTrainer:
                 logger.info(f"GP Epoch {epoch}/{self.gp_epochs} | MLL: {mean_train_stats.get('loss_gp', 0.0):.4f}")
             
                 if test_loader and epoch % 10 == 0:
-                    val_stats = self.evaluate(test_loader, global_epochs)
-                    self._log_metrics(global_epochs, val_stats, prefix="val")
-                    current_val_mse = val_stats.get('mse_accuracy', float('inf'))
-                    if torch.isfinite(torch.tensor(current_val_mse)) and current_val_mse < best_val_mse:
-                        best_val_mse = current_val_mse
-                        self.save_checkpoint("best_val_model.pth")
-                        self.export_keops_cache()
-                        mlflow.log_artifact("best_val_model.pth")
-                        logger.info(f"New best model saved with Val MSE: {best_val_mse:.4f}")
+                    try:
+                        val_stats = self.evaluate(test_loader, global_epochs)
+                        
+                        if val_stats:
+                            self._log_metrics(global_epochs, val_stats, prefix="val")
+                            
+                            current_val_mse = val_stats.get('val_mse', float('inf'))
+                        if epoch % 10 == 0:
+                            current_val_mse = val_stats.get('val_mse', float('inf'))
+                            if torch.isfinite(torch.tensor(current_val_mse)) and current_val_mse < best_val_mse:
+                                best_val_mse = current_val_mse
+                                self.save_checkpoint("best_val_model_fullgp.pth")
+                                mlflow.log_artifact("best_val_model_fullgp.pth")
+                                logger.info(f"🌟 New best model saved with Val MSE: {best_val_mse:.4f}")
+                                self.export_keops_cache()
+                    except Exception as e:
+                        logger.error(f"❌ CRITICAL: Evaluation crashed during Epoch {global_epochs}!")
+                        logger.error(f"Error details: {str(e)}")
+                        logger.warning("🛡️ Shield activated: Bypassing crash to keep the training loop alive.")
+                        self.clear_gpytorch_caches() 
+                        torch.cuda.empty_cache()
 
             self.clear_gpytorch_caches()
-            mlflow.pytorch.log_model(self.model, "model_stage3_full")
+            checkpoint_path = "model_stage3_full.pt"
+            torch.save(self.model.state_dict(), checkpoint_path)
+            mlflow.log_artifact(checkpoint_path, artifact_path="checkpoints")
 
         # ==========================================
         # PREP FOR STAGES 4 & 5: Linear LR Decay
@@ -562,17 +599,18 @@ class LangevinTrainer:
         # Calculate total remaining batches for Stages 4 and 5
         if joint_training:
             total_em_batches = (self.em_macro_cycles * (self.e_epochs_per_cycle + self.m_epochs_per_cycle)) * len(train_loader)
-            total_joint_batches = self.joint_epochs * len(train_loader)
-            total_finetune_steps = total_em_batches + total_joint_batches
+            if maniac_override:
+                total_joint_batches = self.joint_epochs * len(train_loader)
+                total_finetune_steps = total_em_batches + total_joint_batches
+            else:
+                total_finetune_steps = total_em_batches
+
             logger.info(f"Initializing LinearLR for final {total_finetune_steps} fine-tuning steps.")
             linear_vae_scheduler = torch.optim.lr_scheduler.LinearLR(
                 self.adamw_optimiser, start_factor=1.0, end_factor=0.1, total_iters=total_finetune_steps
             )
             linear_gp_scheduler = torch.optim.lr_scheduler.LinearLR(
                 self.adam_optimiser, start_factor=1.0, end_factor=0.1, total_iters=total_finetune_steps
-            )
-            linear_langevin_scheduler = torch.optim.lr_scheduler.LinearLR(
-                self.langevin_optimiser, start_factor=1.0, end_factor=0.1, total_iters=total_finetune_steps
             )
 
             if self.em_macro_cycles > 0:
@@ -587,13 +625,14 @@ class LangevinTrainer:
                     # --------------------------------------------------
                     # E-Step: Refine Latent Representations (Mini-Batches)
                     # --------------------------------------------------
-                    self.orchestrator.train_vae_and_dirichlet()
-                    for e_epoch in range(1, self.e_epochs_per_cycle + 1):
+                    self.orchestrator.train_vae_only()
+                    e_epoch_pbar = tqdm(range(1, self.e_epochs_per_cycle + 1), desc=f"Cycle {cycle} [E-Step]", unit="epoch")
+                    for e_epoch in e_epoch_pbar:
                         self.model.train()
                         self.objective.train()
                         global_epochs += 1
                         train_stats = defaultdict(float)
-                        for x, y, ind in train_loader:
+                        for x, y, ind in tqdm(train_loader, desc=f"E-Epoch {e_epoch}", leave=False, unit="batch"):
                             x = x.to(self.device, dtype=torch.float64, non_blocking=True)
                             y = y.to(self.device, dtype=torch.float64, non_blocking=True)
                             ind = ind.to(self.device, non_blocking=True)
@@ -603,23 +642,38 @@ class LangevinTrainer:
                             for k, v in metrics.items(): 
                                 train_stats[k] += v if isinstance(v, float) else v.item()
                         linear_vae_scheduler.step()
-                        linear_gp_scheduler.step()
-                        linear_langevin_scheduler.step()
                         mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()} 
                         self._log_metrics(global_epochs, mean_train_stats, prefix="em_e_step")
+                        e_epoch_pbar.set_postfix({'Recon': f"{mean_train_stats['loss_recon']:.4f}"})
                         logger.info(f"  [E-Step] VAE Epoch {e_epoch} | Recon: {mean_train_stats['loss_recon']:.4f}")
-
-                    # --------------------------------------------------
+                        if test_loader and e_epoch % 5 == 0:  # Changed to e_epoch!
+                            try:
+                                val_stats = self.evaluate(test_loader, global_epochs)
+                                if val_stats:
+                                    self._log_metrics(global_epochs, val_stats, prefix="val")
+                                    current_val_mse = val_stats.get('val_mse', float('inf'))
+                                    if torch.isfinite(torch.tensor(current_val_mse)) and current_val_mse < best_val_mse:
+                                        best_val_mse = current_val_mse
+                                        self.save_checkpoint("best_val_model_estep.pth")
+                                        mlflow.log_artifact("best_val_model_estep.pth")
+                                        logger.info(f"🌟 New best model saved (E-Step) with Val MSE: {best_val_mse:.4f}")
+                                        self.export_keops_cache()
+                            except Exception as e:
+                                logger.error(f"❌ CRITICAL: Evaluation crashed during E-step Epoch {e_epoch}!")
+                                logger.error(f"Error details: {str(e)}")
+                                logger.warning("🛡️ Shield activated: Bypassing crash to keep the training loop alive.")
+                                self.clear_gpytorch_caches() 
+                                torch.cuda.empty_cache()
                     # M-Step: Maximize Marginal Likelihood (Full-Batch)
                     # --------------------------------------------------
-                    self.orchestrator.train_gp_only() # VAE Frozen
-                    
-                    for m_epoch in range(1, self.m_epochs_per_cycle + 1):
-                        self.model.train()      # <--- ADD THIS
+                    self.orchestrator.train_gp_warmup() # VAE Frozen
+                    m_epoch_pbar = tqdm(range(1, self.m_epochs_per_cycle + 1), desc=f"Cycle {cycle} [M-Step]", unit="epoch")
+                    for m_epoch in m_epoch_pbar:
+                        self.model.train()
                         self.objective.train()
                         train_stats = defaultdict(float)
                         global_epochs += 1 # Step forward in MLflow time
-                        for x, y, ind in train_loader:
+                        for x, y, ind in tqdm(train_loader, desc=f"M-Epoch {m_epoch}", leave=False, unit="batch"):
                             x = x.to(self.device, dtype=torch.float64, non_blocking=True)
                             y = y.to(self.device, dtype=torch.float64, non_blocking=True)
                             ind = ind.to(self.device, non_blocking=True)
@@ -627,17 +681,46 @@ class LangevinTrainer:
                             metrics = self.step_gp(x, y, ind, annealers=gp_full_annealers, global_step=m_steps, total_steps=total_m_steps)
                             for k, v in metrics.items(): 
                                 train_stats[k] += v if isinstance(v, float) else v.item()
-                        linear_vae_scheduler.step()
                         linear_gp_scheduler.step()
-                        linear_langevin_scheduler.step()
                         mean_train_stats = {k: v / len(train_loader) for k, v in train_stats.items()} 
                         self._log_metrics(global_epochs, mean_train_stats, prefix="em_m_step")
+                        m_epoch_pbar.set_postfix({'MLL': f"{mean_train_stats.get('loss_gp', 0.0):.4f}"})
                         logger.info(f"  [M-Step] GP Epoch {m_epoch} | MLL: {mean_train_stats.get('loss_gp', 0.0):.4f}")
-            
+                        
+                        if test_loader and m_epoch % 5 == 0:
+                            try:
+                                val_stats = self.evaluate(test_loader, global_epochs)
+                                if val_stats:
+                                    self._log_metrics(global_epochs, val_stats, prefix="val")
+                                    current_val_mse = val_stats.get('val_mse', float('inf'))
+                                    if torch.isfinite(torch.tensor(current_val_mse)) and current_val_mse < best_val_mse:
+                                        best_val_mse = current_val_mse
+                                        self.save_checkpoint("best_val_model_mstep.pth")
+                                        mlflow.log_artifact("best_val_model_mstep.pth")
+                                        logger.info(f"🌟 New best model saved (M-Step) with Val MSE: {best_val_mse:.4f}")
+                                        self.export_keops_cache()
+                            except Exception as e:
+                                logger.error(f"❌ CRITICAL: Evaluation crashed during M-step Epoch {m_epoch}!")
+                                logger.error(f"Error details: {str(e)}")
+                                logger.warning("🛡️ Shield activated: Bypassing crash to keep the training loop alive.")
+                                self.clear_gpytorch_caches() 
+                                torch.cuda.empty_cache()
             self.clear_gpytorch_caches()
-            mlflow.pytorch.log_model(self.model, "model_stage4_em")
+            checkpoint_path = "model_stage_em_full.pt"
+            torch.save(self.model.state_dict(), checkpoint_path)
+            mlflow.log_artifact(checkpoint_path, artifact_path="checkpoints")
 
-            
+        if maniac_override:
+            total_very_risky_steps = (self.joint_epochs * len(train_loader))
+            linear_langevin_scheduler = torch.optim.lr_scheduler.LinearLR(
+                self.langevin_optimiser, start_factor=1.0, end_factor=0.1, total_iters=total_very_risky_steps
+            )
+            linear_vae_scheduler = torch.optim.lr_scheduler.LinearLR(
+                self.adamw_optimiser, start_factor=1.0, end_factor=0.1, total_iters=total_very_risky_steps
+            )
+            linear_gp_scheduler = torch.optim.lr_scheduler.LinearLR(
+                self.adam_optimiser, start_factor=1.0, end_factor=0.1, total_iters=total_very_risky_steps
+            )
             if self.joint_epochs > 0:
                 self.orchestrator.train_cyclically()
                 cycles = 0
@@ -651,18 +734,17 @@ class LangevinTrainer:
                     global_epochs += 1
                     
                     with gpytorch.settings.cholesky_jitter(self.global_cholesky_jitter), \
-                        gpytorch.settings.max_preconditioner_size(0), \
-                        gpytorch.settings.max_cg_iterations(50), \
-                        gpytorch.settings.cg_tolerance(0.1), \
-                        gpytorch.settings.num_trace_samples(4), \
+                        gpytorch.settings.max_preconditioner_size(15), \
+                        gpytorch.settings.max_cg_iterations(30), \
+                        gpytorch.settings.cg_tolerance(0.07), \
+                        gpytorch.settings.num_trace_samples(1), \
                         gpytorch.settings.max_root_decomposition_size(25), \
                         gpytorch.settings.eval_cg_tolerance(0.01), \
-                        gpytorch.settings.fast_computations(covar_root_decomposition=False, log_prob=False, solves=False):
+                        gpytorch.settings.fast_computations(False, True, False):
                             
                             for x, y, ind in train_loader:
                                 x = x.to(self.device, dtype=torch.float64, non_blocking=True)
                                 y = y.to(self.device, dtype=torch.float64, non_blocking=True)
-                                y_scaled = (y - self.y_mean) / self.y_std
                                 ind = ind.to(self.device, non_blocking=True)
                                 self.adam_optimiser.zero_grad()
                                 self.adamw_optimiser.zero_grad()
@@ -693,10 +775,6 @@ class LangevinTrainer:
                     linear_langevin_scheduler.step()
                     self._log_metrics(global_epochs, mean_train_stats, prefix="joint")
                     logger.info(f"Joint Epoch {epoch}/{self.joint_epochs} | Total Loss: {mean_train_stats.get('loss_total', float('nan')):.4f}")
-
-        self.save_checkpoint("deepkernels_model.pth")
-        self.clear_gpytorch_caches()
-        mlflow.pytorch.log_model(self.model, "deepkernels_model")
         return best_val_mse
 
     def clear_gpytorch_caches(self):

@@ -4,7 +4,7 @@ import math
 import torch.nn.utils.parametrizations as P
 import torch.nn.functional as F
 import gpytorch
-from typing import Optional, Any, NamedTuple
+from typing import Optional, Any, NamedTuple, List
 
 
 from deepkernels.models.parent import BaseGenerativeModel
@@ -45,25 +45,20 @@ class KernelNetwork(BaseGenerativeModel):
         dims = [self.primitives_total_dim, 512, 1024, self.spectral_emb_dim]
         layers = []
         for in_f, out_f in zip(dims, dims[1:]):
-            layers.append(nn.Linear(in_f, out_f))
+            layers.append(torch.nn.utils.spectral_norm(nn.Linear(in_f, out_f)))
         
             if out_f != dims[-1]:
                 layers.append(nn.LayerNorm(out_f))
-                layers.append(nn.GELU())
+                layers.append(nn.ELU(inplace=True))
             else:
                 layers.append(nn.LayerNorm(out_f))
-                layers.append(nn.GELU()) 
 
         self.spectral_feedback_loop = nn.Sequential(*layers)
         
-        gate_last_linear = nn.Linear(64, 8)
 
         self.gate_head = nn.Sequential(
-            nn.Linear(self.primitives_total_dim, 64),
-            nn.LayerNorm(64),
-            nn.Softsign(),
-            P.weight_norm(gate_last_linear),
-            SafeSoftplus()                  
+            nn.Linear(self.primitives_total_dim, 8),
+            nn.Sigmoid()
         )
         
 
@@ -81,7 +76,7 @@ class KernelNetwork(BaseGenerativeModel):
             
         return P.weight_norm(layer)
 
-    def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
+    def forward(self, x, vae_out, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, generative_mode:bool=False, **params):
         """
         inputs the latent bottleneck dim (64)
         """
@@ -108,15 +103,20 @@ class KernelNetwork(BaseGenerativeModel):
         )
 
         return gp_params, features_large
-
+    
     def init_weights_nkn(self):
-        # --- Gate Head: Neutral weights, positive bias ---
-        for module in self.gate_head.modules():
+        for module in self.spectral_feedback_loop.modules():
             if isinstance(module, nn.Linear):
                 if hasattr(module, 'weight_orig'):
-                    nn.init.orthogonal_(module.weight_orig, gain=1.0)
+                    nn.init.orthogonal_(module.weight_orig, gain=1.41)
                 else:
-                    nn.init.orthogonal_(module.weight, gain=1.0)
+                    nn.init.orthogonal_(module.weight, gain=1.41)
                 
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        for module in self.gate_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0.1)

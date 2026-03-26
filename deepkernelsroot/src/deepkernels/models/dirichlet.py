@@ -35,7 +35,6 @@ class DirichletOutput(NamedTuple):
     bottleneck: torch.Tensor
     beta: torch.Tensor
     pi: torch.Tensor
-    conc_prior: torch.Tensor
     local_conc: torch.Tensor
     ls_logvar: torch.Tensor
     mu_z: torch.Tensor
@@ -48,6 +47,7 @@ class DirichletOutput(NamedTuple):
     rational: torch.Tensor
     polynomial: torch.Tensor
     matern: torch.Tensor
+    lmc_consensus: torch.Tensor
 
 
 from dataclasses import dataclass
@@ -64,10 +64,10 @@ class DirichletConfig:
     num_experts: int = 8
     num_fourier_features: int = 128
     spectral_emb_dim: int = 2048
-    n_data: float = 76674.0  # Kept as float for division stability
+    n_data: float = 87636.0 # Kept as float for division stability
     
     # --- Hyperparameters ---
-    dropout: float = 0.05
+    dropout: float = 0.0
     gamma_concentration_init: float = 1.5417
     noise_scalar: float = 0.316
     psi_scale: float = 1.0
@@ -76,8 +76,9 @@ class DirichletConfig:
     jitter: float = 1e-6
     eps: float = 1e-3
     large_eps: float = 4e-2
-    posterior_dirichlet_epsilon: float = 4e-5
-    conc_clamp: float = 30.0
+    posterior_dirichlet_epsilon: float = 2e-5
+    conc_clamp: float = 9.0
+    concentration_strength: float = 77.0
     min_ls: float = 0.05
     max_ls: float = 15.0
     sigma_lower_bound: float = 1e-4
@@ -88,9 +89,11 @@ class DirichletConfig:
     stick_breaking_epsilon: float = 3e-3
     uniform_dist_clamp: float = 5e-5
     tiny_eps: float = 3e-8
-    M_series: int = 8
+    M_series: int = 9
     num_primitives: int = 5
     individual_kernel_dim_out: int = 32
+    evidence_dim: int = 58
+    training_batch_size: int = 1024
 
 
 class AmortisedDirichlet(BaseGenerativeModel):
@@ -129,33 +132,34 @@ class AmortisedDirichlet(BaseGenerativeModel):
         self.mu_upper_bound = self.config.mu_upper_bound
         self.eps_clip = self.config.eps_clip
         self.psi_scale = self.config.psi_scale
-
+        self.concentration_strength = self.config.concentration_strength
+        self.evidence_dim = self.config.evidence_dim
+        self.batch_size = self.config.training_batch_size
+        
         #-global & dynamic:
         self.input_dim = kwargs.get("input_dim", 30)
         self.n_data = kwargs.get('n_data', 76674.0)
+        
         #-hypernetworks
         self.compress_spectral_features_head = torch.nn.utils.spectral_norm(nn.Linear(self.k_atoms * self.M * 2, self.spectral_emb_dim))
         
         self.bottleneck_mixer = nn.Sequential(
             nn.utils.spectral_norm(nn.Linear(self.latent_dim, self.bottleneck_dim)), 
             nn.LayerNorm(self.bottleneck_dim), 
-            nn.SiLU()
+            nn.ELU(inplace=True)
         )
         
         self.kernel_network = KernelNetwork(config=self.config)
 
-
         scale_constraint = gpytorch.constraints.GreaterThan(1e-4)
-        jitter_constraint = gpytorch.constraints.GreaterThan(1e-6)
         positive_constraint = gpytorch.constraints.Positive()
 
         
-        mu_constraint = gpytorch.constraints.Interval(lower_bound=-30.0, upper_bound=20.0)
-        sigma_constraint = gpytorch.constraints.Interval(lower_bound=0.01, upper_bound=5.0)
         ls_constraint = gpytorch.constraints.Interval(lower_bound=self.min_ls, upper_bound=self.max_ls)
-        atom_mu_constraint = gpytorch.constraints.Interval(lower_bound=-30.0, upper_bound=20.0)
-        atom_sigma_constraint = gpytorch.constraints.Interval(lower_bound=0.01, upper_bound=5.0)
         lmc_constraint = gpytorch.constraints.Interval(lower_bound=-5.0, upper_bound=5.0)
+        freq_bounds = gpytorch.constraints.Interval(-30.0, 20.0)
+        broad_var = gpytorch.constraints.Interval(0.01, 5.0)
+        tight_var = gpytorch.constraints.Interval(0.01, 1.5)
         
         #============
         #--params--#
@@ -169,22 +173,21 @@ class AmortisedDirichlet(BaseGenerativeModel):
         self.register_constraint("raw_q_b_global", positive_constraint)
 
         #-learnable gamma conc param-#
-        self.register_parameter(name="raw_gamma", parameter=nn.Parameter(torch.zeros(1)))
-        self.register_constraint("raw_gamma", scale_constraint)
+        self.register_parameter(name="raw_gamma", parameter=torch.nn.Parameter(torch.zeros(1)))
 
         #-global hierarchical dist (H)-# 
         self.register_parameter(name="raw_h_mu", parameter=nn.Parameter(torch.zeros(1, 1, self.latent_dim)))
-        self.register_constraint("raw_h_mu", mu_constraint)
+        self.register_constraint("raw_h_mu", freq_bounds)
 
         self.register_parameter(name="raw_h_sigma", parameter=nn.Parameter(torch.zeros(1, 1, self.latent_dim)))
-        self.register_constraint("raw_h_sigma", sigma_constraint)
+        self.register_constraint("raw_h_sigma", broad_var)
         
         #-atoms for spectral features (gaussian)-#
         self.register_parameter(name="raw_atom_loc", parameter=nn.Parameter(torch.randn(self.k_atoms, 1, self.latent_dim) * 2 * math.sqrt(0.1)))
-        self.register_constraint("raw_atom_loc", atom_mu_constraint)
+        self.register_constraint("raw_atom_loc", freq_bounds)
 
         self.register_parameter(name="raw_atom_scale", parameter=nn.Parameter(torch.randn(self.k_atoms, 1, self.latent_dim) * 0.1))
-        self.register_constraint("raw_atom_scale", atom_sigma_constraint)
+        self.register_constraint("raw_atom_scale", tight_var)
 
         #kernel lengthscales-#
         self.register_parameter(name="raw_lengthscale_uncertainty", parameter=nn.Parameter(torch.zeros(1, self.k_atoms)))
@@ -209,14 +212,14 @@ class AmortisedDirichlet(BaseGenerativeModel):
 
         self.register_prior(
             "atom_scale_prior", 
-            CustomLaplacePrior(loc=0.0025, scale=0.37), 
+            gpytorch.priors.LogNormalPrior(loc=0.0, scale=1.0), 
             lambda m: m.atom_scale,
             lambda m, v: None
         )
 
         self.register_prior(
             "gamma_prior", 
-            GammaPrior(concentration=1.5, rate=0.5), 
+            GammaPrior(concentration=1.0, rate=0.5), 
             lambda m: m.gamma,
             lambda m, v: None
         )
@@ -237,37 +240,38 @@ class AmortisedDirichlet(BaseGenerativeModel):
         self.register_added_loss_term("local_divergence")
         self.register_added_loss_term("inverse_wishart")
 
-        #-initialisations-#
-        random_log_noise_mu = torch.abs(torch.randn(self.k_atoms, 1, self.latent_dim)) * self.noise_scalar
-        target_atom_mu = 2 * torch.sqrt(random_log_noise_mu)
-        target_atom_sigma = torch.exp(torch.randn(self.k_atoms, 1, self.latent_dim) * self.noise_scalar)
-        
-        target_lmc = torch.randn(self.k_atoms, self.num_latents) * 0.1
-        target_lmc_var = torch.ones(self.k_atoms) + (torch.rand(self.k_atoms) * 0.1)
+        self._init_weights()
 
+        neutral_stick = torch.full((self.k_atoms - 1,), 0.5413)
+        atom_spread = torch.linspace(-5.0, 5.0, self.k_atoms).view(self.k_atoms, 1, 1)
+        initial_atom_loc = atom_spread.expand(-1, 1, self.latent_dim).clone()
+        initial_atom_loc += torch.randn_like(initial_atom_loc) * 0.1
+        initial_atom_scale = torch.full((self.k_atoms, 1, self.latent_dim), -1.5)
+        initial_lmc = torch.full((self.k_atoms, self.num_latents), -2.25)
+        target_lmc_var = torch.ones(self.k_atoms) + (torch.rand(self.k_atoms) * 0.1)
+        
         self.initialize(
-            raw_q_a_global=torch.tensor(0.0),
-            raw_q_b_global=torch.tensor(0.0),
-            raw_gamma=torch.tensor(0.0),
-            raw_h_mu=torch.tensor(0.0),
-            raw_h_sigma=torch.tensor(0.0),
-            raw_lengthscale_uncertainty=torch.tensor(0.0),
-            raw_atom_loc=torch.randn_like(target_atom_mu) * 0.05,
-            raw_atom_scale=torch.randn_like(target_atom_sigma) * 0.05, 
-            raw_lmc_var=torch.randn_like(target_lmc_var) * 0.05,
-            raw_lmc_matrix=torch.randn_like(target_lmc) * 0.05
+            raw_q_a_global=neutral_stick,
+            raw_q_b_global=neutral_stick,
+            raw_h_mu=torch.zeros(1, 1, self.latent_dim),
+            raw_gamma=torch.full((1,), -1.87),
+            raw_h_sigma=torch.tensor([0.5413]),
+            raw_atom_loc=initial_atom_loc,
+            raw_atom_scale=initial_atom_scale,
+            raw_lengthscale_uncertainty=torch.zeros(1, self.k_atoms),
+            raw_lmc_var=target_lmc_var,
+            raw_lmc_matrix=initial_lmc
         )
-    
-    #-properties for params -#
 
     @property
     def q_a_global(self): return self.raw_q_a_global_constraint.transform(self.raw_q_a_global)
+
+    @property
+    def gamma(self):
+        return 0.35 + (6.0 - 0.35) * torch.sigmoid(self.raw_gamma)
         
     @property
     def q_b_global(self): return self.raw_q_b_global_constraint.transform(self.raw_q_b_global)
-
-    @property
-    def gamma(self): return self.raw_gamma_constraint.transform(self.raw_gamma)
     
     @property
     def h_mu(self): return self.raw_h_mu_constraint.transform(self.raw_h_mu)
@@ -290,12 +294,23 @@ class AmortisedDirichlet(BaseGenerativeModel):
     @property
     def lmc_matrix(self): return self.raw_lmc_matrix_constraint.transform(self.raw_lmc_matrix)
 
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                if hasattr(module, 'weight_orig'):
+                    nn.init.orthogonal_(module.weight_orig, gain=1.41)
+                else:
+                    nn.init.orthogonal_(module.weight, gain=1.41)
+                
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
     #-helper-#
     def _safe_tensor(self, value):
         """Helper to ensure we always pass a tensor to the inverse transform"""
         return value if torch.is_tensor(value) else torch.tensor(value)
     
-    def forward(self, x, vae_out, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params) -> DirichletOutput:
+    def forward(self, x, vae_out, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, generative_mode:bool=False, **params) -> DirichletOutput:
         """
         performs nonparametric clustering according to a hierarchical dirichlet process using learned lengthscale
         and concentration param refinement
@@ -319,7 +334,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
             alpha_mu = getattr(vae_out, 'alpha_mu', None)
         
         if alpha_mu is None:
-            alpha_mu = torch.zeros(batch_size, self.k_atoms, device=device)
+            alpha_mu = torch.zeros(batch_size, self.evidence_dim, device=device)
         
         
         alpha_diag = params.get('alpha_diag', None)
@@ -327,7 +342,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
             alpha_diag = getattr(vae_out, 'diag', None)
         
         if alpha_diag is None:
-            alpha_diag = torch.ones(batch_size, self.k_atoms, device=device)
+            alpha_diag = torch.ones(batch_size, self.evidence_dim, device=device)
         
         
         alpha_factor = params.get('alpha_factor', None)
@@ -335,8 +350,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
             alpha_factor = getattr(vae_out, 'alpha_factor', None)
         
         if alpha_factor is None:
-            alpha_factor = torch.zeros(batch_size, self.k_atoms, self.rank, device=device)
-        
+            alpha_factor = torch.zeros(batch_size, self.evidence_dim, self.rank, device=device)
         
         ls = params.get('ls')
         if ls is None and vae_out is not None:
@@ -345,25 +359,26 @@ class AmortisedDirichlet(BaseGenerativeModel):
         if isinstance(ls, torch.Tensor) and ls.numel() == 0:
             ls = None
         
-        
-        beta, gamma_conc, global_kl = self.global_stick_breaking_kumaraswamy()
+        beta, _, global_kl = self.global_stick_breaking_kumaraswamy()
 
         self.update_added_loss_term("global_divergence", LossTerm(global_kl, t_index=t))
     
         bottleneck, gate, gp_params = self.run_neural_nets_dirichlet(x)
         
-        local_conc = self.get_local_evidence(alpha_mu, alpha_factor, alpha_diag) #-alpha reparameterisation-#
+        qa, qb, alpha = self.get_local_evidence(alpha_mu, alpha_factor, alpha_diag) #-alpha reparameterisation-#
 
-        pi, local_kl = self.dirichlet_posterior_inference_and_log_local_loss(x, gamma_conc, beta, local_conc) #-< alpha is here as local conc-#
-
-        B_mat_current_state, W_consensus = self.coregionalisation_matrix(pi)
-
-        iw_loss = self.inverse_wishart_penalty(B_mat_current_state)
-
-        self.update_added_loss_term("inverse_wishart", LossTerm(iw_loss / self.n_data, t_index=t))
+        pi, local_kl = self.local_stick_breaking(qa, qb, beta)
 
         self.update_added_loss_term("local_divergence", LossTerm(local_kl, t_index=t))
-        
+
+        pi = pi.clamp(min=4e-3)
+
+        Bmat, Wcon = self.coregionalisation_matrix(pi)
+
+        iw_loss = self.inverse_wishart_penalty(Bmat)
+
+        self.update_added_loss_term("inverse_wishart", LossTerm(iw_loss, t_index=t))
+
         ls_pred, bw_learned, ls_logvar = self.predict_kernel_lengthscales(ls)
         
         omega = self.get_omega(bw_learned)
@@ -382,8 +397,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
             bottleneck=bottleneck,
             beta=beta,
             pi=pi,
-            conc_prior=gamma_conc,
-            local_conc=local_conc,
+            local_conc=alpha,
             ls_logvar=ls_logvar,
             gates=gp_params.gates,
             linear=gp_params.linear,
@@ -394,115 +408,78 @@ class AmortisedDirichlet(BaseGenerativeModel):
             mu_z=mu_z,
             logvar_z=logvar_z,
             real_x=real_x,
-            lmc_matrices=W_consensus
+            lmc_matrices=Bmat,
+            lmc_consensus=Wcon
         )
     
-    
-    def numerically_stable_gamma(self, gamma_concentration_init):
-        raw = float(gamma_concentration_init)
-        if raw <= 0:
-            raise ValueError("Gamma concentration must be strictly positive.")
-        if raw > 20.0:
-            return raw
-        safe = math.log(math.expm1(raw))
-        return safe
     def get_omega(self, bw, **params):
-        # 1. Expand h_mu: [1, 1, 16] -> [1, 1, 1, 16]
-        h = self.h_mu.unsqueeze(2)
+        base = self.h_mu.unsqueeze(2) + self.atom_loc.transpose(0, 1).unsqueeze(2)
+        omega = torch.einsum('bkd, kmd -> bkmd', bw, self.noise_weights)
         
-        # 2. Expand atom_loc: [30, 1, 16] -> [1, 30, 1, 16]
-        a = self.atom_loc.transpose(0, 1).unsqueeze(2)
+        omega.add_(base)
         
-        # 3. noise_weights is [30, 128, 16] (k_atoms, M, latent_dim). 
-        # Add a batch dimension: [1, 30, 128, 16]
-        w = self.noise_weights.unsqueeze(0)
+        omega.clamp_(-30.0, 20.0)
         
-        # 4. bw is [Batch, 30, 16]. 
-        # Add the M dimension: [Batch, 30, 1, 16]
-        bw_4d = bw.unsqueeze(2)
+        return omega
+    
+    def coregionalisation_matrix(self, pi, tau=0.86, hard=True, jitter=1e-5):
+        B_base = torch.mm(self.lmc_matrix, self.lmc_matrix.t())
+        B_dense = B_base * pi.unsqueeze(-1) * pi.unsqueeze(-2)
+        v = self.lmc_var + jitter
+        B_dense.diagonal(dim1=-2, dim2=-1).add_(v)
+        raw_logits = pi.unsqueeze(-1) * self.lmc_matrix.unsqueeze(0)
         
-        # 5. Multiply safely: [Batch, 30, 1, 16] * [1, 30, 128, 16] = [Batch, 30, 128, 16]
-        dynamic_part = bw_4d * w
+        W_gumbel = torch.nn.functional.gumbel_softmax(
+            raw_logits, 
+            tau=tau, 
+            hard=hard, 
+            dim=1
+        )
         
-        # 6. Final output is beautifully, reliably 4D
-        omega = h + a + dynamic_part
+        W_consensus = W_gumbel.mean(dim=0)
         
-        return torch.clamp(omega, -100.0, 100.0)
-        ###dynamic_part = torch.einsum('bkd, kmd -> bkm', bw, self.noise_weights)
-    def coregionalisation_matrix(self, pi, jitter=1e-5):
-        target_dtype = pi.dtype
-        target_device = pi.device
-
-        batch_size = pi.size(0)
-        pi_bc = pi.unsqueeze(-1)
+        W_consensus = torch.clamp(W_consensus, min=-5.0, max=5.0)
         
-        lmc_matrix = self.lmc_matrix.to(device=target_device, dtype=target_dtype)
-        lmc_var = self.lmc_var.to(device=target_device, dtype=target_dtype)
-        
-        v = lmc_var + jitter
-
-        # W_current_state shape: [Batch, 30, 8]
-        W_current_state = pi_bc * lmc_matrix
-        W_consensus = W_current_state.mean(dim=0)
-        
-        v_bc = v.unsqueeze(0).expand(batch_size, -1)
-        W_W_T = torch.bmm(W_current_state, W_current_state.transpose(-1, -2))
-        
-        B_dense = W_W_T + torch.diag_embed(v_bc)
-
-        return B_dense, W_consensus
+        return B_dense.contiguous(), W_consensus
+    
     
     def random_fourier_features(self, z, omega, pi, **params):
         """inputs latent dim z"""
-        noise_bias = self.noise_bias
         B, D = z.shape
+        
         if pi is None:
             pi = torch.full((B, self.k_atoms), 1.0/self.k_atoms, device=z.device)
             if self.training:
-                pi = pi + (torch.randn_like(pi) * 0.01)
+                # This is safe because pi isn't part of the autograd graph yet
+                pi.add_(torch.randn_like(pi).mul_(0.01))
             pi = F.softmax(pi, dim=-1)
+            
         if omega.dim() == 4:
-            proj = (z.view(B, 1, 1, D) * omega).sum(dim=-1) 
+            proj = torch.einsum('bd, bkmd -> bkm', z, omega)
         else:
-            W = omega.view(-1, D)
-            proj = F.linear(z, W).view(B, self.k_atoms, self.M)
+            proj = F.linear(z, omega.view(-1, D)).view(B, self.k_atoms, self.M)
         
-        proj = proj + noise_bias.unsqueeze(0)
+        proj = proj + self.noise_bias.unsqueeze(0) 
+        
         scale = 1.0 / math.sqrt(self.M)
-
-        cos_proj = torch.cos(proj) * scale
-        sin_proj = torch.sin(proj) * scale
-
-        pi_scl = torch.sqrt(pi).unsqueeze(-1)
-        cos_proj = cos_proj * pi_scl
-        sin_proj = sin_proj * pi_scl
-
-        feats = torch.stack([cos_proj, sin_proj], dim=-1)
+        
+        pi_scl = torch.sqrt(pi).unsqueeze(-1) * scale
+        
+        cos_proj = torch.cos(proj) * pi_scl
+        sin_proj = torch.sin(proj) * pi_scl
+        
+        feats = torch.cat([cos_proj, sin_proj], dim=-1)
         return feats.flatten(1)
-    
 
     def global_stick_breaking_kumaraswamy(self, **kwargs):
-        q_a = self.q_a_global + self.stick_breaking_epsilon
-        q_b = self.q_b_global + self.stick_breaking_epsilon
+        q_a = F.softplus(self.q_a_global) + 1.035
+        q_b = F.softplus(self.q_b_global) + 1.035
         u = torch.rand_like(q_a).clamp(self.uniform_dist_clamp, 1.0 - self.uniform_dist_clamp)
         
         #-Inverse CDF transform-: fomula: v = (1 - (1 - u)^(1/b))^(1/a)
         qv_global = (1.0 - (1.0 - u).pow(1.0 / q_b)).pow(1.0 / q_a)
         qv_global = qv_global.clamp(self.uniform_dist_clamp, 1.0 - self.uniform_dist_clamp)
-        
-        #log_qv = ( --for monte carlo kl-#
-        #    torch.log(q_a) + torch.log(q_b) 
-         #   + (q_a - 1.0) * torch.log(qv_global) 
-          #  + (q_b - 1.0) * torch.log((1.0 - qv_global.pow(q_a)).clamp(min=8e-8))
-        #).sum()
-        
         gamma_conc = self.gamma + self.stick_breaking_epsilon
-        
-        #log_pv = (
-        #    torch.log(gamma_conc) 
-        #    + (gamma_conc - 1.0) * torch.log(1.0 - qv_global)
-        #).sum()
-
         
         log_v = torch.log(qv_global)
         log_1_minus_v = torch.log(1.0 - qv_global)
@@ -512,8 +489,6 @@ class AmortisedDirichlet(BaseGenerativeModel):
         
         log_beta = torch.cat([log_pi_k, log_pi_last], dim=-1)
         beta = torch.exp(log_beta)
-        
-        beta = torch.clamp(beta, min=1e-7)
         beta = beta / beta.sum(dim=-1, keepdim=True)
 
         euler_gamma = 0.5772156649
@@ -522,19 +497,53 @@ class AmortisedDirichlet(BaseGenerativeModel):
         kl = (
             ((q_a - 1.0) / q_a) * (-euler_gamma - psi_b - 1.0 / q_b) 
             + torch.log(q_a * q_b) 
-            + torch.log(gamma_conc) 
+            - torch.log(gamma_conc) 
             - (q_b - 1.0) / q_b
         )
-        
-        taylor_sum = 0
-        M_series = self.M_series
-        for m in range(1, M_series + 1):
-            taylor_sum += 1.0 / (m * (m * q_b + q_a))
-            
+        Ms = self.M_series
+        m = torch.arange(1, Ms + 1, device=q_b.device, dtype=q_b.dtype)
+        m_view = m.view([Ms] + [1] * q_b.dim())
+        taylor_sum = (1.0 / (m_view * (m_view * q_b + q_a + 1e-6))).sum(dim=0)
         kl += (gamma_conc - 1.0) * q_b * taylor_sum
-        global_kl = kl.sum(dim=-1) / self.n_data
-        
+        global_kl = kl.sum(dim=-1).mean() / self.n_data
         return beta, gamma_conc, global_kl
+    
+    def local_stick_breaking(self, qa, qb, global_beta):
+        prior_a = 1.0 
+        prior_b = global_beta[..., :-1] * 37.0 + 1.0
+        clamped_qa = torch.clamp(prior_a + qa, max=self.conc_clamp, min=self.jitter)
+        clamped_qb = torch.clamp(prior_b + qb, max=self.conc_clamp, min=self.jitter)
+        u = torch.rand_like(clamped_qa).clamp(self.uniform_dist_clamp, 1.0 - self.uniform_dist_clamp)
+        v = (1.0 - (1.0 - u).pow(1.0 / clamped_qb)).pow(1.0 / clamped_qa)
+        v = v.clamp(self.uniform_dist_clamp, 1.0 - self.uniform_dist_clamp)
+        
+        log_v = torch.log(v)
+        log_1_minus_v = torch.log(1.0 - v)
+        pad_log_1_minus_v = F.pad(log_1_minus_v, (1, 0), value=0.0)
+        log_pi_k = log_v + torch.cumsum(pad_log_1_minus_v, dim=-1)[..., :-1]
+        log_pi_last = torch.cumsum(pad_log_1_minus_v, dim=-1)[..., -1:]
+        
+        log_pi = torch.cat([log_pi_k, log_pi_last], dim=-1)
+        pi_posterior = torch.exp(log_pi)
+        pi_posterior = torch.clamp(pi_posterior, min=self.posterior_eps)
+        pi_posterior = pi_posterior / pi_posterior.sum(dim=-1, keepdim=True)
+        
+        euler_gamma = 0.5772156649
+        psi_b = torch.digamma(clamped_qb)
+        kl = (
+            ((clamped_qa - 1.0) / clamped_qa) * (-euler_gamma - psi_b - 1.0 / clamped_qb) 
+            + torch.log(clamped_qa * clamped_qb) 
+            - torch.log(prior_b) 
+            - (clamped_qb - 1.0) / clamped_qb
+        )
+        Ms = self.M_series
+        m = torch.arange(1, Ms + 1, device=clamped_qb.device, dtype=clamped_qb.dtype)
+        m_view = m.view([Ms] + [1] * clamped_qb.dim())
+        taylor_sum = (1.0 / (m_view * (m_view * clamped_qb + clamped_qa + 1e-6))).sum(dim=0)
+        kl += (prior_b - 1.0) * clamped_qb * taylor_sum
+        local_kl = kl.sum(dim=-1).mean()
+        kl = local_kl/self.batch_size
+        return pi_posterior, kl
 
     ##def global_stick_breaking(self, **params):
         #-variational inference-#
@@ -591,7 +600,7 @@ class AmortisedDirichlet(BaseGenerativeModel):
             # bw_base is [30, 16]. We unsqueeze to [1, 30, 16]
             bw_base_expanded = bw_base.unsqueeze(0)
             
-            # Perfect Broadcast: [1, 30, 16] * [128, 30, 1] -> [128, 30, 16]
+            #- BROADCAST -> [1, 30, 16] * [128, 30, 1] -> [128, 30, 16]
             bw_learned = bw_base_expanded * precision
             
             ls_logvar = self.lengthscale_uncertainty.expand(batch_size, -1)
@@ -607,22 +616,6 @@ class AmortisedDirichlet(BaseGenerativeModel):
         embedded_features = self.compress_spectral_features_head(features)
         return gate * embedded_features
     
-    def dirichlet_posterior_inference_and_log_local_loss(self, x, gamma_conc, beta, local_conc):
-        
-        prior_conc = (gamma_conc * beta) + self.large_eps
-        prior_conc = torch.clamp(prior_conc, min=self.large_eps, max=self.conc_clamp)
-        prior_conc = prior_conc.unsqueeze(0).expand(x.size(0), -1)
-
-        post_conc = prior_conc + local_conc
-        post_conc = torch.clamp(post_conc, min=self.large_eps, max=self.conc_clamp)
-
-        dist_prior = dist.Dirichlet(prior_conc)
-        dist_post = dist.Dirichlet(post_conc)
-        pi_posterior = torch.clamp(dist_post.rsample(), min=self.posterior_eps)
-        pi_posterior = pi_posterior / pi_posterior.sum(dim=-1, keepdim=True)
-        local_divergence = torch.distributions.kl_divergence(dist_post, dist_prior)
-        kl = local_divergence.mean()
-        return pi_posterior, kl
     
     def get_local_evidence(self, mu, factor, diag):
         """NB: this is actually alpha logits -- do not recalc in decoder from same value"""
@@ -635,44 +628,42 @@ class AmortisedDirichlet(BaseGenerativeModel):
             factor = factor.view(mu.shape[0], mu.shape[1], -1)
         
         dist = torch.distributions.LowRankMultivariateNormal(mu, factor, safe_diag)
-        alpha_logits = dist.rsample()
-        local_conc = F.softplus(alpha_logits) + self.jitter
+        ab_logits = dist.rsample()
+        a_logits, b_logits = ab_logits.chunk(2, dim=-1)
         
-        return local_conc
+        local_evidence_a = torch.clamp(a_logits, min=-7.0, max=4.0)
+        local_a = F.softplus(local_evidence_a) + self.eps
+        local_evidence_b = torch.clamp(b_logits, min=-7.0, max=4.0)
+        local_b = F.softplus(local_evidence_b) + self.eps
+        
+        return local_a, local_b, ab_logits #-for loss term-#
     def inverse_wishart_penalty(self, B_dense, k_atoms=30):
-        batch_size = B_dense.size(0)
-        dtype = B_dense.dtype
-        device = B_dense.device
-        jitter = torch.eye(k_atoms, dtype=dtype, device=device).expand(batch_size, -1, -1) * 1e-5
-        B_psd = B_dense + jitter
-        pr_nu = torch.as_tensor(self.pr_nu, dtype=dtype, device=device)
-        psi_scale = torch.as_tensor(self.psi_scale, dtype=dtype, device=device)
+        eye = torch.eye(k_atoms, dtype=B_dense.dtype, device=B_dense.device)
+        B_psd = B_dense + (eye * 1e-5)
         
         L, info = torch.linalg.cholesky_ex(B_psd)
         
         if info.any():
-            B_psd = B_psd + torch.eye(k_atoms, dtype=dtype, device=device).expand(batch_size, -1, -1) * 1e-3
+            B_psd = B_psd + (eye * 1e-3)
             L = torch.linalg.cholesky(B_psd) 
 
-        #-Log Determinant-
-        # log|B| = 2 * sum(log(diag(L)))
-        diag_L = torch.diagonal(L, dim1=-2, dim2=-1)
-        logdet_B = 2.0 * torch.log(diag_L).sum(dim=-1)
+        # 3. LOG DETERMINANT (In-place view)
+        logdet_B = 2.0 * L.diagonal(dim1=-2, dim2=-1).log().sum(dim=-1)
         
-        #- chol trace inverse-#
-        # Tr(B^-1) = Tr((L L^T)^-1) = ||L^-1||_F^2
-        # We solve L * X = I to get L^-1. Solving a triangular matrix is very fast and stable.
-        identity = torch.eye(k_atoms, dtype=dtype, device=device).expand(batch_size, -1, -1)
-        L_inv = torch.linalg.solve_triangular(L, identity, upper=False)
+        # 4. THE INVERSE TRACE FIX
+        # torch.cholesky_inverse is a heavily optimized CUDA kernel.
+        # It takes L and directly returns B^-1. 
+        # We just grab the diagonal and sum it. No identity matrices required!
+        B_inv = torch.cholesky_inverse(L)
+        trace_B_inv = B_inv.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
         
-        trace_B_inv = (L_inv ** 2).sum(dim=(-1, -2))
-        
-        term1 = 0.5 * (pr_nu + k_atoms + 1) * logdet_B
-        term2 = 0.5 * psi_scale * trace_B_inv
+        # 5. SCALAR MATH (Removed the slow as_tensor calls)
+        term1 = 0.5 * (self.pr_nu + k_atoms + 1) * logdet_B
+        term2 = 0.5 * self.psi_scale * trace_B_inv
         
         iw_penalty = term1 + term2
-        
-        return iw_penalty.mean()
+        iw = iw_penalty.mean() / self.batch_size
+        return iw
 
 class LossTerm(gpytorch.mlls.AddedLossTerm):
     """

@@ -40,7 +40,32 @@ class BaseGenerativeModel(gpytorch.Module):
         eps = torch.clamp(eps,  min=eps_min, max=eps_max)
         return mu + eps * std
     
-    def forward(self, x, vae_out, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, **params):
+    def init_pi_value(self, batch_size, device):
+        pi = torch.full((batch_size, self.k_atoms), 1.0/self.k_atoms, device=device)
+        pi = pi + (torch.randn_like(pi) * 0.01)
+        pi = F.softmax(pi, dim=-1)
+        return pi
+            
+    
+    def pack_features(self, gates, linear, periodic, rational, polynomial, matern, pi):
+        def to_3d(p, jitter=1e-5):
+            if p.dim() == 4:
+                return p.squeeze(1) if p.size(1) == 1 else p.squeeze(2)
+            if p.dim() == 2:
+                return p.unsqueeze(0).expand(8, -1, -1)
+            return p + jitter
+        packed = torch.cat([
+            to_3d(gates), to_3d(linear), to_3d(periodic),
+            to_3d(rational), to_3d(polynomial), to_3d(matern),
+            to_3d(pi)
+        ], dim=-1)
+        
+        return packed.contiguous()
+
+    def scale_consensus(self, w, temperature=0.5):
+        return torch.softmax(w / temperature, dim=-1)
+    
+    def forward(self, x, vae_out, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, generative_mode:bool=False, **params):
         raise NotImplementedError("Subclass must implement forward()")
         
     def get_variational_strategy(self):

@@ -4,17 +4,6 @@ import pykeops
 import linear_operator
 from pykeops.torch import LazyTensor
 from linear_operator.operators import LinearOperator, KeOpsLinearOperator
-
-
-pykeops.config.cuda_standalone = True
-pykeops.config.use_OpenMP = False
-
-try:
-    if not pykeops.config.gpu_available:
-        print("Warning: KeOps GPU not found, falling back to CPU.")
-except:
-    pass
-
 import torch
 import torch.nn as nn
 import math
@@ -48,15 +37,15 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
         self.register_parameter(name="raw_nkn_weights", parameter=nn.Parameter(torch.ones(4, 8) * 0.5413))
 
         # -- register_constraints ---
-        self.register_constraint("raw_scale_12", gpytorch.constraints.Interval(0.025, 7.0))
-        self.register_constraint("raw_scale_32",  gpytorch.constraints.Interval(0.025, 7.0))
-        self.register_constraint("raw_scale_52",  gpytorch.constraints.Interval(0.025, 7.0))
-        self.register_constraint("raw_rq_alpha",  gpytorch.constraints.Interval(0.05, 3.5))
+        self.register_constraint("raw_scale_12", gpytorch.constraints.Interval(0.05, 5.0))
+        self.register_constraint("raw_scale_32",  gpytorch.constraints.Interval(0.05, 5.0))
+        self.register_constraint("raw_scale_52",  gpytorch.constraints.Interval(0.05, 5.0))
+        self.register_constraint("raw_rq_alpha",  gpytorch.constraints.Interval(0.5, 3.0))
         self.register_constraint("raw_linear_scale", gpytorch.constraints.Interval(0.05, 1.5))
-        self.register_constraint("raw_poly_offset", gpytorch.constraints.Interval(0.025, 1.5))
-        self.register_constraint("raw_latent_amplitude", gpytorch.constraints.Interval(0.01, 4.0))
-        self.register_constraint("raw_outputscale", gpytorch.constraints.Interval(0.01, 9.0))
-        self.register_constraint("raw_inv_bandwidth", gpytorch.constraints.Interval(2e-3, 1.0))
+        self.register_constraint("raw_poly_offset", gpytorch.constraints.Interval(0.05, 1.25))
+        self.register_constraint("raw_latent_amplitude", gpytorch.constraints.Interval(0.05, 3.5))
+        self.register_constraint("raw_outputscale", gpytorch.constraints.Interval(0.05, 3.5))
+        self.register_constraint("raw_inv_bandwidth", gpytorch.constraints.Interval(0.05, 1.15))
         self.register_constraint("raw_nkn_weights", gpytorch.constraints.Interval(lower_bound=0.1, upper_bound=1.1))
         
         #-register priors-#
@@ -70,22 +59,21 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
         
         self.register_prior("outputscale_prior", gpytorch.priors.GammaPrior(3.0, 0.25), lambda m: m.outputscale)
         self.register_prior("latent_amplitude_prior", gpytorch.priors.GammaPrior(3.0, 0.3), lambda m: m.latent_amplitude)
-        self.register_prior("inv_bandwidth_prior", gpytorch.priors.GammaPrior(4.0, 0.8), lambda m: m.latent_amplitude)
+        self.register_prior("inv_bandwidth_prior", gpytorch.priors.GammaPrior(4.0, 0.8), lambda m: m.inv_bandwidth)
        
-        self.register_prior("nkn_weights_prior", CustomLaplacePrior(loc=0.0, scale=0.3), "raw_nkn_weights")
-        self.raw_latent_amplitude.requires_grad = False
+        #self.register_prior("nkn_weights_prior", CustomLaplacePrior(loc=0.0, scale=0.3), "raw_nkn_weights")
         
         self.initialize(
             raw_scale_12 = torch.tensor(0.0),
             raw_scale_32 = torch.tensor(0.0),
             raw_scale_52 = torch.tensor(0.0),
             raw_rq_alpha = torch.tensor(0.0),
-            raw_inv_bandwidth = torch.tensor(-2.0),
-            raw_nkn_weights=torch.tensor(0.0),
-            raw_outputscale = torch.tensor(-3.0),     
-            raw_latent_amplitude = torch.tensor(-3.0),
-            raw_poly_offset = torch.tensor(-2.0),
-            raw_linear_scale = torch.tensor(-2.0)
+            raw_inv_bandwidth = torch.tensor(0.0),
+            raw_nkn_weights=torch.tensor(0.5413),
+            raw_outputscale = torch.tensor(0.0),     
+            raw_latent_amplitude = torch.tensor(0.0),
+            raw_poly_offset = torch.tensor(0.0),
+            raw_linear_scale = torch.tensor(0.0)
         )
     
     @property
@@ -148,9 +136,15 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
             
             tiny_eps = 1e-12
             
-            gates_i = LazyTensor(xi[..., :, None, 0:8].contiguous())
-            gates_j = LazyTensor(xj[..., None, :, 0:8].contiguous())
+            gates_i_pt = xi[..., :, None, 0:8].contiguous()
+            gates_j_pt = xj[..., None, :, 0:8].contiguous()
+            def get_gi(dim): return LazyTensor(gates_i_pt[..., dim:dim+1].contiguous())
+            def get_gj(dim): return LazyTensor(gates_j_pt[..., dim:dim+1].contiguous())
             
+            w0_pt = ws[0].view(1, 1, 1, 8)
+            w1_pt = ws[1].view(1, 1, 1, 8)
+            w2_pt = ws[2].view(1, 1, 1, 8)
+            w3_pt = ws[3].view(1, 1, 1, 8)
             idx = 8
             
             lin_i  = LazyTensor(xi[..., :, None, idx:idx+32].contiguous()); idx += 32
@@ -202,26 +196,34 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
             alpha = LazyTensor(self.rq_alpha.view(1, 1, 1, 1).contiguous())
             k_rq = (1.0 + dist_sq_rat / (2.0 * alpha)) ** (-alpha)
             k_rbf = (-dist_sq_rat).exp()
+            
+            w0_pt = ws[0].view(1, 1, 1, 8)
+            w1_pt = ws[1].view(1, 1, 1, 8)
+            w2_pt = ws[2].view(1, 1, 1, 8)
+            w3_pt = ws[3].view(1, 1, 1, 8)
 
-            primitives = k_lin.concat(k_poly).concat(k_per).concat(k_mat12).concat(k_mat32).concat(k_mat52).concat(k_rq).concat(k_rbf)
-            
-            base_manifold = gates_i * gates_j * primitives
-            
-            w0 = LazyTensor(ws[0].view(1, 1, 1, 8).contiguous())
-            w1 = LazyTensor(ws[1].view(1, 1, 1, 8).contiguous())
-            w2 = LazyTensor(ws[2].view(1, 1, 1, 8).contiguous())
-            w3 = LazyTensor(ws[3].view(1, 1, 1, 8).contiguous())
-            
+            def compute_node(w_pt):
+                return (
+                    (get_gi(0) * get_gj(0) * k_lin   * LazyTensor(w_pt[..., 0:1].contiguous())) +
+                    (get_gi(1) * get_gj(1) * k_poly  * LazyTensor(w_pt[..., 1:2].contiguous())) +
+                    (get_gi(2) * get_gj(2) * k_per   * LazyTensor(w_pt[..., 2:3].contiguous())) +
+                    (get_gi(3) * get_gj(3) * k_mat12 * LazyTensor(w_pt[..., 3:4].contiguous())) +
+                    (get_gi(4) * get_gj(4) * k_mat32 * LazyTensor(w_pt[..., 4:5].contiguous())) +
+                    (get_gi(5) * get_gj(5) * k_mat52 * LazyTensor(w_pt[..., 5:6].contiguous())) +
+                    (get_gi(6) * get_gj(6) * k_rq    * LazyTensor(w_pt[..., 6:7].contiguous())) +
+                    (get_gi(7) * get_gj(7) * k_rbf   * LazyTensor(w_pt[..., 7:8].contiguous()))
+                )
             scale = 0.025
             node_jitter = 1e-3
-            node0 = (base_manifold * w0).sum(-1) + node_jitter
-            node1 = (base_manifold * w1).sum(-1) + node_jitter
-            interaction_1 = (node0 * node1) + (scale * 2)
-            node2 = (base_manifold * w2).sum(-1) + node_jitter
-            node3 = (base_manifold * w3).sum(-1) + node_jitter
+            node0 = compute_node(w0_pt) + node_jitter
+            node1 = compute_node(w1_pt) + node_jitter
+            interaction_1 = (node0 * node1) + scale
+            
+            node2 = compute_node(w2_pt) + node_jitter
+            node3 = compute_node(w3_pt) + node_jitter
             interaction_2 = (node2 * node3) + scale
+            
             return interaction_1 + interaction_2
-        
         # ==========================================
         # GPYTORCH COMPOSITION
         # ==========================================
@@ -231,16 +233,18 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
 
         base_covar = KeOpsLinearOperator(xi, xj, covar_func, **params)
 
-        curr_batch_size = base_covar.shape[0] 
-        n = base_covar.shape[-1]
-        rescale = (self.outputscale * self.latent_amplitude).view(curr_batch_size, 1, 1)
+        # Force the 8 parameters into [8, 1, 1] using -1
+        rescale = (self.outputscale * self.latent_amplitude).view(-1, 1, 1)
         
+        # This will safely broadcast [1, N, N] * [8, 1, 1] -> [8, N, N]
         scaled_covar = base_covar * rescale
+        
         is_auto_covar = x1.shape == x2.shape and torch.equal(x1, x2)
         
         if is_auto_covar:
             n = base_covar.shape[-1]
-            jitter_diag = torch.ones(curr_batch_size, n, device=x1.device, dtype=x1.dtype) * 1e-3
+            # Match the jitter shape to the newly broadcasted 8 experts
+            jitter_diag = torch.ones(8, n, device=x1.device, dtype=x1.dtype) * 1e-3
             jitter = linear_operator.operators.DiagLinearOperator(jitter_diag)
             return scaled_covar + jitter
         else:
@@ -288,13 +292,19 @@ class GenerativeKernel(gpytorch.kernels.Kernel):
         g_squared = gates.square()
         ws = F.softplus(self.nkn_weights, beta=1.0)
         def get_safe_node(w_idx):
-            return ((g_squared * primitives_diag * ws[w_idx]).sum(dim=-1) / 8.0) + 3e-3
+            return (g_squared * primitives_diag * ws[w_idx]).sum(dim=-1) + 1e-3
 
+        scale = 0.025
         node0 = get_safe_node(0)
         node1 = get_safe_node(1)
+        interaction_1 = (node0 * node1) + (scale * 2)
+
         node2 = get_safe_node(2)
         node3 = get_safe_node(3)
-        base_diag = (node0 * node1) + (node2 * node3)
+        interaction_2 = (node2 * node3) + scale
+        
+        base_diag = interaction_1 + interaction_2
+        
         os_view = self.outputscale.view(-1, 1)
         amp_view = self.latent_amplitude.view(-1, 1)
         return base_diag * os_view * amp_view
