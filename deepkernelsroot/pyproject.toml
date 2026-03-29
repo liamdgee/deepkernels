@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "deepkernels"
 version = "1.0.1"
-description = "An end-to-end modular framework for probabilistic inference (deep kernel learning) and uncertainty quantification (Gaussian Processes) in Strictly Linear computational efficiency [O(N)]"
+description = "Harnessing GPU-Accelerated Multitask Gaussian Processes to Audit Systemic Biases in US Lending Practices."
 requires-python = ">=3.10"
 
 # EVERY library required for the Vultr container to boot and serve traffic MUST be here.
@@ -25,15 +25,12 @@ dependencies = [
     "ninja==1.11.1",
     
     # MLOps & Telemetry
-    "mlflow==2.10.0",
-    "sqlalchemy==2.0.23",
-    "pyyaml==6.0.1",
+    "mlflow",
+    "sqlalchemy",
+    "pyyaml",
+    "tqdm",
     
-    # Utilities
-    "tqdm==4.66.1",
-    "pyarrow==15.0.0",
-    
-    # Web Server & Serving UI (MOVED FROM DEV)
+    #-API-#
     "fastapi==0.104.1",
     "uvicorn[standard]==0.24.0.post1",
     "python-multipart==0.0.6",
