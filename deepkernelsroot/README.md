@@ -9,16 +9,16 @@
 
 *deepkernels* is an end-to-end probabilistic inference engine which leverages **Multitask State-Space Gaussian Processes** with dynamic covariance structures provided by **Neural Kernel Networks** and autonomous nonparametric clustering driven by **Amortised Hierarchical Dirichlet Processes**. The **StateSpaceKernelProcess** in `src/deepkernels/model.py` is optimised for large-scale inference via **PyKeOps CUDA-JIT compilation** as symbolically defined in the custom **GenerativeKernel** covariance module in `src/deepkernels/kernels/keops.py`.
 
----
-
 ### 🌌 Project Status: Inference & Front End Refinement (TRAINING COMPLETE)
-* **Current Epoch:** Finished epoch 40 / 40 of E-M refinement (5 Macro-Cycles)
-* **A100 Load:** 99% (Compute efficiently bound via KeOps CUDA kernels)
-* **Last Logic Update:** March 26, 2026
-* **Validation RMSE:** **0.2889** (Peak) / 0.2895 (Final Cycle)
-* **Final MLL:** **1.0615** (Optimized down from 1.1279)
-* **Throughput:** **7s / epoch (E-step) // 5s / Epoch (M-step)** (// 26s / Batch (14 min epochs) during joint training with unfrozen kernel network + langevin dynamics (posterior sampling stage))
-* **Last Logic Update:** March 26, 2026
+
+| Metric | Status / Value | Architecture & Training Context |
+| :--- | :--- | :--- |
+| **Current Epoch** | `40 / 40` | 5 Macro-Cycles of E-M refinement completed. |
+| **A100 Load** | `99%` | Compute efficiently bound via KeOps CUDA kernels. |
+| **Validation RMSE** | `0.2889` | Peak convergence (0.2895 at Final Cycle). |
+| **Final MLL** | `1.0615` | Successfully optimized down from initial 1.1279. |
+| **E-M Throughput** | `7s (E) / 5s (M)` | Accelerated from 26s/batch (14 min epochs) during joint Langevin training. |
+| **Last Logic Update** | `Mar 26, 2026` | Front-end inference UI actively deployed. |
 
 ---
 

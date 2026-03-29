@@ -8,8 +8,8 @@ ENV PYTHONUNBUFFERED=1 \
     PYKEOPS_CACHE_DIR='/app/.cache/pykeops' \
     KEOPS_BIN_DIR='/app/.cache/pykeops' \
     KEOPS_EXTRA_FLAGS='-O3 -frounding-math -ffp-contract=off' \
-    OMP_NUM_THREADS=4 \
-    MKL_NUM_THREADS=4 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     PORT=7860

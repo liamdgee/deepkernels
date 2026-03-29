@@ -15,7 +15,6 @@ import linear_operator
 
 from deepkernels.models.parent import BaseGenerativeModel
 from deepkernels.models.NKN import KernelNetwork, GPParams
-from deepkernels.kernels.keops import CustomLaplacePrior
 import torch.distributions as dist
 
 #---Init logger---#
