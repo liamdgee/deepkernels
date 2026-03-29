@@ -1,36 +1,48 @@
 
 import os
-import torch
-import pykeops
-import gpytorch
-import joblib
+from pathlib import Path
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 import numpy as np
 import pandas as pd
+import torch
+import gpytorch
+import joblib
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
 from typing import List, Literal
 
-from deepkernels.models.model import StateSpaceKernelProcess
+from src.deepkernels.models.model import StateSpaceKernelProcess
 from app.api.routers import metrics
+
 import logging
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-# ==========================================
-# 1. KEOPS & CUDA COMPILER TUNING (PRODUCTION)
-# ==========================================
-docker_cache_dir = "/app/.cache/pykeops"
-os.makedirs(docker_cache_dir, exist_ok=True)
-pykeops.set_build_folder(docker_cache_dir)
-torch.set_default_dtype(torch.float64)
+
+
+BASE_DIR = Path("~/deepkernels").expanduser()
+KEOPS_CACHE_DIR = BASE_DIR / ".cache" / "pykeops"
+ORCHESTRATOR_PATH = BASE_DIR / "optimised_features.pkl"
+WEIGHTS_PATH = Path(os.getenv("MODEL_WEIGHTS", BASE_DIR / "princess_weights.pth")).expanduser()
+KEOPS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+import pykeops
+pykeops.config.build_folder = str(KEOPS_CACHE_DIR)
+KEOPS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 pykeops.config.precision = 'float64'
+torch.set_default_dtype(torch.float64)
+torch.set_num_threads(1)
 torch.backends.cuda.matmul.allow_tf32 = False 
 torch.backends.cudnn.allow_tf32 = False
-torch.set_num_threads(1)
-
 # ==========================================
 # 2. PYDANTIC SCHEMAS
 # ==========================================
@@ -58,43 +70,40 @@ class PredictionResponse(BaseModel):
 
 state = {}
 
+logger = logging.getLogger(__name__)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 Booting DeepKernels Inference Engine...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     try:
-        state["orchestrator"] = joblib.load("optimised_features.pkl")
+        orch = joblib.load(ORCHESTRATOR_PATH)
+        state["orchestrator"] = orch
         logger.info("✅ Feature Orchestrator Loaded.")
+        
         model_categories = set(state["orchestrator"].config.feature.cat_cols)
-        schema_categories = set(SimulationInput.__fields__['lender_type'].type_.__args__)
+        schema_categories = set(SimulationInput.model_fields['lender_type'].annotation.__args__)
         if schema_categories - model_categories:
             logger.warning(f"⚠️ WARNING: Schema allows lenders not in training data: {schema_categories - model_categories}")
-    except Exception as e:
-        logger.warning(f"❌ Failed to load orchestrator: {e}")
-    
-    
-    weights = os.getenv("MODEL_WEIGHTS", "./data/server_essentials/princess_weights.pth")
-    
-    try:
-        model = StateSpaceKernelProcess()
-        model.load_state_dict(torch.load(weights, map_location=device))
+        
+        logger.info(f"⏳ Loading SleepyPrincess weights from: {WEIGHTS_PATH.name}...")
+        input_dim = len(orch.config.feature.num_cols) + len(orch.config.feature.cat_cols)
+        model = StateSpaceKernelProcess(input_dim=input_dim, n_data=87636.0, device=device) 
+        model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=device))
         model.to(device).eval()
         state["model"] = model
         state["device"] = device
         logger.info(f"✅ SleepyPrincessv1.0 Weights Loaded onto {device}.")
+        
     except Exception as e:
-        logger.warning(f"❌ Model Load Failure: {e}")
+        logger.error(f"❌ CRITICAL: Failed to load inference assets: {e}")
+        raise e
     
-    model_categories = set(state["orchestrator"].config.feature.cat_cols)
-    schema_categories = set(SimulationInput.__fields__['lender_type'].type_.__args__)
-    
-    if schema_categories - model_categories:
-        logger.warning(f"⚠️ WARNING: Schema allows lenders not in training data: {schema_categories - model_categories}")
     yield
 
+    logger.info("🛑 Shutting down DeepKernels Engine...")
     state.clear()
-    logger.info("🛑 Shutting down Inference Engine...")
-
 
 app = FastAPI(title="deepkernelsAPI", lifespan=lifespan)
 
@@ -129,8 +138,8 @@ async def run_simulation(payload: SimulationInput):
         batch_dfs = []
         for l_type in active_lenders:
             raw = {
-                'log_amountsought': [np.log(payload.amount_sought)], 
-                'ln_tenure': [np.log(payload.tenure_months)],
+                'log_amountsought': [np.log(payload.amount_sought + 1 + 1e-6)], 
+                'ln_tenure': [np.log(payload.tenure_months + 1 + 1e-6)],
                 'animus_scaled': [payload.animus_proxy],
                 'isolation_scaled': [payload.isolation_proxy],
                 'iat_score_f_scaled': [payload.iat_score],
