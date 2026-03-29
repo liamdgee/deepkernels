@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deepkernels"
-version = "0.1.0"
+version = "1.0.1"
 description = "An end-to-end modular framework for probabilistic inference (deep kernel learning) and uncertainty quantification (Gaussian Processes) in Strictly Linear computational efficiency [O(N)]"
 requires-python = ">=3.10"
 
@@ -39,7 +39,8 @@ dependencies = [
     "gradio==4.12.0",
     "python-multipart==0.0.6",
     "jinja2==3.1.2",
-    "plotly==5.18.0"
+    "plotly==5.18.0",
+    "httpx==0.27.0",
 ]
 
 [project.optional-dependencies]

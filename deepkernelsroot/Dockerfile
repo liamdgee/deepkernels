@@ -40,7 +40,7 @@ USER deepkerneluser
 
 LABEL maintainer="Liam Douglas Giles (Machine Learning Engineer -- Sydney)"
 LABEL description="deepkernels -- A generative state space 'dreamer' model of systemic biases across US credit markets"
-LABEL version="1.0.0"
+LABEL version="1.0.1"
 
 # --- Networking ---
 EXPOSE 7860

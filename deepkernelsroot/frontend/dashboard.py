@@ -338,20 +338,60 @@ def build_kl_evolution_graph(data: dict | None) -> go.Figure:
 
 def build_simulation_trajectory(data: dict | None) -> go.Figure:
     fig = go.Figure()
+    
     if not data or not data.get("trajectory"):
         fig.update_layout(title="Awaiting Simulation...", **BESPOKE_LAYOUT)
+        fig.update_yaxes(range=[0, 1])
         return fig
+        
+    # Extract Data
     traj = data["trajectory"]
+    steps = list(range(len(traj)))
+    
+    final_step = steps[-1]
+    final_val = traj[-1] 
+    
+    final_mean_text = f"{final_val:.4f}"
+    std_val = data.get('final_std', 0) 
+    final_sd_text = f"± {std_val * 1.96:.4f}"
+    
     fig.add_trace(go.Scatter(
-        x=list(range(len(traj))), y=traj, mode='lines+markers', name="Rejection Probability",
-        line=dict(color='#ff7b72', width=3, shape='spline'), fill='tozeroy', fillcolor='rgba(255, 123, 114, 0.1)'
+        x=steps, y=traj, mode='lines+markers', name="Rejection Probability",
+        line=dict(color='#ff7b72', width=3, shape='spline'), 
+        fill='tozeroy', fillcolor='rgba(255, 123, 114, 0.1)'
     ))
+    
+    combo_text = (
+        f"<b>Final Prediction</b><br>"
+        f"<span style='color:#ff7b72; font-size:18px;'>{final_mean_text}</span><br>"
+        f"<span style='color:#8b949e; font-size:12px;'>Uncertainty: {final_sd_text}</span>"
+    )
+    
+    fig.add_annotation(
+        x=final_step,
+        y=final_val,
+        text=combo_text,
+        showarrow=True,
+        arrowhead=2,
+        arrowsize=1,
+        arrowwidth=2,
+        arrowcolor="rgba(255,255,255,0.4)",
+        ax=-80, # Pulled back slightly more to fit the extra text
+        ay=-50, 
+        font=dict(family="Inter, sans-serif", color="white"),
+        align="left",
+        bgcolor="rgba(15, 15, 15, 0.9)", 
+        bordercolor="#ff7b72", 
+        borderwidth=1,
+        borderpad=8
+    )
+
+    # Apply Master Layout
     fig.update_layout(title="Autoregressive Rejection Trajectory", **BESPOKE_LAYOUT)
     fig.update_yaxes(title_text="Probability of Rejection", range=[0, 1])
+    
     return fig
 
-
-# ==========================================
 # - Dynamic HTML Generator functions
 # ==========================================
 def get_telemetry_layout():
@@ -458,7 +498,29 @@ app.layout = html.Div(style={'backgroundColor': '#0d1117', 'minHeight': '100vh',
 # ==========================================
 # 6. ROUTING & CONTROLLERS (Callbacks)
 # ==========================================
-
+@app.callback(
+    Output("main-trajectory-graph", "figure"),
+    Input("simulate-btn", "n_clicks"),
+    State("compare-tgl", "value"),
+    State("lender-dropdown", "value"),
+    # ... other states ...
+)
+def update_viz(n_clicks, compare_mode, selected_lender, ...):
+    payload = {
+        "compare_all_lenders": compare_mode,
+        "lender_type": selected_lender,
+        "animus_proxy": animus_val,
+        # ...
+    }
+    
+    response = requests.post(f"{API_BASE_URL}/inference/simulate", json=payload)
+    data = response.json()
+    
+    if compare_mode:
+        return build_multi_path_fig(data) 
+    else:
+        return build_single_path_fig(data)
+    
 # A. The Router
 @app.callback(Output('page-content', 'children'), [Input('view-selector', 'value')])
 def render_page(view_mode):
