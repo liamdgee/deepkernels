@@ -1,23 +1,14 @@
 import torch
 import gpytorch
 from gpytorch.mlls import AddedLossTerm
-from gpytorch.priors import NormalPrior, GammaPrior, HorseshoePrior
 import torch.distributions as dist
 import torch.nn.functional as F
-from deepkernels.losses.simple import SimpleLoss
 import torch.distributions as dist
 import math
 import logging
-from typing import Union, Optional, Dict, Tuple, TypeAlias, Union
-import pykeops
-
-import torch
+from typing import Union, Union, Optional
 from torch.distributions import LowRankMultivariateNormal, Independent, Normal, kl_divergence
-
 import os
-if 'CONDA_PREFIX' in os.environ:
-    os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
-    os.environ['PATH'] = f"{os.environ['CONDA_PREFIX']}/bin:{os.environ['PATH']}"
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:

@@ -1,8 +1,12 @@
-
+import os
+from pathlib import Path
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncConnection
 from sqlalchemy import event
 
-DATABASE_URL = "sqlite+aiosqlite:///./deepkernels_metrics.db"
+
+BASE_DIR = Path("~/deepkernels/deepkernelsroot").expanduser()
+DB_PATH = BASE_DIR / "metrics.db"
+DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
 
 engine = create_async_engine(
     DATABASE_URL,
@@ -18,9 +22,6 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor.close()
 
 async def get_db():
-    """
-    Yields a safe, async database connection to FastAPI routes.
-    (Optimized for read-only telemetry)
-    """
+    """Yields a safe, async database connection."""
     async with engine.connect() as conn:
         yield conn

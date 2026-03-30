@@ -29,6 +29,7 @@ dependencies = [
     "sqlalchemy",
     "pyyaml",
     "tqdm",
+    "aiosqlite",
     
     #-API-#
     "fastapi==0.104.1",

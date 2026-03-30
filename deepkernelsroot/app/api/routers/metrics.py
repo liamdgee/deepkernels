@@ -16,7 +16,7 @@ from app.services.telemetry import (
 
 #-router-#
 router = APIRouter(
-    prefix="/api/v1/metrics",
+    prefix="/v1/metrics",
     tags=["Real-time Telemetry"]
 )
 
@@ -40,7 +40,7 @@ async def pulse_endpoint(run_id: str, db: AsyncConnection = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/posterior-paths/{run_id}")
+@router.get("/gp-paths/{run_id}")
 async def simulation_endpoint(run_id: str, db: AsyncConnection = Depends(get_db)): 
     """Serves the top-left Health Gauge."""
     try:

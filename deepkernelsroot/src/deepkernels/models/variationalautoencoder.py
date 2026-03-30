@@ -111,12 +111,13 @@ class SpectralVAE(BaseGenerativeModel):
         )
     
     def refinement_loop(self, x, steps, indices=None, current_state=None, generative_mode:bool=False):
+        
         if current_state is None:
             current_state = self.get_zero_state(x, x.device, batch_size=x.size(0))
-        if not generative_mode:
-            x_seq = x if x.dim() == 3 else x.unsqueeze(1)
+            
+        x_seq = x if x.dim() == 3 else x.unsqueeze(1)
 
-        for t in range(steps):
+        for t in range(1, steps + 1):
             if generative_mode and t > 0:
                 x_t = current_state.recon 
             else:

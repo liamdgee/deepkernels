@@ -12,7 +12,7 @@ import asyncio
 app = dash.Dash(__name__, title="DeepKernels -- An algorithmic auditing tool for ethical lending standards", suppress_callback_exceptions=True)
 
 TEST_RUN_ID = "latest_run_001" 
-API_BASE_URL = "http://127.0.0.1:8000/api/v1" 
+API_BASE_URL = "/api/v1"
 
 BESPOKE_LAYOUT = dict(
     template="plotly_dark",
@@ -167,6 +167,7 @@ def build_money_graph(data: dict | None) -> go.Figure:
     fig.update_layout(title="Predictive Trajectory vs Ground Truth", **BESPOKE_LAYOUT)
 
     return fig
+
 
 def build_pulse_gauge(data: dict | None) -> go.Figure:
     fig = go.Figure()
@@ -392,16 +393,12 @@ def build_simulation_trajectory(data: dict | None) -> go.Figure:
     
     return fig
 
-# - Dynamic HTML Generator functions
-# ==========================================
 def get_telemetry_layout():
     """Returns your exact Telemetry CSS Grid."""
     return html.Div(children=[
         
-        # 1. The Heartbeat (Only need ONE, right at the top)
         dcc.Interval(id='metrics-interval', interval=5000, n_intervals=0),
         
-        # --- THE MASTER GRID ---
         html.Div(
             style={
                 'display': 'grid',
@@ -454,20 +451,70 @@ def get_telemetry_layout():
     ])
 
 def get_simulator_layout():
-    """Returns the new Fairness Simulator form."""
+    """Returns the completed Fairness Simulator with all required Proxies."""
     return html.Div(style={'display': 'flex', 'gap': '24px'}, children=[
+        # --- INPUT PANEL (Left) ---
         html.Div(style={'flex': '1', 'backgroundColor': '#161b22', 'border': '1px solid #30363d', 'padding': '20px', 'borderRadius': '6px'}, children=[
             html.H3("Sociocorrelation Parameters", style={'marginTop': '0', 'borderBottom': '1px solid #30363d', 'paddingBottom': '10px'}),
-            html.Label("Business Tenure (Months)"), dcc.Slider(id='sim-tenure', min=1, max=120, value=24, step=1),
-            html.Label("Amount Sought ($)"), dcc.Slider(id='sim-amount', min=5000, max=500000, value=25000, step=5000),
+            
+            html.Label("Business Tenure (Months)"), 
+            dcc.Slider(id='sim-tenure', min=1, max=120, value=24, step=1, marks={1: '1m', 60: '5y', 120: '10y'}),
+            
+            html.Label("Amount Sought ($)", style={'marginTop': '20px', 'display': 'block'}), 
+            dcc.Slider(id='sim-amount', min=5000, max=500000, value=25000, step=5000, marks={5000: '5k', 250000: '250k', 500000: '500k'}),
+            
             html.Label("Lending Institution Type", style={'marginTop': '20px', 'display': 'block'}),
-            dcc.Dropdown(id='sim-lender', options=[{'label': 'Traditional Bank', 'value': 'bank'}, {'label': 'Fintech', 'value': 'fintech'}], value='fintech', style={'color': '#000'}),
-            html.Label("Animosity Proxy", style={'marginTop': '20px', 'display': 'block'}), dcc.Slider(id='sim-animus', min=-3.3, max=3.3, value=0.0, step=0.1),
-            html.Button("🚀 Simulate Rejection Trajectory", id='sim-submit-btn', n_clicks=0, style={'width': '100%', 'padding': '12px', 'marginTop': '30px', 'backgroundColor': '#238636', 'color': 'white', 'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'fontWeight': 'bold'})
+            dcc.Dropdown(
+                id='sim-lender', 
+                options=[
+                    {'label': 'Traditional Bank', 'value': 'bank'}, 
+                    {'label': 'Fintech', 'value': 'fintech'},
+                    {'label': 'Credit Union', 'value': 'creditunion'},
+                    {'label': 'CDFI', 'value': 'cdfi'}
+                ], 
+                value='fintech', 
+                style={'color': '#000'}
+            ),
+
+            html.Hr(style={'margin': '30px 0', 'borderColor': '#30363d'}),
+            html.H4("Algorithmic Bias Proxies", style={'color': '#8b949e'}),
+
+            html.Label("Animosity Proxy (Inter-group friction)"), 
+            dcc.Slider(id='sim-animus', min=0.1, max=6.9, value=3.5, step=0.1),
+
+            # --- NEW PROXIES ADDED HERE ---
+            html.Label("Isolation Proxy (Network Density)", style={'marginTop': '20px', 'display': 'block'}), 
+            dcc.Slider(id='sim-isolation', min=0.1, max=6.9, value=3.5, step=0.1),
+
+            html.Label("IAT Score (Implicit Association)", style={'marginTop': '20px', 'display': 'block'}), 
+            dcc.Slider(id='sim-iat', min=0.1, max=6.9, value=3.5, step=0.1),
+            html.Div(style={'marginTop': '20px', 'padding': '10px', 'backgroundColor': '#0d1117', 'borderRadius': '4px', 'border': '1px solid #30363d'}, children=[
+                dcc.Checklist(
+                    id='sim-compare-all',
+                    options=[{'label': ' Compare All Lenders (Competitive Manifold)', 'value': 'all'}],
+                    value=['all'],
+                    style={'color': '#7ee787', 'fontSize': '14px'}
+                )
+            ]),
+            html.Button(
+                "🚀 Simulate Rejection Trajectory", 
+                id='sim-submit-btn', 
+                n_clicks=0, 
+                style={
+                    'width': '100%', 'padding': '15px', 'marginTop': '30px', 
+                    'backgroundColor': '#238636', 'color': 'white', 'border': 'none', 
+                    'borderRadius': '6px', 'cursor': 'pointer', 'fontWeight': 'bold'
+                }
+            )
         ]),
+
+        # --- OUTPUT PANEL (Right) ---
         html.Div(style={'flex': '2', 'backgroundColor': '#161b22', 'border': '1px solid #30363d', 'padding': '20px', 'borderRadius': '6px'}, children=[
-            dcc.Graph(id='sim-output-graph', style={'height': '500px'}),
-            html.Div(id='sim-output-text', style={'marginTop': '20px', 'fontSize': '16px', 'color': '#7ee787', 'fontWeight': 'bold'})
+            dcc.Graph(id='sim-output-graph', style={'height': '550px'}),
+            html.Div(id='sim-output-text', style={
+                'marginTop': '20px', 'fontSize': '18px', 'color': '#7ee787', 
+                'fontWeight': 'bold', 'textAlign': 'center', 'fontFamily': 'monospace'
+            })
         ])
     ])
 
@@ -490,45 +537,69 @@ app.layout = html.Div(style={'backgroundColor': '#0d1117', 'minHeight': '100vh',
         ])
     ]),
     
-    # This is the empty bucket where the Router puts the HTML grids
     html.Div(id='page-content')
 ])
 
 
-# ==========================================
-# 6. ROUTING & CONTROLLERS (Callbacks)
-# ==========================================
 @app.callback(
-    Output("main-trajectory-graph", "figure"),
-    Input("simulate-btn", "n_clicks"),
-    State("compare-tgl", "value"),
-    State("lender-dropdown", "value"),
-    # ... other states ...
+    [Output('sim-output-graph', 'figure'), Output('sim-output-text', 'children')],
+    [Input('sim-submit-btn', 'n_clicks')],
+    [
+        State('sim-tenure', 'value'), 
+        State('sim-amount', 'value'), 
+        State('sim-lender', 'value'), 
+        State('sim-animus', 'value'),
+        State('sim-isolation', 'value'),
+        State('sim-iat', 'value'),
+        State('sim-compare-all', 'value')
+    ],
+    prevent_initial_call=True
 )
-def update_viz(n_clicks, compare_mode, selected_lender, ...):
+async def run_simulation(n_clicks, tenure, amount, lender, animus, isolation, iat, compare_val):
+    is_compare = 'all' in (compare_val or [])
     payload = {
-        "compare_all_lenders": compare_mode,
-        "lender_type": selected_lender,
-        "animus_proxy": animus_val,
-        # ...
+        "tenure_months": float(tenure),
+        "amount_sought": float(amount),
+        "lender_type": str(lender).lower(),
+        "animus_proxy": float(animus),
+        "isolation_proxy": float(isolation), # Now dynamic!
+        "iat_score": float(iat),             # Now dynamic!
+        "horizon_steps": 64,
+        "compare_all_lenders": is_compare    # Now dynamic!
     }
     
-    response = requests.post(f"{API_BASE_URL}/inference/simulate", json=payload)
-    data = response.json()
+    data = await trigger_simulation_async(payload)
     
-    if compare_mode:
-        return build_multi_path_fig(data) 
+    if not data:
+        return go.Figure().update_layout(title="❌ API CONNECTION FAILED", **BESPOKE_LAYOUT), "Check if Uvicorn is running on Port 8000."
+    
+    fig = go.Figure()
+    
+    if is_compare and isinstance(data, dict) and any(isinstance(v, dict) for v in data.values()):
+        for lender_name, metrics in data.items():
+            fig.add_trace(go.Scatter(
+                x=list(range(len(metrics['trajectory']))),
+                y=metrics['trajectory'],
+                name=lender_name.upper(),
+                mode='lines',
+                line=dict(width=2, shape='spline')
+            ))
+        status_msg = "Comparative manifold generated across lender archetypes."
     else:
-        return build_single_path_fig(data)
+        fig = build_simulation_trajectory(data)
+        mean = data.get('final_mean', 0)
+        status_msg = f"Target Projection: {mean:.4f} for {lender.upper()}"
+
+    fig.update_layout(**BESPOKE_LAYOUT)
+    return fig, status_msg
     
-# A. The Router
 @app.callback(Output('page-content', 'children'), [Input('view-selector', 'value')])
 def render_page(view_mode):
     if view_mode == 'simulator':
         return get_simulator_layout()
     return get_telemetry_layout()
 
-# B. Telemetry Heartbeat
+
 @app.callback(
     [Output('live-money-graph', 'figure'), Output('live-pulse-gauge', 'figure'),
      Output('live-gradients-graph', 'figure'), Output('live-ece-graph', 'figure'),
@@ -553,26 +624,6 @@ async def update_telemetry(n_intervals):
         build_ece_graph(calib), build_nlpd_graph(calib), generate_gp_paths(paths)
     )
 
-@app.callback(
-    [Output('sim-output-graph', 'figure'), Output('sim-output-text', 'children')],
-    [Input('sim-submit-btn', 'n_clicks')],
-    [State('sim-tenure', 'value'), State('sim-amount', 'value'), State('sim-lender', 'value'), State('sim-animus', 'value')],
-    prevent_initial_call=True # Ensures it doesn't fire on page load
-)
-async def run_simulation(n_clicks, tenure, amount, lender, animus):
-    payload = {
-        "tenure_months": tenure, "amount_sought": amount, 
-        "lender_type": lender, "animus_proxy": animus
-    }
-    
-    data = await trigger_simulation_async(payload)
-    if not data:
-        return go.Figure().update_layout(title="API Error", **BESPOKE_LAYOUT), "Error contacting backend."
-    
-    mean = data.get('final_mean', 0)
-    std = data.get('final_std', 0)
-    return build_simulation_trajectory(data), f"Final Mean: {mean:.4f} (± {std*1.96:.4f})"
-
 
 if __name__ == '__main__':
-    app.run_server(debug=True, host="0.0.0.0", port=8050)
+    app.run(debug=False, host="0.0.0.0", port=8050)

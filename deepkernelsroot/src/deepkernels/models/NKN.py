@@ -76,7 +76,7 @@ class KernelNetwork(BaseGenerativeModel):
             
         return P.weight_norm(layer)
 
-    def forward(self, x, vae_out, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, generative_mode:bool=False, **params):
+    def forward(self, x, vae_out=None, indices=None, steps=None, batch_shape=torch.Size([]), features_only:bool=False, generative_mode:bool=False, **params):
         """
         inputs the latent bottleneck dim (64)
         """

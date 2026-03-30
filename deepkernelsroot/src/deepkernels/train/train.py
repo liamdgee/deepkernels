@@ -309,7 +309,7 @@ def main():
         checkpoint = torch.load(model_path, map_location=device, weights_only=True)
         filtered_state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
         missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
-        logger.info(f"✅ Salvaged {len(filtered_state_dict)} GP warmup restored.")
+        logger.info(f"✅ Salvaged {len(filtered_state_dict)} GP restored.")
             
     else:
         logger.info("No checkpoint found. Starting fresh training run.")
@@ -339,9 +339,12 @@ def main():
     )
     
     experiment_name = "princess"
+    
+    mlflow.set_tracking_uri("sqlite:////home/liam/deepkernels/deepkernelsroot/metrics.db")
     mlflow.set_experiment(experiment_name)
     logger.info("Starting Experiment. Check MLflow dashboard for live metrics!")
-    with mlflow.start_run(run_name="vae_gp_joint_train") as run:
+    with mlflow.start_run(run_name="inference_running") as run:
+        logger.info(f"🚀 ACTIVE RUN ID: {run.info.run_id}")
         try:
             trainer.fit(
                 train_loader=train_loader,
