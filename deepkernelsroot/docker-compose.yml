@@ -23,7 +23,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    restart: always
+    restart: unless-stopped
 
   # ----------------------------------------------------
   # -- Front-facing UI --- dash / plotly --
@@ -39,11 +39,12 @@ services:
       - API_BASE_URL=http://engine:8000
     depends_on:
       - engine
-    restart: always
+    restart: unless-stopped
 
 # ----------------------------------------------------
   # 3. The Reverse Proxy (HTTPS/SSL)
   # ----------------------------------------------------
+  # 3. The Reverse Proxy (HTTPS/SSL)
   caddy:
     image: caddy:2-alpine
     container_name: deepkernels-proxy
@@ -79,3 +80,8 @@ services:
               count: 1
               capabilities: [gpu]
     profiles: ["dev"]
+  
+
+volumes:
+  caddy_data:
+  caddy_config:
