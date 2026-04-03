@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncConnection
 from sqlalchemy import event
 
 
-BASE_DIR = Path("~/deepkernels/deepkernelsroot").expanduser()
+BASE_DIR = Path("~/deepkernels/").expanduser()
 DB_PATH = BASE_DIR / "metrics.db"
 DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
 

@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  # ----------------------------------------------------
+  # -- Heavy Build -- Engine (Backend)
+  # ----------------------------------------------------
+  engine:
+    container_name: deepkernels-engine
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    volumes:
+      - ~/deepkernels/live_artifacts:/app/artifacts 
+    environment:
+      - MODEL_WEIGHTS_PATH=/app/artifacts/princess_weights.pth
+      - SCALER_PATH=/app/artifacts/features.pkl
+    expose:
+      - "8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: always
+
+  # ----------------------------------------------------
+  # -- Front-facing UI --- dash / plotly --
+  # ----------------------------------------------------
+  dash:
+    container_name: deepkernels-dash
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "80:8050"
+    environment:
+      - API_BASE_URL=http://engine:8000
+    depends_on:
+      - engine
+    restart: always
+
+  # ----------------------------------------------------
+  # 3. Dev Build
+  # ----------------------------------------------------
+  research:
+    container_name: deepkernels-research
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8888:8888"
+      - "5000:5000"
+    volumes:
+      - .:/app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles: ["dev"]

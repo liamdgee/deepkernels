@@ -1,73 +1,68 @@
-#-data safeguards-3
-*.dta
-*.csv
-*.xlsx
-*.parquet
-*.json
-*.zip
-data/
-*.ipynb
-logs/
-notebooks/
-/unused/*
-#-Artifacts-#
-models/*.pt
-
-models/*.onnx
-*.pt
-*.pth
-*.onnx
-*.ckpt
-mlruns/
-lightning_logs/
-
-#-python project-agnostic ignores-#
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache/
-.venv/
-venv/
-.env
-.ipynb_checkpoints/
-
-unused/*
-/unused/*
-./unused/
-unused/
-
-#-sys-
-.git
-.gitignore
-.DS_Store
-.gitattributes
-Dockerfile
-tests/
+# ==========================================
+# 1. System & Git
+# ==========================================
 .git/
-
-deepkernels/unused/
-
-.vscode
-.vscode/*
-*.vscode
+.gitignore
+.gitattributes
 .DS_Store
-# Python caches
+
+# ==========================================
+# 2. Python & Virtual Environments
+# ==========================================
 __pycache__/
 *.py[cod]
 *.[oa]
+.venv/
+venv/
+env/
 
-# PyTorch & ML
-*.pt
-*.pth
-*.ckpt
-runs/
-wandb/
-lightning_logs/
+# ==========================================
+# 3. IDEs & Dev Tools
+# ==========================================
+.vscode/
+.idea/
+.pytest_cache/
+*.ipynb
+.ipynb_checkpoints/
 
-# Server/Data junk
+# ==========================================
+# 4. Secrets (CRITICAL SECURITY)
+# ==========================================
+.env
+*.env
+
+# ==========================================
+# 5. Data & Logs
+# ==========================================
 data/
 logs/
 *.log
-.env
+*.csv
+*.xlsx
+*.parquet
+*.dta
+*.zip
+
+# ==========================================
+# 6. ML Artifacts & Tracking (Keep image lean)
+# ==========================================
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pkl
 *.db
+*.sqlite
+mlruns/
+wandb/
+runs/
+lightning_logs/
+
+# ==========================================
+# 7. Project Specific / Build Tools
+# ==========================================
+unused/
+notebooks/
+tests/
+Dockerfile*
+docker-compose*.yml

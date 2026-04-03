@@ -8,10 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 # -- HARD CODED VALUE FOR TRAINING BATCH SIZE FOR DASHBOARD LATENCY OPTIMISATION --#
 BATCH_SIZE = 1024
 
-# ==========================================
-# 1. LIVE DASHBOARD ENDPOINTS
-# ==========================================
-
 async def fetch_money_graph_data(run_id: str, db: AsyncConnection, sample_size: int = 200) -> dict:
     """Fetches raw prediction vs. truth samples for 'Money Graphs'."""
     query = text("""

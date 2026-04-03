@@ -50,7 +50,7 @@ class StateSpaceKernelProcess(BaseGenerativeModel):
                 )
                 zz = self.pack_features(state.gates, state.linear, state.periodic, state.rational, state.polynomial, state.matern, state.pi)
                 lmc_raw = state.lmc_consensus.mean(dim=0)
-                top_val, _ = torch.topk(lmc_raw, k=4, dim=0)
+                top_val, _ = torch.topk(lmc_raw, k=6, dim=0)
                 min_val = top_val.min(dim=0, keepdim=True)[0]
                 lmc_sparse = torch.where(lmc_raw >= min_val, lmc_raw, torch.zeros_like(lmc_raw))
                 squashed_weights = lmc_sparse.sum(dim=0)

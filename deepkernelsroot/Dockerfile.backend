@@ -12,38 +12,46 @@ ENV PYTHONUNBUFFERED=1 \
     MKL_NUM_THREADS=1 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    PORT=7860
+    PORT=8000
+
 WORKDIR /app
 
+# --- System Dependencies ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     build-essential \
     cmake \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml .
+# --- Install Python Dependencies ---
+COPY app/pyproject.toml .
 COPY src/ /app/src/ 
 
 RUN pip install --upgrade pip && \
     pip install .
-# --- Application Code & Artifacts ---
-#--- copies app.py, app_pipe.py, mlflow.db, the .pkl, and the .pth files
-COPY . /app/
 
-# --- Security & Permissions ---
-#---- ** KeOps WILL crash if it cannot write its compiled C++ files to the cache dir ** ----#
+# --- Application Code ---
+COPY app/app.py .
+
+# ==========================================
+# Security & Permissions
+# ==========================================
 RUN useradd -m deepkerneluser && \
     mkdir -p /app/.cache/pykeops && \
     chown -R deepkerneluser:deepkerneluser /app
 
 USER deepkerneluser
 
-LABEL maintainer="Liam Douglas Giles (Machine Learning Engineer -- Sydney)"
-LABEL description="deepkernels -- A generative state space 'dreamer' model of systemic biases across US credit markets"
-LABEL version="1.0.1"
+# --- KeOps Pre-Compilation ---
+# Now compiled as deepkerneluser, guaranteeing read/write access at runtime.
+RUN python -c "import torch; import pykeops; pykeops.test_numpy_bindings(); pykeops.test_torch_bindings()"
+
+LABEL maintainer="Liam Douglas Giles (Sydney-Based Machine Learning Engineer)"
+LABEL description="deepkernels -- A generative kernel machine for scalable simulation-based inference"
+LABEL version="1.1.0"
 
 # --- Networking ---
-EXPOSE 7860
+EXPOSE 8000
 
-#--- Server Entrypoint ---#
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+#--- Server Entrypoint (Production Gunicorn) ---#
+CMD ["gunicorn", "app:app", "--workers", "2", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"]
