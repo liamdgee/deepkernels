@@ -34,7 +34,7 @@ services:
       context: .
       dockerfile: Dockerfile.frontend
     ports:
-      - "80:8050"
+      - "8050"
     environment:
       - API_BASE_URL=http://engine:8000
     depends_on:
