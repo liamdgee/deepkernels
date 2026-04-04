@@ -6,6 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PYKEOPS_BUILD_DIR='/app/.cache/pykeops' \
     PYKEOPS_CACHE_DIR='/app/.cache/pykeops' \
+    KEOPS_CHUNKS_SIZE=1024 \
     KEOPS_BIN_DIR='/app/.cache/pykeops' \
     KEOPS_EXTRA_FLAGS='-O3 -frounding-math -ffp-contract=off' \
     OMP_NUM_THREADS=1 \
