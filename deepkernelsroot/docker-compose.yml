@@ -3,25 +3,31 @@ services:
   # ----------------------------------------------------
   # -- Heavy Build -- Engine (Backend)
   # ----------------------------------------------------
-  engine:
+ engine:
     container_name: deepkernels-engine
     build:
       context: .
       dockerfile: Dockerfile.backend
     volumes:
       - ~/deepkernels/live_artifacts:/app/artifacts 
+    # Merge all env vars into one block to avoid YAML overwriting
     environment:
       - MODEL_WEIGHTS_PATH=/app/artifacts/princess_weights.pth
       - SCALER_PATH=/app/artifacts/features.pkl
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # Essential for 4GB VRAM: forces KeOps to use smaller memory tiles
+      - KEOPS_CHUNKS_SIZE=1024 
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     expose:
       - "8000"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # Move runtime to top-level (Legacy Mode) to bypass CDI/NVML discovery
+    runtime: nvidia
+    # Direct hardware mapping: Docker no longer needs to 'find' the driver
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
     restart: unless-stopped
 
   # ----------------------------------------------------
