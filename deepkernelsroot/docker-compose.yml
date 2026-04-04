@@ -1,4 +1,3 @@
-
 services:
   # ----------------------------------------------------
   # -- Heavy Build -- Engine (Backend)
@@ -9,13 +8,13 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     volumes:
-      - ~/deepkernels/live_artifacts:/app/artifacts
+      - ~/deepkernels/live_artifacts:/app/artifacts 
     environment:
       - MODEL_WEIGHTS_PATH=/app/artifacts/princess_weights.pth
       - SCALER_PATH=/app/artifacts/features.pkl
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - KEOPS_CHUNKS_SIZE=1024
+      - KEOPS_CHUNKS_SIZE=1024 
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     expose:
       - "8000"
@@ -35,17 +34,16 @@ services:
       context: .
       dockerfile: Dockerfile.frontend
     ports:
-      - "8050"
+      - "8050:8050"
     environment:
       - API_BASE_URL=http://engine:8000
     depends_on:
       - engine
     restart: unless-stopped
 
-# ----------------------------------------------------
-  # 3. The Reverse Proxy (HTTPS/SSL)
   # ----------------------------------------------------
-  # 3. The Reverse Proxy (HTTPS/SSL)
+  # -- Reverse Proxy (HTTPS/SSL) --
+  # ----------------------------------------------------
   caddy:
     image: caddy:2-alpine
     container_name: deepkernels-proxy
@@ -61,7 +59,7 @@ services:
       - dash
 
   # ----------------------------------------------------
-  # 3. Dev Build
+  # -- Dev Build (Profile: dev) --
   # ----------------------------------------------------
   research:
     container_name: deepkernels-research
@@ -73,15 +71,16 @@ services:
       - "5000:5000"
     volumes:
       - .:/app
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # Applied the same legacy fixes here so your dev environment works
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
     profiles: ["dev"]
-  
 
 volumes:
   caddy_data:
