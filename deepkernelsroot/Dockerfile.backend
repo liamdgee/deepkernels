@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel AS production
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel AS production
 
 # --- Environment Variables ---
 ENV PYTHONUNBUFFERED=1 \
