@@ -634,7 +634,7 @@ def get_simulator_layout():
             html.Div([
                 html.Div("Borrower Default Risk Parameters", style=SECTION_TITLE),
                 html.Label("Business Tenure (Months)", style=LABEL_STYLE), 
-                dcc.Slider(id='sim-tenure', min=MINTEN, max=MAXTEN, value=MEAN_TENURE, step=6, marks=None, allow_direct_input=False, **SLIDER_KWARGS),
+                dcc.Slider(id='sim-tenure', min=MINTEN, max=MAXTEN, value=MEAN_TENURE, step=6, marks=None, **SLIDER_KWARGS),
                 
                 html.Label("Number of Simulated Credit Applications", style=LABEL_STYLE), 
                 dcc.Slider(id='sim-horizon', min=16, max=128, value=32, step=16, marks=None, allow_direct_input=False, **SLIDER_KWARGS),

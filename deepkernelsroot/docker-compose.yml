@@ -16,13 +16,6 @@ services:
       - SCALER_PATH=/app/artifacts/features.pkl
     expose:
       - "8000"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     restart: unless-stopped
 
   # ----------------------------------------------------
