@@ -42,7 +42,7 @@ if not logger.handlers:
 BASE_DIR = Path(os.getenv("APP_BASE_DIR", "/app"))
 ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", BASE_DIR / "artifacts"))
 ORCHESTRATOR_PATH = Path(os.getenv("SCALER_PATH", ARTIFACTS_DIR / "features.pkl"))
-WEIGHTS_PATH = Path(os.getenv("WEIGHTS_PATH", ARTIFACTS_DIR / "princess_weights.pth"))
+WEIGHTS_PATH = Path(os.getenv("MODEL_WEIGHTS_PATH", ARTIFACTS_DIR / "princess_weights.pth"))
 
 # ==========================================
 # TORCH & KEOPS CONFIGURATION
@@ -125,40 +125,20 @@ async def lifespan(app: FastAPI):
         model = StateSpaceKernelProcess(input_dim=input_dim, n_data=87636.0, device=device)
         logger.info(f"⏳ Loading weights from: {WEIGHTS_PATH.name}...")
         
-        # --- CRITICAL CHANGE START ---
-        # Load to CPU first to bypass the CUDA driver version mismatch 
-        # during the unpickling/allocation phase.
-        checkpoint = torch.load(WEIGHTS_PATH, map_location='cpu', weights_only=False)
-        # -----------------------------
-
-        raw_state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        checkpoint = torch.load(WEIGHTS_PATH, map_location=device, weights_only=True)
+        filtered_state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        logger.info(f"✅ Salvaged {len(filtered_state_dict)} GP restored.")
+        model.load_state_dict(filtered_state_dict, strict=False)
         
-        first_key = list(raw_state_dict.keys())[0]
+        model.eval()
         
-        # Clean the keys as you were doing
-        if first_key.startswith('model.'):
-            logger.info("🧹 Stripping 'model.' prefix...")
-            clean_state_dict = {k.replace('model.', ''): v for k, v in raw_state_dict.items()}
-        elif first_key.startswith('_forward_module.'):
-            logger.info("🧹 Stripping '_forward_module.' prefix...")
-            clean_state_dict = {k.replace('_forward_module.', ''): v for k, v in raw_state_dict.items()}
-        else:
-            clean_state_dict = raw_state_dict
-
-        # Load the dictionary into the model (still on CPU at this moment)
-        missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
         
-        # Register constraints (Gpytorch specific)
         model.gp.likelihood.noise_covar.register_constraint(
             "raw_noise", 
             gpytorch.constraints.Interval(1e-5, 0.005)
         )
         model.gp.covar_module.register_constraint("raw_outputscale", gpytorch.constraints.Interval(0.01, 0.5))
         model.gp.covar_module.register_constraint("raw_inv_bandwidth", gpytorch.constraints.Interval(0.01, 0.4))
-
-        # --- THE BIG MOVE ---
-        # Now that the weights are parsed in RAM, move the whole thing to the A100
-        model.to(device).eval()
         # --------------------
 
         state["model"] = model
