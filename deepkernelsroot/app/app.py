@@ -24,8 +24,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 #-key imports-#
-from src.deepkernels.models.model import StateSpaceKernelProcess
-from api.routers import metrics
+try:
+    from src.deepkernels.models.model import StateSpaceKernelProcess
+except ModuleNotFoundError:
+    from deepkernels.models.model import StateSpaceKernelProcess
+try:
+    from api.routers import metrics
+except ModuleNotFoundError:
+    from app.api.routers import metrics
 
 # ==========================================
 # LOGGING & PATHS
