@@ -140,7 +140,13 @@ async def lifespan(app: FastAPI):
         model.gp.covar_module.register_constraint("raw_outputscale", gpytorch.constraints.Interval(0.01, 0.5))
         model.gp.covar_module.register_constraint("raw_inv_bandwidth", gpytorch.constraints.Interval(0.01, 0.4))
         logger.info(f"✅ Salvaged {len(filtered_state_dict)} keys to CPU model.")
-        model.to(device).eval()
+        try:
+            model = model.to(device)
+            logger.info(f"✅ Model successfully migrated to {device}")
+        except RuntimeError as e:
+            logger.warning(f"⚠️ GPU Migration failed ({e}). Falling back to CPU.")
+            device = torch.device('cpu')
+            model = model.to(device)
         
         state["model"] = model
         state["device"] = device
