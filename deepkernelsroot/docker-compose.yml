@@ -8,8 +8,9 @@ services:
     volumes:
       - ~/deepkernels/live_artifacts:/app/artifacts
       - .:/app
-      - environment:
-      - PYTHONPATH=/app:/app/app:/app/src
+    working_dir: /app
+    environment:
+      - PYTHONPATH=/app:/app/app:/app/src:.
       - MODEL_WEIGHTS_PATH=/app/artifacts/princess_weights.pth
       - SCALER_PATH=/app/artifacts/features.pkl
       - KEOPS_CHUNKS_SIZE=1024 
@@ -24,7 +25,6 @@ services:
               count: 1
               capabilities: [gpu, compute, utility]
     restart: unless-stopped
-
   # ----------------------------------------------------
   # -- Front-facing UI --- dash / plotly --
   # ----------------------------------------------------
