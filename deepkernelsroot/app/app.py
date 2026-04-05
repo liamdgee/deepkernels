@@ -120,29 +120,32 @@ async def lifespan(app: FastAPI):
         schema_categories = set(SimulationInput.model_fields['lender_type'].annotation.__args__)
         if schema_categories - model_categories:
             logger.warning(f"⚠️ WARNING: Schema allows lenders not in training data: {schema_categories - model_categories}")
-        
         input_dim = len(orch.config.feature.num_cols) + len(orch.config.feature.cat_cols) + 1
-        model = StateSpaceKernelProcess(input_dim=input_dim, n_data=87636.0, device=device)
-        logger.info(f"⏳ Loading weights from: {WEIGHTS_PATH.name}...")
         
-        checkpoint = torch.load(WEIGHTS_PATH, map_location=device, weights_only=True)
+        # 1. Initialize the model on CPU first (to be safe)
+        model = StateSpaceKernelProcess(input_dim=input_dim, n_data=87636.0, device=torch.device('cpu'))
+        
+        logger.info(f"⏳ Loading weights to CPU RAM...")
+        
+        checkpoint = torch.load(WEIGHTS_PATH, map_location='cpu', weights_only=False)
+        
         filtered_state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
-        logger.info(f"✅ Salvaged {len(filtered_state_dict)} GP restored.")
+        
+        # 4. Load the weights into the CPU model
         model.load_state_dict(filtered_state_dict, strict=False)
-        
-        model.eval()
-        
-        
         model.gp.likelihood.noise_covar.register_constraint(
             "raw_noise", 
             gpytorch.constraints.Interval(1e-5, 0.005)
         )
         model.gp.covar_module.register_constraint("raw_outputscale", gpytorch.constraints.Interval(0.01, 0.5))
         model.gp.covar_module.register_constraint("raw_inv_bandwidth", gpytorch.constraints.Interval(0.01, 0.4))
-        # --------------------
-
+        logger.info(f"✅ Salvaged {len(filtered_state_dict)} keys to CPU model.")
+        model.to(device).eval()
+        
         state["model"] = model
-        state["device"] = device        
+        state["device"] = device
+        logger.info(f"✅ SleepyPrincessv1.0 Ready on {device}.")
+          
     except Exception as e:
         logger.error(f"❌ CRITICAL BOOT FAILURE: {e}")
         raise e
