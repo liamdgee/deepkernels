@@ -13,11 +13,13 @@ services:
     working_dir: /app
     environment:
       - PYTHONPATH=/app:/app/app:/app/src
-      - MODEL_WEIGHTS_PATH=/app/artifacts/princess_weights.pth
+      - MODEL_WEIGHTS=/app/artifacts/princess_weights.pth
       - SCALER_PATH=/app/artifacts/features.pkl
       - KEOPS_CHUNKS_SIZE=1024 
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - PYKEOPS_CACHE_DIR=/app/.cache/pykeops
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     expose:
       - "8000"
     deploy:

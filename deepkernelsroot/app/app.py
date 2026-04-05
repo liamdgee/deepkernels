@@ -41,7 +41,7 @@ if not logger.handlers:
 # Docker-safe relative paths
 BASE_DIR = Path(os.getenv("APP_BASE_DIR", "/app"))
 ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", BASE_DIR / "artifacts"))
-ORCHESTRATOR_PATH = Path(os.getenv("ORCHESTRATOR_PATH", ARTIFACTS_DIR / "features.pkl"))
+ORCHESTRATOR_PATH = Path(os.getenv("SCALER_PATH", ARTIFACTS_DIR / "features.pkl"))
 WEIGHTS_PATH = Path(os.getenv("MODEL_WEIGHTS", ARTIFACTS_DIR / "princess_weights.pth"))
 
 # ==========================================

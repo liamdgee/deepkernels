@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel AS production
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel AS production
 
 # --- Environment Variables ---
 ENV PYTHONUNBUFFERED=1 \
@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --- Install Python Dependencies ---
 
 RUN pip install --upgrade pip && \
-    pip install torch==2.5.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+    pip install torch==2.5.1 --extra-index-url https://download.pytorch.org/whl/cu124
 
 COPY app/pyproject.toml .
 RUN pip install .
