@@ -5,9 +5,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.backend
-    # Use a named volume for artifacts to prevent permission headaches
     volumes:
       - ~/deepkernels/live_artifacts:/app/artifacts
+      - .:/app
       - environment:
       - PYTHONPATH=/app:/app/app:/app/src
       - MODEL_WEIGHTS_PATH=/app/artifacts/princess_weights.pth
@@ -16,7 +16,6 @@ services:
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     expose:
       - "8000"
-    # Modern Way: Reserve the GPU via the deploy block
     deploy:
       resources:
         reservations:
