@@ -1,10 +1,15 @@
 import os
 from pathlib import Path
+import sys
 
 # Force single-threading for CPU operations to prevent container thread-locking
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+current_dir = Path(__file__).resolve().parent
+sys.path.insert(0, str(current_dir))
+sys.path.insert(0, str(current_dir / "src"))
 
 import math
 import hashlib
@@ -24,14 +29,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 #-key imports-#
-try:
-    from src.deepkernels.models.model import StateSpaceKernelProcess
-except ModuleNotFoundError:
-    from deepkernels.models.model import StateSpaceKernelProcess
-try:
-    from api.routers import metrics
-except ModuleNotFoundError:
-    from app.api.routers import metrics
+
+from src.deepkernels.models.model import StateSpaceKernelProcess
+from api.routers import metrics
 
 # ==========================================
 # LOGGING & PATHS
