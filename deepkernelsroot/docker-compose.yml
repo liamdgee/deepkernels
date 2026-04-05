@@ -16,11 +16,15 @@ services:
       - MODEL_WEIGHTS_PATH=/app/artifacts/princess_weights.pth
       - SCALER_PATH=/app/artifacts/features.pkl
       - KEOPS_CHUNKS_SIZE=1024 
-      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - PYKEOPS_CACHE_DIR=/app/.cache/pykeops
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - CUDA_MODULE_LOADING=LAZY
+      # --- vGPU Compatibility Fixes ---
+      - NCCL_P2P_DISABLE=1
+      - NCCL_IB_DISABLE=1
+      - TORCH_CUDA_ALLOC_CONF=expandable_segments:False
+      - PYTORCH_NO_CUDA_MEMORY_CACHING=1
     expose:
       - "8000"
     deploy:
@@ -30,7 +34,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu, compute, utility]
-    privileged: true
     shm_size: '2gb'
     restart: unless-stopped
   # ----------------------------------------------------
