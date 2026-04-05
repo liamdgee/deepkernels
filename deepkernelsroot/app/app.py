@@ -31,12 +31,6 @@ from pydantic import BaseModel, Field
 #-key imports-#
 
 from src.deepkernels.models.model import StateSpaceKernelProcess
-import sys
-import types
-
-# Force Python to treat your current code as 'app_pipe'
-sys.modules['app_pipe'] = app_pipe
-sys.modules['src.deepkernels.preprocess.app_pipe'] = app_pipe
 # ==========================================
 # LOGGING & PATHS
 # ==========================================
