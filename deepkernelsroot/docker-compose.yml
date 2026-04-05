@@ -11,7 +11,7 @@ services:
     environment:
       - MODEL_WEIGHTS_PATH=/app/artifacts/princess_weights.pth
       - SCALER_PATH=/app/artifacts/features.pkl
-      - PYTHONPATH=/app/src:/app
+      - PYTHONPATH=/app/app:/app:/app/src
       - KEOPS_CHUNKS_SIZE=1024 
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     expose:
@@ -38,7 +38,7 @@ services:
       - "8050:8050"
     environment:
       - API_BASE_URL=http://engine:8000
-      - PYTHONPATH=/app/src:/app
+      - PYTHONPATH=/app/app:/app:/app/src
     depends_on:
       - engine
     restart: unless-stopped
