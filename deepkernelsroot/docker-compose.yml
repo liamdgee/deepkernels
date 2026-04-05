@@ -8,6 +8,7 @@ services:
     volumes:
       - ~/deepkernels/live_artifacts:/app/artifacts
       - .:/app
+      - keops_cache:/app/.cache/pykeops
     working_dir: /app
     environment:
       - PYTHONPATH=/app:/app/app:/app/src:.
@@ -15,6 +16,7 @@ services:
       - SCALER_PATH=/app/artifacts/features.pkl
       - KEOPS_CHUNKS_SIZE=1024 
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - PYKEOPS_CACHE_DIR=/app/.cache/pykeops
     expose:
       - "8000"
     deploy:
@@ -85,3 +87,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  keops_cache:
