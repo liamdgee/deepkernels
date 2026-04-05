@@ -42,7 +42,7 @@ if not logger.handlers:
 BASE_DIR = Path(os.getenv("APP_BASE_DIR", "/app"))
 ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", BASE_DIR / "artifacts"))
 ORCHESTRATOR_PATH = Path(os.getenv("SCALER_PATH", ARTIFACTS_DIR / "features.pkl"))
-WEIGHTS_PATH = Path(os.getenv("MODEL_WEIGHTS", ARTIFACTS_DIR / "princess_weights.pth"))
+WEIGHTS_PATH = Path(os.getenv("WEIGHTS_PATH", ARTIFACTS_DIR / "princess_weights.pth"))
 
 # ==========================================
 # TORCH & KEOPS CONFIGURATION
@@ -123,15 +123,21 @@ async def lifespan(app: FastAPI):
         
         input_dim = len(orch.config.feature.num_cols) + len(orch.config.feature.cat_cols) + 1
         model = StateSpaceKernelProcess(input_dim=input_dim, n_data=87636.0, device=device)
-
         logger.info(f"⏳ Loading weights from: {WEIGHTS_PATH.name}...")
-        checkpoint = torch.load(WEIGHTS_PATH, map_location=device, weights_only=False)
+        
+        # --- CRITICAL CHANGE START ---
+        # Load to CPU first to bypass the CUDA driver version mismatch 
+        # during the unpickling/allocation phase.
+        checkpoint = torch.load(WEIGHTS_PATH, map_location='cpu', weights_only=False)
+        # -----------------------------
+
         raw_state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
         
         first_key = list(raw_state_dict.keys())[0]
         
+        # Clean the keys as you were doing
         if first_key.startswith('model.'):
-            logger.info("🧹 Stripping 'model.' prefix from state_dict keys...")
+            logger.info("🧹 Stripping 'model.' prefix...")
             clean_state_dict = {k.replace('model.', ''): v for k, v in raw_state_dict.items()}
         elif first_key.startswith('_forward_module.'):
             logger.info("🧹 Stripping '_forward_module.' prefix...")
@@ -139,22 +145,24 @@ async def lifespan(app: FastAPI):
         else:
             clean_state_dict = raw_state_dict
 
+        # Load the dictionary into the model (still on CPU at this moment)
         missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
+        
+        # Register constraints (Gpytorch specific)
         model.gp.likelihood.noise_covar.register_constraint(
             "raw_noise", 
             gpytorch.constraints.Interval(1e-5, 0.005)
         )
         model.gp.covar_module.register_constraint("raw_outputscale", gpytorch.constraints.Interval(0.01, 0.5))
         model.gp.covar_module.register_constraint("raw_inv_bandwidth", gpytorch.constraints.Interval(0.01, 0.4))
-        if missing:
-            logger.warning(f"❓ Missing keys (might be okay if internal GP params): {len(missing)}")
-        if unexpected:
-            logger.info(f"📦 Ignored {len(unexpected)} extra keys (likely optimizer/meta data).")
+
+        # --- THE BIG MOVE ---
+        # Now that the weights are parsed in RAM, move the whole thing to the A100
         model.to(device).eval()
+        # --------------------
+
         state["model"] = model
-        state["device"] = device
-        logger.info(f"✅ SleepyPrincessv1.0 Ready on {device}.")
-        
+        state["device"] = device        
     except Exception as e:
         logger.error(f"❌ CRITICAL BOOT FAILURE: {e}")
         raise e

@@ -13,7 +13,7 @@ services:
     working_dir: /app
     environment:
       - PYTHONPATH=/app:/app/app:/app/src
-      - MODEL_WEIGHTS=/app/artifacts/princess_weights.pth
+      - WEIGHTS_PATH=/app/artifacts/princess_weights.pth
       - SCALER_PATH=/app/artifacts/features.pkl
       - KEOPS_CHUNKS_SIZE=1024 
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
