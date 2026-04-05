@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 
 #-key imports-#
 from src.deepkernels.models.model import StateSpaceKernelProcess
-from app.api.routers import metrics
+from api.routers import metrics
 
 # ==========================================
 # LOGGING & PATHS
