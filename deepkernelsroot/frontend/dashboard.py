@@ -22,7 +22,7 @@ EPS = 0.1
 # 1. SETUP & THEMES
 # ==========================================
 app = dash.Dash(__name__, title="DeepKernels -- An algorithmic auditing tool for ethical lending standards", suppress_callback_exceptions=True)
-
+server = app.server
 
 import os
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000") + "/v1"

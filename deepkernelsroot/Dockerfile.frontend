@@ -31,4 +31,4 @@ LABEL description="deepkernels -- Frontend Visualization UI"
 EXPOSE 8050
 
 # --- Server Entrypoint ---
-CMD ["gunicorn", "dashboard:app.server", "--workers", "2", "--bind", "0.0.0.0:8050"]
+CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8050", "dashboard:server"]

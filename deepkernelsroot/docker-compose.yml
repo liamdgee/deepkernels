@@ -11,7 +11,7 @@ services:
     environment:
       - MODEL_WEIGHTS_PATH=/app/artifacts/princess_weights.pth
       - SCALER_PATH=/app/artifacts/features.pkl
-      # Keep these! They are critical for your 4GB A100 slice
+      - PYTHONPATH=/app/src:/app
       - KEOPS_CHUNKS_SIZE=1024 
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     expose:
@@ -38,6 +38,7 @@ services:
       - "8050:8050"
     environment:
       - API_BASE_URL=http://engine:8000
+      - PYTHONPATH=/app/src:/app
     depends_on:
       - engine
     restart: unless-stopped
@@ -72,7 +73,6 @@ services:
       - "5000:5000"
     volumes:
       - .:/app
-    # Applied the same legacy fixes here so your dev environment works
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
