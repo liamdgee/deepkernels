@@ -7,11 +7,12 @@ services:
       dockerfile: Dockerfile.backend
     volumes:
       - ~/deepkernels/live_artifacts:/app/artifacts
+      - ~/deepkernels/data:/app/data
       - .:/app
       - keops_cache:/app/.cache/pykeops
     working_dir: /app
     environment:
-      - PYTHONPATH=/app:/app/app:/app/src:.
+      - PYTHONPATH=/app:/app/app:/app/src
       - MODEL_WEIGHTS_PATH=/app/artifacts/princess_weights.pth
       - SCALER_PATH=/app/artifacts/features.pkl
       - KEOPS_CHUNKS_SIZE=1024 
