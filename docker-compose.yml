@@ -1,0 +1,142 @@
+services:
+
+  engine:
+    container_name: deepkernels-engine
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      
+    # --- PATH FIX ---
+    # 1. We move the working directory directly inside the inner folder
+    working_dir: /app/app
+    # 2. We change the command to just look for the 'app.py' file in this folder
+    command: gunicorn -w 4 -k uvicorn.workers.UvicornWorker --timeout 120 --bind 0.0.0.0:8000 app:app
+    
+    volumes:
+      - ~/deepkernels/live_artifacts:/app/artifacts
+      - ~/deepkernels/data:/app/data
+      - keops_cache:/app/.cache/pykeops
+      
+    environment:
+      # (Removed the duplicate PYTHONPATH)
+      - PYTHONPATH=/app:/app/app:/app/src
+      - MODEL_WEIGHTS_PATH=/app/artifacts/princess_weights.pth
+      - SCALER_PATH=/app/artifacts/features.pkl
+      
+      # --- Performance: Larger blocks for A100 ---
+      - KEOPS_CHUNKS_SIZE=2048 
+      - PYKEOPS_CACHE_DIR=/app/.cache/pykeops
+      
+      # --- vGPU Compatibility ---
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_MODULE_LOADING=LAZY
+      - NCCL_P2P_DISABLE=1
+      - NCCL_IB_DISABLE=1
+      
+      # --- Memory Tuning: Caching ON with limits ---
+      - PYTORCH_NO_CUDA_MEMORY_CACHING=0
+      - TORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
+      
+    # --- PORT FIX ---
+    # Moved the dangling 8000 to the correct key
+    expose:
+      - "8000"
+      
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, compute, utility]
+    shm_size: '2gb'
+    restart: unless-stopped
+  # ----------------------------------------------------
+  # -- Front-facing UI --- dash / plotly --
+  # ----------------------------------------------------
+  dash:
+    container_name: deepkernels-dash
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    expose: 
+    - "8050"
+    environment:
+      - API_BASE_URL=http://engine:8000
+      - PYTHONPATH=/app/app:/app:/app/src
+    depends_on:
+      - engine
+    restart: unless-stopped
+
+  # ----------------------------------------------------
+  # -- Reverse Proxy (HTTPS/SSL) --
+  # ----------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    container_name: deepkernels-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - dash
+
+  # ----------------------------------------------------
+  # -- Dev Build (Profile: dev) --
+  # ----------------------------------------------------
+  # ----------------------------------------------------
+  # -- Dev Build (Profile: dev) --
+  # ----------------------------------------------------
+  research:
+    container_name: deepkernels-research
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8888:8888"
+      - "5000:5000"
+    volumes:
+      - ~/deepkernels/live_artifacts:/app/artifacts
+      - ~/deepkernels/data:/app/data
+      - .:/app
+      - keops_cache:/app/.cache/pykeops
+      
+    environment:
+      - PYTHONPATH=/app:/app/app:/app/src
+      - MODEL_WEIGHTS_PATH=/app/artifacts/princess_weights.pth
+      - SCALER_PATH=/app/artifacts/features.pkl
+      
+      # --- Performance: Larger blocks for A100 ---
+      - KEOPS_CHUNKS_SIZE=4096 
+      - PYKEOPS_CACHE_DIR=/app/.cache/pykeops
+      
+      # --- vGPU Compatibility ---
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_MODULE_LOADING=LAZY
+      - NCCL_P2P_DISABLE=1
+      - NCCL_IB_DISABLE=1
+      
+      # --- Memory Tuning: Caching ON with limits ---
+      - PYTORCH_NO_CUDA_MEMORY_CACHING=0
+      - TORCH_CUDA_ALLOC_CONF=max_split_size_mb:64,expandable_segments:False
+      
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, compute, utility]
+    shm_size: '2gb'
+    profiles: ["dev"]
+
+volumes:
+  caddy_data:
+  caddy_config:
+  keops_cache:

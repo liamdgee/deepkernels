@@ -1,0 +1,140 @@
+project:
+  name: "deep_kernels"
+  version: "1.0.0"
+
+environment:
+  mode: "auto" # "auto", "local", or "remote"
+  local:
+    device: "cpu" # MacBook Air M-series usually better on CPU for KeOps
+    num_workers: 0
+    compile: false
+  remote:
+    device: "cuda"
+    num_workers: 4
+    compile: true
+
+# ==========================================
+# Artifacts & Logging
+# ==========================================
+logging:
+  experiment_name: "deep-kernel-state-space"
+  artifact_path: "./artifacts"
+  checkpoint_freq: 10 # Save model every 10 epochs
+  log_gradients: true
+  keops_cache_path: "./.cache/keops" 
+
+# ==========================================
+# Data & Pipeline Execution
+# ==========================================
+datapipeline:
+  path_primary: ""
+  path_secondary: ""
+  target_col: "lmean_rejected"
+  seq_len: 32
+  batch_size: 128
+  test_pct: 0.2
+  num_workers: 4
+  drop_cols: ["lender_id", "rejected", "lmean_rejected"]
+
+# ==========================================
+# Training Stages & Epochs
+# ==========================================
+traininghypers:
+  state_only_vae: true
+  warmup_vae_epochs: 80
+  vae_epochs: 350
+  warmup_gp_epochs: 150
+  gp_epochs: 500
+  em_macro_cycles: 8
+  joint_epochs: 500
+  e_epochs_per_cycle: 3
+  m_epochs_per_cycle: 5
+
+# ==========================================
+# Optimizers & Learning Rates
+# ==========================================
+optimisertuning:
+  base_lr_adamw: 0.001175
+  slow_decay_adamw: 0.001
+  base_decay_adamw: 0.05
+  fast_dir: 0.0015
+  med_dir: 0.0017
+  slow_dir: 0.000533
+  gamma_dir: 0.00031
+  ultrasensitive_lr: 0.0005
+  sensitive_lr: 0.0001
+  gp_mean_lr: 0.002777
+  gp_likelihood_lr: 0.002177
+  gp_global_hyper_lr: 0.00235
+  lmc_lr: 0.001175
+  gp_lengthscale_lr: 0.00035
+  gp_kernel_nkn_lr: 0.0001
+
+# ==========================================
+# Langevin & Gradient Norm Limits
+# ==========================================
+langevindynamics:
+  temp: 0.00000171375
+  max_grad_norm: 2.2245
+  langevin_clip_norm: 5.86
+
+# ==========================================
+# Model Dimensions & Architecture
+# ==========================================
+modeldims:
+  input_dim: 30
+  latent_dim: 16
+  bottleneck_dim: 64
+  k_atoms: 30
+  num_latents: 8
+  alpha_factor_rank: 3
+  disentangle_split_override: [4, 30, 30]
+
+# ==========================================
+# Spectral, Fourier & NKN Settings
+# ==========================================
+spectralfeatures:
+  num_fourier_features: 128
+  emb_dim: 2048
+  compressions: [1024, 512, 128, 64]
+  individual_kernel_dim_out: 32
+  
+  
+  #-error safeguards-#
+  individual_kernel_input_dim: 32
+  kernels_out: 32
+  num_experts: 8
+  num_primitives: 5
+
+# ==========================================
+# Annealer & Penalty Params
+# ==========================================
+lossesandpenalties:
+  beta: 0.9
+  iw_stop_beta: 0.07
+  kl_stop_beta: 0.05
+  kl_cycles: 4
+  kl_weights: {"global_divergence": 0.0, "local_divergence": 0.0, "alpha_kl": 0.0, "lengthscale_kl": 0.0, "inverse_wishart": 0.0, "recon_kl": 0.0}
+
+# ==========================================
+# Numerical Stability & Bounds
+# ==========================================
+numericalstability:
+  dropout: 0.05
+  jitter: 0.000015
+  cholesky_jitter: 0.0002
+  cholesky_jitter_large: 0.0043
+  eps: 0.00015
+  eps_dirichlet: 0.0001
+  large_eps: 0.045
+  posterior_dirichlet_epsilon: 0.00065
+  min_ls: 0.1
+  max_ls: 8.0
+  conc_clamp: 10.0
+  min_noise: 0.0015
+  
+# ==========================================
+# Environment & Hardware Detection
+# ==========================================
+
+  

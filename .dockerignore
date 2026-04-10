@@ -1,0 +1,68 @@
+# ==========================================
+# 1. System & Git
+# ==========================================
+.git/
+.gitignore
+.gitattributes
+.DS_Store
+
+# ==========================================
+# 2. Python & Virtual Environments
+# ==========================================
+__pycache__/
+*.py[cod]
+*.[oa]
+.venv/
+venv/
+env/
+
+# ==========================================
+# 3. IDEs & Dev Tools
+# ==========================================
+.vscode/
+.idea/
+.pytest_cache/
+*.ipynb
+.ipynb_checkpoints/
+
+# ==========================================
+# 4. Secrets (CRITICAL SECURITY)
+# ==========================================
+.env
+*.env
+
+# ==========================================
+# 5. Data & Logs
+# ==========================================
+data/
+logs/
+*.log
+*.csv
+*.xlsx
+*.parquet
+*.dta
+*.zip
+
+# ==========================================
+# 6. ML Artifacts & Tracking (Keep image lean)
+# ==========================================
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+*.db
+*.sqlite
+mlruns/
+wandb/
+runs/
+lightning_logs/
+
+# ==========================================
+# 7. Project Specific / Build Tools
+# ==========================================
+unused/
+notebooks/
+tests/
+Dockerfile*
+docker-compose*.yml
