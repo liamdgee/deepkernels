@@ -76,7 +76,11 @@ logs/
 *.pth
 *.ckpt
 data/
+config.yaml
+*.yaml
+
 
 deepsecrets/
 deepsecrets/*
 deepsecretsroot/*deepsecrets/
+config.yaml
