@@ -24,6 +24,7 @@ env/
 .pytest_cache/
 *.ipynb
 .ipynb_checkpoints/
+.github/workflows/
 
 # ==========================================
 # 4. Secrets (CRITICAL SECURITY)
