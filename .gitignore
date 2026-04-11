@@ -79,10 +79,13 @@ data/
 config.yaml
 *.yaml
 
-
+.github/workflows/
 deepsecrets/
 deepsecrets/*
 deepsecretsroot/*deepsecrets/
 config.yaml
 /dupes/
 /dupes/*
+
+*.disabled
+deepsecrets/
