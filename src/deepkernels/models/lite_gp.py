@@ -3,7 +3,7 @@ import math
 import gpytorch
 import torch
 import torch.nn as nn
-from deepkernels.models.dummy_model_config import RootConfig
+from deepkernels.models.model_config import RootConfig
 
 
 class SpectralVariationalGaussianProcess(gpytorch.models.ApproximateGP):

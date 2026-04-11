@@ -3,7 +3,7 @@ import math
 import gpytorch
 import torch
 import torch.nn as nn
-from deepkernels.models.dummy_model_config import RootConfig
+from deepkernelsroot.src.deepkernels.models.lite_model_config import RootConfig
 
 class HierarchicalDirichletProcess(nn.Module):
     def __init__(self, config: RootConfig):

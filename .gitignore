@@ -84,3 +84,5 @@ deepsecrets/
 deepsecrets/*
 deepsecretsroot/*deepsecrets/
 config.yaml
+/dupes/
+/dupes/*
