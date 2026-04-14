@@ -5,7 +5,7 @@
 # **deepkernels** — A Unified Probabilistic Modelling Framework for Multidimensional Anomaly Detection
 ---
 
-> ** Production Note: The containerised environment (`docker-compose.yml`) is strictly for production inference. Model weights are frozen and finalised, training is complete and there is no resources available to spin up mock model training environments. See the interactive [causal inference dashboard](https://topologicaldisparity.com) to see real-time multitask predictions for US loan approval rates across adjustable sliders for borrower demographics. Notably, model is trained explicitly on US data. **
+> ** Production Note: The containerised environment (`docker-compose.yml`) is currently being developed for developer-level 'quick inference' prompts. This is not the production inference, training or frontend container. Model weights are frozen and finalised, training is complete and there is no resources available to spin up mock model training environments. See the interactive [causal inference dashboard](https://topologicaldisparity.com) to see real-time multitask predictions for US loan approval rates across adjustable sliders for borrower demographics. Notably, model is trained explicitly on US data. **
 
 *deepkernels* is an end-to-end probabilistic inference engine which leverages **Multitask State-Space Gaussian Processes** with dynamic **Kronecker Task Covariance (LMC)** structures provided by **Dynamic Neural Kernel Networks** and unsupervised nonparametric clustering driven by **Hierarchical Dirichlet Processes**. The **StateSpaceKernelProcess** in `src/deepkernels/model.py` is optimised for large-scale inference via **PyKeOps CUDA-JIT compilation** as defined in the custom **GenerativeKernel** and **ProbabilisticMixtureMean** modules in `src/deepkernels/kernels/keops.py`.
 
@@ -139,7 +139,7 @@ This repository is designed for transparency. To evaluate the mathematical metho
 
 📄 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the APACHE-2.0 License - see the LICENSE file for details.
 
 📧 Contact
 Liam Douglas Giles - [liamdgiles@outlook.com / https://linkedin.com/in/liamdouglasgiles]

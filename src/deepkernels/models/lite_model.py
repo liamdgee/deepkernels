@@ -16,18 +16,18 @@ if not logger.handlers:
 
 try:
     import deepsecrets
-    from deepsecrets.deepkernels.models.gaussianprocess import AcceleratedKernelGP
-    from deepkernels.models.parent import BaseGenerativeModel
-    from deepsecrets.deepkernels.models.variationalautoencoder import (SpectralVAE,
+    from deepsecrets.src.deepsecrets.models.gaussianprocess import AcceleratedKernelGP
+    from deepsecrets.src.deepsecrets.models.parent import BaseGenerativeModel
+    from deepsecrets.src.deepsecrets.models.variationalautoencoder import (SpectralVAE,
                                                         StateSpaceOutput)
     AUTH_USER = True
     logger.info("Authentication Status approved. Loading core model architecture.")
 except ImportError:
     AUTH_USER = False
-    from deepkernelsroot.src.deepkernels.models.lite_gp import SpectralVariationalGaussianProcess as DummyGP
-    from deepkernelsroot.src.deepkernels.models.lite_dirichlet import HierarchicalDirichletProcess as DummyVAE
-    from deepkernelsroot.src.deepkernels.models.lite_model_config import RootConfig as DummyConfig
-    from deepkernels.models.parent import BaseGenerativeModel
+    from deepkernels.models.lite_gp import SpectralVariationalGaussianProcess as DummyGP
+    from deepkernels.models.lite_dirichlet import HierarchicalDirichletProcess as DummyVAE
+    from deepkernels.models.lite_model_config import RootConfig as DummyConfig
+    from deepkernelsroot.src.deepkernels.models.lite_parent import BaseGenerativeModel
     logger.info("Authentication Status declined. Loading dummy model architecture.")
 
 

@@ -1,23 +1,18 @@
 import logging
-import math
-import os
-from typing import Optional, Union
+from typing import Union
 
 import gpytorch
 import torch
 import torch.distributions as dist
 import torch.nn.functional as F
-from gpytorch.mlls import AddedLossTerm
-from torch.distributions import (Independent, LowRankMultivariateNormal,
-                                 Normal, kl_divergence)
 
-from setuptools import setup, find_packages
+#from setuptools import setup, find_packages
 
-setup(
-    name="deepsecrets",
-    version="0.1.0",
-    packages=find_packages(),
-)
+#setup(
+ #   name="deepsecrets",
+  #  version="0.1.0",
+   # packages=find_packages(),
+#)
 
 
 logger = logging.getLogger(__name__)
