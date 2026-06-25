@@ -1,13 +1,26 @@
+
+x-deepkernels-base: &base
+  build:
+    context: .
+    dockerfile: Dockerfile.public
+  volumes:
+    - .:/app 
+  shm_size: '2gb'
+
 services:
-  sandbox:
+  demo:
+    <<: *base
+    container_name: deepkernels-demo
+    profiles:
+      - demo
+  
+  playground:
+    <<: *base
     container_name: deepkernels-playground
-    build:
-      context: .
-      dockerfile: Dockerfile.public
+    profiles:
+      - playground
     ports:
       - "8888:8888"
-    volumes:
-      - .:/app 
     environment:
       - JUPYTER_ENABLE_LAB=yes
-    shm_size: '2gb'
+    command: ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", "--NotebookApp.token=''"]

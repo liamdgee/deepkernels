@@ -14,7 +14,7 @@ import torch.nn.functional as F
 #-local imports-#
 from .parent import BaseGenerativeModel
 from .vae import SpectralVAE
-from .state import StateSpaceOutput
+from .state import StateSpaceOutput, ModelOutput
 from .gp import AcceleratedKernelGP
 
 logger = logging.getLogger(__name__)
@@ -45,17 +45,6 @@ class ShallowKernels(BaseGenerativeModel):
             )
         
         self.gp = AcceleratedKernelGP(likelihood=likelihood, input_dim=self.input_dim * 7)
-
-    def get_device(self, device):
-        """Replaces BaseGenerativeModel device logic."""
-        if device == "cuda" and not torch.cuda.is_available():
-            logger.warning("CUDA requested but not available. Falling back to CPU.")
-            return torch.device("cpu")
-        return torch.device(device)
-
-    def pack_features(self, *features):
-        """Concatenates features for the GP. Replaces BaseGenerativeModel method."""
-        return torch.cat(features, dim=-1)
 
     def zero_state(self, x, device, batch_size):
         return self.vae.get_zero_state(x, device, batch_size)
@@ -96,35 +85,33 @@ class ShallowKernels(BaseGenerativeModel):
     def forward(
         self,
         x,
-        vae_out,
+        state: Optional[StateSpaceOutput]=None,
         indices=None,
-        steps=2,
         batch_shape=torch.Size([]),
         features_only: bool = False,
         generative_mode: bool = False,
-        **params
-    ):
-        if vae_out is None:
-            vae_out = self.vae.get_zero_state(x, x.device, batch_size=x.size(0))
+        **params,
+    ) -> ModelOutput:
+        if state is None:
+            state = self.vae.get_zero_state(x, x.device, batch_size=x.size(0))
 
         state = self.vae(
             x,
-            vae_out=vae_out,
-            steps=steps,
+            state=state,
             batch_shape=batch_shape,
             indices=indices,
             generative_mode=generative_mode,
         )
 
         if features_only:
-            return state, None, None
+            return ModelOutput.features_only(state)
 
         
         zz = self.pack_features(state)
         
         mvn = self.gp(zz)
 
-        return state, mvn, zz
+        return ModelOutput(state=state, gp_out=mvn, zz=zz)
 
 # --- Runnable Test Block --- #
 if __name__ == "__main__":
@@ -132,7 +119,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # 1. Instantiate
-    model = StateSpaceKernelProcess(input_dim=30, device=device).to(device)
+    model = ShallowKernels(input_dim=30, device=device).to(device)
     
     # 2. Dummy Data
     dummy_input = torch.randn(4, 30).to(device)

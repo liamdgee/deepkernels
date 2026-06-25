@@ -1,25 +1,19 @@
-# Use a lightweight, architecture-agnostic Python base image for broad CPU compatibility
 FROM python:3.10-slim
 
-# Set the working directory
 WORKDIR /app
 
-# Install basic system dependencies (build-essential removed)
 RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip
 RUN pip install --upgrade pip
 
-# Copy only the dependency file first (to cache this layer)
 COPY pyproject.toml /app/
 
-# Install the package and the optional dev dependencies (which includes jupyterlab)
+COPY src /app/src/
+
 RUN pip install -e .[dev]
 
-# Copy the rest of the public codebase
 COPY . /app/
 
-# Default command: Launch Jupyter Lab so developers can explore the core library
-CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", "--NotebookApp.token=''"]
+CMD ["python", "-m", "deepkernels.main"]

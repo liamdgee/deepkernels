@@ -55,14 +55,14 @@ def train_model(model, train_loader, epochs=10, device="cuda"):
     Standard training loop for the variational GP and VAE components using a DataLoader.
     """
     model.train()
-    model.likelihood.train()
+    model.gp.likelihood.train()
     
-    optimizer = Adam(model.parameters(), lr=0.01)
+    opt = Adam(model.parameters(), lr=0.01)
     
     # CRITICAL: For mini-batch GP training, num_data must be the *total* dataset size, 
     # not the batch size. This scales the KL divergence term correctly.
     mll = gpytorch.mlls.VariationalELBO(
-        model.likelihood, model.gp, num_data=len(train_loader.dataset)
+        model.gp.likelihood, model.gp, num_data=len(train_loader.dataset)
     )
     
     logger.info("Starting training loop...")
@@ -77,19 +77,17 @@ def train_model(model, train_loader, epochs=10, device="cuda"):
             # We squeeze it to ensure gpytorch doesn't throw a shape error.
             y_batch = y_batch.to(device).squeeze(-1) 
             
-            optimizer.zero_grad()
+            opt.zero_grad()
             
             # Forward pass
-            state, mvn, zz = model(x_batch, vae_out=None)
+            out = model(x_batch)
             
             # Calculate Losses
-            recon_loss = F.mse_loss(state.recon, x_batch) # Fixed: F.mse_loss instead of F.mse
-            gp_loss = -mll(mvn, y_batch) 
-            
-            # Combine and backprop
-            loss = gp_loss + recon_loss 
+            recon_loss = F.mse_loss(out.state.recon, x_batch)
+            gp_loss = mll(out.gp_out, y_batch) 
+            loss = recon_loss - gp_loss
             loss.backward()
-            optimizer.step()
+            opt.step()
             
             total_loss += loss.item()
             
@@ -105,7 +103,7 @@ def main():
 
     # 1. Setup Architecture
     input_dim = 30
-    model = StateSpaceKernelProcess(input_dim=input_dim, device=device).to(device)
+    model = ShallowKernels(input_dim=input_dim, device=device).to(device)
 
     # 2. Setup Synthetic Data & DataLoader
     logger.info("Initializing Synthetic TimeSeries Dataset...")

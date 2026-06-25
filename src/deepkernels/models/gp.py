@@ -21,7 +21,7 @@ class AcceleratedKernelGP(gpytorch.models.ApproximateGP):
         self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
         self.likelihood = likelihood
 
-    def forward(self, x):
+    def forward(self, x) -> gpytorch.distributions.MultivariateNormal:
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)

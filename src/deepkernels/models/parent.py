@@ -1,18 +1,11 @@
 import logging
-from typing import Union
+from typing import Union, Any, Optional
 
 import gpytorch
 import torch
 import torch.distributions as dist
 import torch.nn.functional as F
-
-#from setuptools import setup, find_packages
-
-#setup(
- #   name="deepsecrets",
-  #  version="0.1.0",
-   # packages=find_packages(),
-#)
+from .state import StateSpaceOutput, ModelOutput
 
 
 logger = logging.getLogger(__name__)
@@ -72,14 +65,13 @@ class BaseGenerativeModel(gpytorch.Module):
     def forward(
         self,
         x,
-        vae_out,
+        state: Optional[StateSpaceOutput]=None,
         indices=None,
-        steps=2,
         batch_shape=torch.Size([]),
         features_only: bool = False,
         generative_mode: bool = False,
         **params,
-    ):
+    ) -> Union[ModelOutput, StateSpaceOutput, None]:
         raise NotImplementedError("Subclass must implement forward()")
 
     def get_variational_strategy(self):

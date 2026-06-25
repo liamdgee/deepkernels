@@ -8,17 +8,16 @@ version = "1.0.0"
 description = "deepkernels -- A generative kernel machine for scalable simulation-based inference (public-access-version)"
 requires-python = ">=3.10"
 dependencies = [
-    # Core Deep Learning
+    # Core Deep Learning & Gaussian Processes (torch/gpytorch/linear-operator)
     "torch==2.5.1",
     "gpytorch==1.11",
-    # linear-operator is a gpytorch backend dependency, good to keep explicit
     "linear-operator==0.5.0", 
     "numpy==2.2.6"
 ]
 
 [project.optional-dependencies]
 dev = [
-    "jupyterlab==4.1.0",
+    "jupyterlab>=4.2.0",
     "black==24.1.1",
     "isort==5.13.2",
     "safety==3.0.1"
