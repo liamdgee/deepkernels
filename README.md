@@ -1,15 +1,20 @@
-
 ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 ![PyTorch](https://img.shields.io/badge/backend-PyTorch-orange.svg)
 
 # **deepkernels** — A Unified Probabilistic Modelling Framework for Multidimensional Anomaly Detection
 ---
 
-> ** Production Note: The containerised environment (`docker-compose.yml`) is currently being developed for developer-level 'quick inference' prompts. This is not the production inference, training or frontend container. Model weights are frozen and finalised, training is complete and there is no resources available to spin up mock model training environments. See the interactive [causal inference dashboard](https://topologicaldisparity.com) to see real-time multitask predictions for US loan approval rates across adjustable sliders for borrower demographics. Notably, model is trained explicitly on US data. **
+> **Architectural Insight:** This document serves as a technical overview of the production architecture of the `deepkernels` framework. As this is the public-access playground repository, this README is intended to outline the mathematical methodology and system design, rather than serve as a step-by-step training or setup guide. 
+>
+> **Production Note:** The containerised environment (`docker-compose.yml`) is provided for developer-level 'quick inference' testing only. Model weights are frozen, training is complete, and there are no resources available here to spin up mock model training environments. 
 
-*deepkernels* is an end-to-end probabilistic inference engine which leverages **Multitask State-Space Gaussian Processes** with dynamic **Kronecker Task Covariance (LMC)** structures provided by **Dynamic Neural Kernel Networks** and unsupervised nonparametric clustering driven by **Hierarchical Dirichlet Processes**. The **StateSpaceKernelProcess** in `src/deepkernels/model.py` is optimised for large-scale inference via **PyKeOps CUDA-JIT compilation** as defined in the custom **GenerativeKernel** and **ProbabilisticMixtureMean** modules in `src/deepkernels/kernels/keops.py`.
+To see the finalised model in action, view the interactive [causal inference dashboard](https://topologicaldisparity.com), which showcases real-time multitask predictions for US loan approval rates across adjustable borrower demographic sliders.
 
-### 🌌 Project Status: PRODUCTION -- 
+You can also see a technical demo of a currently in-development stochastic optimal control tool for ML developers in the form of a [bot-human anomaly detection dashboard](https://kernelsforbotdetection.com).
+
+*deepkernels* is an end-to-end probabilistic inference engine which leverages **Multitask State-Space Gaussian Processes** with dynamic **Kronecker Task Covariance (LMC)** structures provided by **Dynamic Neural Kernel Networks** and unsupervised nonparametric clustering driven by **Hierarchical Dirichlet Processes**. The **ShallowKernels** class in `src/deepkernels/model.py` is simplified proxy-logic for the proprietary **DeepKernels Bayesian Inference Engine**  which is optimised for large-scale inference via **PyKeOps CUDA-JIT compilation**.
+
+### 🌌 Project Status: PRODUCTION
 
 | Metric | Status / Value |
 | :--- | :--- |
@@ -32,10 +37,11 @@ At $t=0$, the inducer covariance matrix was initialized with the following spect
 
 ---
 
-### 📟 Hardware During Training / Inference **
+### 📟 Hardware During Training / Inference
+
 | Component | Training | Inference |
 | :--- | :--- | :--- |
-| **GPU** | 🟢 1/2 NVIDIA A100-80GB (40gb slice)| 🟢 1/20 NVIDIA A100-80GB (4GB Slice) |
+| **GPU** | 🟢 1/2 NVIDIA A100-80GB (40GB slice)| 🟢 1/20 NVIDIA A100-80GB (4GB Slice) |
 | **CUDA** | 🟢 12.1 | 🟢 12.4 |
 | **batch_dim/seq_len** | 🟢 512/32 | 🟢 6/1 (Generative Model Capability) |
 
@@ -43,12 +49,13 @@ At $t=0$, the inducer covariance matrix was initialized with the following spect
 
 ## 🚀 System Architecture
 
-* **Encoder:** Deep Convolutional Neural Network for projection into latent space. *(Logic: `src/deepkernels/models/encoder.py`)*
-* **Clustering:** Bayesian nonparametric layer which incorporates a Kumaraswamy Global Stick Breaking Process, true localised Dirichlet Distribution sampling via implicit gradients, custom inverse wishart penalty, dynamic task coregionalisation matrix derivation and custom Laplace Prior to promote cluster sparsity. *(Logic: `src/deepkernels/models/dirichlet.py`)*
-* **Decoder:** Latent convolutional decoder operates in a bottlenecked dimension of projected random fourier features. Acts to reconstruct input data across input time sequences (`seq_len=32` in training), and regularises dirichlet concentration parameters as well as intermediate kernel lengthscales through custom time-variant `gpytorch.mlls.AddedLossTerm` loss terms. *(Logic: `src/deepkernels/models/decoder.py`)*
-* **Kernel Network:** A hypernet child of the dirichlet clustering module—random fourier features are classified into base kernel primitives (matern 1/2, matern 3/2, matern 5/2, rbf, rational, linear, polynomial, periodic). *(Logic: `src/deepkernels/models/NKN.py`)*
-* **KeOps Symbolic Tensor Operations Kernel:** The input for the GP `covar_module`. Designed to maximise computational efficiency when calculating complex, learnable kernel combinatorics. `PyKeOps` allows the CUDA GPU to compile complex JIT covariance kernel structure in C++. *(Logic: `src/deepkernels/kernels/keops.py`)*
-* **Multitask Linear Model of Coregionalisation Gaussian Process:** Highly customised multitask gaussian process with custom probabilistic `mean_module`, custom GPU-accelerated `covar_module` and `dynamic variational strategy` that is fed simplex probabilities across tasks each forward pass. 
+* **Encoder:** Deep Convolutional Neural Network for projection of data into latent space. *(Logic: `src/deepkernels/models/vae.py`)*
+* **Clustering:** Bayesian nonparametric layer for global and local categorical clustering amortised through a variational autoencoder. *(Logic: `PROPRIETARY`)*
+* **Decoder:** Latent convolutional decoder operates in a bottlenecked dimension of projected random fourier features and regularises the clustering module against custom loss terms -- acts as the decoding bridge between latent space and data space.
+*(Logic: `src/deepkernels/models/vae.py`)*
+* **Kernel Network:** A neural hypernet child of the dirichlet clustering module—random fourier features are classified into base kernel primitives. *(Logic: `PROPRIETARY`)*
+* **KeOps Symbolic Tensor Operations Kernel:** The input for the GP `covar_module`. Designed to maximise computational efficiency when calculating complex, learnable kernel combinatorics. `PyKeOps` allows the CUDA GPU to compile complex JIT covariance kernel structure in C++. *(Logic: `PRORIETARY`)*
+* **LMC Gaussian Process:** Highly customised multitask gaussian process with custom probabilistic `mean_module`, custom GPU-accelerated `covar_module` and `dynamic variational strategy` that is fed simplex probabilities across tasks each forward pass. *(Logic: `src/deepkernels/model/gp.py`)*
 * **Inference Engine:** CUDA-optimised KeOps cache for linear $O(n)$ or quasi-linear $O(n \log n)$ scaling.
 
 ---
@@ -59,7 +66,7 @@ The framework utilizes a distinct 6-stage ensemble reinforcement learning class 
 * **Stage 1:** VAE reconstructs latent space with dirichlet process gradients frozen and all KL penalties suspended.
 * **Stage 2:** VAE continues to optimise recon loss with hierarchical dirichlet process module gradients flowing.
 * **Stage 3:** GP warmup with only upstream bayesian gradients active.
-* **Stage 4:** *(Current)* GP trains with gradient flow to Neural Kernel Network -> KeOps JIT-CUDA Kernel.
+* **Stage 4:** GP trains with gradient flow to Neural Kernel Network -> KeOps JIT-CUDA Kernel.
 * **Stage 5:** Cyclical E-step M-step Maximum Likelihood Estimation.
 * **Stage 6:** Full training with all gradients unfrozen.
 
@@ -123,25 +130,10 @@ $$\theta^{(t+1)} = \arg\max_{\theta} \left( \mathbb{E}_{q_{\phi^{(t+1)}}(Z|X)}[\
 
 ---
 
----
 
-## 🗂️ Codebase Navigation
-
-This repository is designed for transparency. To evaluate the mathematical methodology and its implementation, the core logic is distributed across the following primary modules:
-
-* **`/src/deepkernels/kernels/keops.py`**: The PyKeOps CUDA-JIT compilation logic for the `GenerativeKernel` and `ProbabilisticMixtureMean` modules, enabling $O(n)$ scaling with variational inducing points without incurring a scaling bottleneck for parallelised coregional GPs.
-* **`/src/deepkernels/models/dirichlet.py`**: Implementation of the Bayesian nonparametric layer, including the Kumaraswamy Global Stick Breaking Processes for global vs. local unsupervised clustering paradigms
-* **`/src/deepkernels/models/NKN.py`**: The hypernetwork where random Fourier features are classified into base kernel primitives.
-* **`/src/deepkernels/model.py`**: The overarching `StateSpaceKernelProcess` that orchestrates the model flow and provides general functon to generate stochastic trajectories
-* **`/src/deepkernels/models/encoder.py` & `decoder.py`**: The deep convolutional projection networks bounding the latent space.
-* **`/src/deepkernels/models/gaussianprocess.py`**: The master `AcceleratedKernelGP` architecture with custom `Dynamic LMC Variational Strategy`
-* **`/src/deepkernels/models/parent.py`**: pareht `BaseGenerativeModel` class
-
-📄 License
+## 📄 License
 
 This project is licensed under the APACHE-2.0 License - see the LICENSE file for details.
 
-📧 Contact
-Liam Douglas Giles - [liamdgiles@outlook.com / https://linkedin.com/in/liamdouglasgiles]
-
-
+## 📧 Contact
+Liam Douglas Giles - [liamdgiles@outlook.com](mailto:liamdgiles@outlook.com) / [https://linkedin.com/in/liamdouglasgiles](https://linkedin.com/in/liamdouglasgiles)
