@@ -43,7 +43,7 @@ class BaseGenerativeModel(gpytorch.Module):
         pi = F.softmax(pi, dim=-1)
         return pi
 
-    def pack_features(self, gates, linear, periodic, rational, polynomial, matern, pi):
+    def pack_features(self, state):
         def to_3d(p, jitter=1e-5):
             if p.dim() == 4:
                 return p.squeeze(1) if p.size(1) == 1 else p.squeeze(2)
@@ -53,13 +53,13 @@ class BaseGenerativeModel(gpytorch.Module):
 
         packed = torch.cat(
             [
-                to_3d(gates),
-                to_3d(linear),
-                to_3d(periodic),
-                to_3d(rational),
-                to_3d(polynomial),
-                to_3d(matern),
-                to_3d(pi),
+                to_3d(state.gates),
+                to_3d(state.linear),
+                to_3d(state.periodic),
+                to_3d(state.rational),
+                to_3d(state.polynomial),
+                to_3d(state.matern),
+                to_3d(state.pi),
             ],
             dim=-1,
         )

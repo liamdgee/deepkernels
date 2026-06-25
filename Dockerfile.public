@@ -1,13 +1,12 @@
-# Use an official PyTorch runtime as a parent image
-FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+# Use a lightweight, architecture-agnostic Python base image for broad CPU compatibility
+FROM python:3.10-slim
 
 # Set the working directory
 WORKDIR /app
 
-# Install basic system dependencies required for KeOps/compilation
+# Install basic system dependencies (build-essential removed)
 RUN apt-get update && apt-get install -y \
     git \
-    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip
@@ -16,9 +15,10 @@ RUN pip install --upgrade pip
 # Copy only the dependency file first (to cache this layer)
 COPY pyproject.toml /app/
 
-RUN pip install -e .[test] jupyterlab
+# Install the package and the optional dev dependencies (which includes jupyterlab)
+RUN pip install -e .[dev]
 
-# Copy the rest of the public codebase (tests, src, README)
+# Copy the rest of the public codebase
 COPY . /app/
 
 # Default command: Launch Jupyter Lab so developers can explore the core library

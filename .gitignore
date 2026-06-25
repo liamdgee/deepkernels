@@ -88,4 +88,9 @@ config.yaml
 /dupes/*
 
 *.disabled
+
 deepsecrets/
+rustyorchestration/
+rustysecrets/
+fit_kasada/
+deepkernelsapi/
